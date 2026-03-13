@@ -1,6 +1,6 @@
 (
 // ============================================================
-// Plonk-ish v5.9.1
+// Plonk-ish v5.10
 // - conditional trigs / cycle conditions
 // - pattern variations A/B/C/D
 // - fill mode
@@ -11,6 +11,8 @@
 // - utilities: clear var / rotate left / rotate right / copy range
 // - fixed Mut Off / Mut On visual toggle
 // - FIXED: sequencer clocking / routine resume crash
+// - NEW: scale / pitch quantization
+// - NEW: tie / step length
 // ============================================================
 
 // ---------- pre-boot server options ----------
@@ -28,11 +30,11 @@ s.waitForBoot({
         };
     };
 
-    ~plonkV591SoundDir = Platform.userHomeDir +/+ "PlonkV591_Sounds";
-    ~plonkV591PatternDir = Platform.userHomeDir +/+ "PlonkV591_Patterns";
+    ~plonkV510SoundDir = Platform.userHomeDir +/+ "PlonkV510_Sounds";
+    ~plonkV510PatternDir = Platform.userHomeDir +/+ "PlonkV510_Patterns";
 
-    ~plonkEnsureDir.(~plonkV591SoundDir);
-    ~plonkEnsureDir.(~plonkV591PatternDir);
+    ~plonkEnsureDir.(~plonkV510SoundDir);
+    ~plonkEnsureDir.(~plonkV510PatternDir);
 
     // --------------------------------------------------------
     // helpers
@@ -44,6 +46,64 @@ s.waitForBoot({
         note = names.wrapAt(num % 12);
         octave = (num div: 12) - 1;
         note ++ octave.asString;
+    };
+
+    ~plonkNoteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+    ~plonkScaleNames = [
+        "Chromatic",
+        "Major",
+        "Minor",
+        "Dorian",
+        "Mixolydian",
+        "Pent Major",
+        "Pent Minor"
+    ];
+
+    ~plonkScaleTable = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        [0, 2, 4, 5, 7, 9, 11],
+        [0, 2, 3, 5, 7, 8, 10],
+        [0, 2, 3, 5, 7, 9, 10],
+        [0, 2, 4, 5, 7, 9, 10],
+        [0, 2, 4, 7, 9],
+        [0, 3, 5, 7, 10]
+    ];
+
+    ~plonkPitch = (
+        root: 0,
+        scaleType: 0
+    );
+
+    ~plonkQuantizeMidi = { |midi|
+        var root = (~plonkPitch[\root] ? 0).asInteger.clip(0, 11);
+        var scaleType = (~plonkPitch[\scaleType] ? 0).asInteger.clip(0, ~plonkScaleTable.size - 1);
+        var intervals = ~plonkScaleTable[scaleType];
+        var m = midi.asInteger.clip(0, 127);
+        var best = m;
+        var bestDist = 9999;
+
+        if(scaleType == 0) {
+            m;
+        }{
+            (-2).to(10).do { |oct|
+                intervals.do { |iv|
+                    var cand = (root + iv + (oct * 12)).asInteger;
+                    var dist;
+                    if((cand >= 0) and: { cand <= 127 }) {
+                        dist = (cand - m).abs;
+                        if(
+                            (dist < bestDist) or:
+                            { (dist == bestDist) and: { cand < best } }
+                        ) {
+                            bestDist = dist;
+                            best = cand;
+                        };
+                    };
+                };
+            };
+            best.clip(0, 127);
+        };
     };
 
     ~plonkCondNames = [
@@ -77,7 +137,7 @@ s.waitForBoot({
     // synth definition
     // --------------------------------------------------------
     ~plonkDefineSynth = {
-        SynthDef(\plonkV591, {
+        SynthDef(\plonkV510, {
             |out=0, amp=0.22, pan=0,
             freq=220, gate=1, velocity=0.9,
             model=0,
@@ -269,7 +329,7 @@ s.waitForBoot({
     };
 
     ~plonkDefineSynth.();
-    "Loaded \\plonkV591".postln;
+    "Loaded \\plonkV510".postln;
 
     // --------------------------------------------------------
     // state
@@ -374,7 +434,7 @@ s.waitForBoot({
         MIDIClient.init;
         MIDIIn.connectAll;
 
-        MIDIdef.noteOn(\plonkV591On, { |vel, note|
+        MIDIdef.noteOn(\plonkV510On, { |vel, note|
             ~plonkTrigger.((freq: note.midicps, velocity: vel / 127));
         });
 
@@ -396,7 +456,7 @@ s.waitForBoot({
         ~plonkSeqStop.();
         ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
         ~plonkVoices.clear;
-        MIDIdef.noteOn(\plonkV591On).free;
+        MIDIdef.noteOn(\plonkV510On).free;
 
         s.options.memSize = 262144;
         s.options.sampleRate = sr;
@@ -448,7 +508,7 @@ s.waitForBoot({
         if(args[\model] == 3) { ~plonkChokeDrum.() };
 
         ~plonkStealVoice.();
-        synth = Synth(\plonkV591, args.asKeyValuePairs);
+        synth = Synth(\plonkV510, args.asKeyValuePairs);
         ~plonkVoices.add((synth: synth, model: args[\model], time: Main.elapsedTime));
 
         synth.onFree({
@@ -475,6 +535,8 @@ s.waitForBoot({
             micro: 0.0,
             gate: 0.85,
             accent: 0.0,
+            length: 1,
+            tie: 0,
             condType: 0,
             condA: 1,
             condB: 2,
@@ -520,7 +582,6 @@ s.waitForBoot({
         chainBarCount: 1
     );
 
-    // dedicated sequencing clock
     ~plonkClock = TempoClock.new((~plonkSeq[\tempo] ? 120) / 60);
     ~plonkClock.permanent_(true);
 
@@ -560,23 +621,23 @@ s.waitForBoot({
         ~plonkPatterns[~plonkCurrentPlaybackVariation.()]
     };
 
-~plonkAdvanceChain = {
-    var slot, bars;
+    ~plonkAdvanceChain = {
+        var slot, bars;
 
-    if(~plonkSeq[\chainEnabled].not) {
-        nil;
-    }{
-        slot = ~plonkSeq[\chainSlots][~plonkSeq[\chainIndex]];
-        bars = (slot[\bars] ? 1).asInteger.max(1);
-
-        if(~plonkSeq[\chainBarCount] >= bars) {
-            ~plonkSeq[\chainIndex] = (~plonkSeq[\chainIndex] + 1) % ~plonkSeq[\chainSlots].size;
-            ~plonkSeq[\chainBarCount] = 1;
+        if(~plonkSeq[\chainEnabled].not) {
+            nil;
         }{
-            ~plonkSeq[\chainBarCount] = ~plonkSeq[\chainBarCount] + 1;
+            slot = ~plonkSeq[\chainSlots][~plonkSeq[\chainIndex]];
+            bars = (slot[\bars] ? 1).asInteger.max(1);
+
+            if(~plonkSeq[\chainBarCount] >= bars) {
+                ~plonkSeq[\chainIndex] = (~plonkSeq[\chainIndex] + 1) % ~plonkSeq[\chainSlots].size;
+                ~plonkSeq[\chainBarCount] = 1;
+            }{
+                ~plonkSeq[\chainBarCount] = ~plonkSeq[\chainBarCount] + 1;
+            };
         };
     };
-};
 
     ~plonkResetChain = {
         ~plonkSeq[\chainIndex] = 0;
@@ -596,6 +657,8 @@ s.waitForBoot({
         32.do { |i|
             ~plonkPatterns[idx][i][\on] = 0;
             ~plonkPatterns[idx][i][\locks][\semi] = 0;
+            ~plonkPatterns[idx][i][\length] = 1;
+            ~plonkPatterns[idx][i][\tie] = 0;
         };
         ~plonkSetEditVariation.(idx);
     };
@@ -642,15 +705,67 @@ s.waitForBoot({
         ~plonkSetEditVariation.(idx);
     };
 
+    ~plonkStepBeatDur = { |stepIndex|
+        var baseDur = 1 / 4;
+        var swing = ~plonkSeq[\swing].clip(0, 0.49);
+
+        if(stepIndex.odd) {
+            baseDur * (1 + swing);
+        }{
+            baseDur * (1 - swing);
+        };
+    };
+
+    ~plonkTiedHoldBeats = { |stepIndex, len|
+        var total = 0.0;
+        var stepsCount = ~plonkSeq[\steps].clip(1, 32);
+        var safeLen = len.asInteger.clip(1, 8);
+
+        safeLen.do { |k|
+            var idx = (stepIndex + k) % stepsCount;
+            total = total + ~plonkStepBeatDur.(idx);
+        };
+
+        total;
+    };
+
+~plonkIsTiedContinuation = { |stepIndex|
+    var steps = ~plonkPlaybackSteps.();
+    var found = false;
+
+    7.do { |n|
+        var offset = n + 1;
+        var prevIdx = stepIndex - offset;
+
+        if(prevIdx >= 0) {
+            var prev = steps[prevIdx];
+            var prevLen = (prev[\length] ? 1).asInteger.max(1);
+            var prevTie = (prev[\tie] ? 0).asInteger;
+
+            if(
+                (prev[\on] == 1) and:
+                { prevTie == 1 } and:
+                { prevLen > offset }
+            ) {
+                found = true;
+            };
+        };
+    };
+
+    found;
+};
+
     ~plonkStepMidiForIndex = { |idx|
         var semi = (~plonkSteps[idx][\locks][\semi] ? 0).asInteger;
-        (~plonkSeq[\baseMidi] + semi).clip(0, 127);
+        var rawMidi = (~plonkSeq[\baseMidi] + semi).clip(0, 127);
+        ~plonkQuantizeMidi.(rawMidi);
     };
 
     ~plonkBuildStepArgs = { |step|
         var args = ~plonkState.copy;
         var locks = step[\locks];
-        var noteMidi = ~plonkSeq[\baseMidi] + (locks[\semi] ? 0);
+        var rawMidi = ~plonkSeq[\baseMidi] + (locks[\semi] ? 0);
+        var noteMidi = ~plonkQuantizeMidi.(rawMidi);
         var accentAmt = step[\accent].clip(0, 1);
 
         args[\freq] = noteMidi.midicps;
@@ -734,35 +849,40 @@ s.waitForBoot({
                     st[\condB] = [2, 3, 4, 5, 6, 8].choose;
                 };
             };
+
+            if((amt * 0.14).coin) {
+                st[\length] = [1, 1, 1, 2, 2, 3, 4].choose;
+                st[\tie] = [0, 0, 0, 1].choose;
+            };
         };
     };
 
-~plonkRunMutationIfNeeded = {
-    var targetIdx;
+    ~plonkRunMutationIfNeeded = {
+        var targetIdx;
 
-    if(~plonkMutate[\enabled].not) {
-        nil;
-    }{
-        if((~plonkSeq[\cycleCount] % (~plonkMutate[\everyCycles].max(1))) != 0) {
+        if(~plonkMutate[\enabled].not) {
             nil;
         }{
-            targetIdx = if(~plonkMutate[\targetVariation] == \edit) {
-                ~plonkSeq[\editVariation]
+            if((~plonkSeq[\cycleCount] % (~plonkMutate[\everyCycles].max(1))) != 0) {
+                nil;
             }{
-                ~plonkCurrentPlaybackVariation.()
+                targetIdx = if(~plonkMutate[\targetVariation] == \edit) {
+                    ~plonkSeq[\editVariation]
+                }{
+                    ~plonkCurrentPlaybackVariation.()
+                };
+
+                ~plonkMutateVariation.(targetIdx);
+
+                AppClock.sched(0, {
+                    if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+                    if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+                    if(~plonkRefreshVarButtons.notNil) { ~plonkRefreshVarButtons.() };
+                    nil
+                });
             };
-
-            ~plonkMutateVariation.(targetIdx);
-
-            AppClock.sched(0, {
-                if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
-                if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
-                if(~plonkRefreshVarButtons.notNil) { ~plonkRefreshVarButtons.() };
-                nil
-            });
         };
     };
-};
 
     ~plonkRefreshPlayhead = {
         if(~plonkStepIndicators.notNil) {
@@ -810,56 +930,80 @@ s.waitForBoot({
     };
 
     ~plonkPlayLiveStep = { |stepIndex|
-        var steps, st, baseDur, stepDur, swing, microOffset, ratchetDur, args, condPass, didPlay = false;
+        var steps, st, stepDur, microOffset, ratchetDur, args, condPass, didPlay = false;
+        var isTieContinuation, noteHoldBeats, gateDurBeats, gateDurSecs;
 
         steps = ~plonkPlaybackSteps.();
         st = steps[stepIndex];
-        baseDur = 1 / 4; // quarter of a beat on TempoClock = 16th note
-        swing = ~plonkSeq[\swing].clip(0, 0.49);
-
-        if(stepIndex.odd) {
-            stepDur = baseDur * (1 + swing);
-        }{
-            stepDur = baseDur * (1 - swing);
-        };
+        stepDur = ~plonkStepBeatDur.(stepIndex);
 
         ~plonkSeq[\currentStep] = stepIndex;
         ~plonkRefreshPlayhead.();
 
-        condPass = ~plonkCheckCondition.(st);
+        isTieContinuation = ~plonkIsTiedContinuation.(stepIndex);
 
-        if(st[\on] == 1 and: { condPass } and: { 1.0.rand <= st[\prob] }) {
-            microOffset = st[\micro].clip(-0.49, 0.49) * (stepDur * 0.5);
-            ratchetDur = stepDur / st[\ratchet].clip(1, 4);
-            args = ~plonkBuildStepArgs.(st);
-
-            if(microOffset > 0) { microOffset.wait };
-
-            st[\ratchet].clip(1, 4).do { |i|
-                var synth, gateDurBeats, gateDurSecs;
-                synth = ~plonkTrigger.(args);
-                didPlay = true;
-
-                gateDurBeats = (ratchetDur * st[\gate].clip(0.05, 1.25)).max(0.01);
-                gateDurSecs = gateDurBeats / ~plonkClock.tempo.max(0.0001);
-
-                SystemClock.sched(gateDurSecs, {
-                    synth.set(\gate, 0);
-                    nil
-                });
-
-                if(i < (st[\ratchet].clip(1, 4) - 1)) {
-                    ratchetDur.wait;
-                };
-            };
-
-            if(microOffset < 0) {
-                (stepDur + microOffset.abs).wait;
-            }{
-                (stepDur - microOffset).max(0.001).wait;
-            };
-        }{
+        if(isTieContinuation) {
+            didPlay = true;
             stepDur.wait;
+        }{
+            condPass = ~plonkCheckCondition.(st);
+
+            if(st[\on] == 1 and: { condPass } and: { 1.0.rand <= st[\prob] }) {
+                microOffset = st[\micro].clip(-0.49, 0.49) * (stepDur * 0.5);
+                ratchetDur = stepDur / st[\ratchet].clip(1, 4);
+                args = ~plonkBuildStepArgs.(st);
+
+                if(microOffset > 0) { microOffset.wait };
+
+                if((st[\tie] ? 0) == 1) {
+                    noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
+                    gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
+                    gateDurSecs = gateDurBeats / ~plonkClock.tempo.max(0.0001);
+
+                    {
+                        var synth;
+                        synth = ~plonkTrigger.(args);
+                        didPlay = true;
+
+                        SystemClock.sched(gateDurSecs, {
+                            synth.set(\gate, 0);
+                            nil
+                        });
+                    }.value;
+
+                    if(microOffset < 0) {
+                        (stepDur + microOffset.abs).wait;
+                    }{
+                        (stepDur - microOffset).max(0.001).wait;
+                    };
+                }{
+                    st[\ratchet].clip(1, 4).do { |i|
+                        var synth;
+                        synth = ~plonkTrigger.(args);
+                        didPlay = true;
+
+                        gateDurBeats = (ratchetDur * st[\gate].clip(0.05, 1.25)).max(0.01);
+                        gateDurSecs = gateDurBeats / ~plonkClock.tempo.max(0.0001);
+
+                        SystemClock.sched(gateDurSecs, {
+                            synth.set(\gate, 0);
+                            nil
+                        });
+
+                        if(i < (st[\ratchet].clip(1, 4) - 1)) {
+                            ratchetDur.wait;
+                        };
+                    };
+
+                    if(microOffset < 0) {
+                        (stepDur + microOffset.abs).wait;
+                    }{
+                        (stepDur - microOffset).max(0.001).wait;
+                    };
+                };
+            }{
+                stepDur.wait;
+            };
         };
 
         ~plonkSeq[\lastStepPlayed] = didPlay;
@@ -901,6 +1045,8 @@ s.waitForBoot({
             st[\micro] = rrand(-0.18, 0.18);
             st[\gate] = rrand(0.35, 1.10);
             st[\accent] = [0.0, 0.0, 0.25, 0.5, 0.75, 1.0].choose;
+            st[\length] = [1, 1, 1, 2, 2, 3, 4].choose;
+            st[\tie] = [0, 0, 0, 1].choose;
             st[\condType] = [0, 0, 0, 1, 2, 3, 4, 9, 10, 11].choose;
             st[\condA] = rrand(1, 4);
             st[\condB] = [2, 3, 4, 5, 6, 8].choose;
@@ -930,13 +1076,13 @@ s.waitForBoot({
     // save/load
     // --------------------------------------------------------
     ~plonkSaveSound = { |name="sound1"|
-        var path = ~plonkV591SoundDir +/+ (name ++ ".archive");
+        var path = ~plonkV510SoundDir +/+ (name ++ ".archive");
         ~plonkState.copy.writeArchive(path);
         ("Saved sound: " ++ path).postln;
     };
 
     ~plonkLoadSound = { |name="sound1"|
-        var path = ~plonkV591SoundDir +/+ (name ++ ".archive");
+        var path = ~plonkV510SoundDir +/+ (name ++ ".archive");
         if(File.exists(path)) {
             ~plonkState = Object.readArchive(path).copy;
             ("Loaded sound: " ++ path).postln;
@@ -946,17 +1092,18 @@ s.waitForBoot({
     };
 
     ~plonkSavePattern = { |name="pattern1"|
-        var path = ~plonkV591PatternDir +/+ (name ++ ".archive");
+        var path = ~plonkV510PatternDir +/+ (name ++ ".archive");
         (
             seq: ~plonkSeq.copy.put(\task, nil),
             patterns: ~plonkPatterns.collect { |arr| arr.collect(_.deepCopy) },
-            mutate: ~plonkMutate.copy
+            mutate: ~plonkMutate.copy,
+            pitch: ~plonkPitch.copy
         ).writeArchive(path);
         ("Saved pattern: " ++ path).postln;
     };
 
     ~plonkLoadPattern = { |name="pattern1"|
-        var path = ~plonkV591PatternDir +/+ (name ++ ".archive");
+        var path = ~plonkV510PatternDir +/+ (name ++ ".archive");
         var obj;
         if(File.exists(path)) {
             obj = Object.readArchive(path);
@@ -964,6 +1111,9 @@ s.waitForBoot({
             ~plonkSeq[\task] = nil;
             ~plonkPatterns = obj[\patterns].collect { |arr| arr.collect(_.deepCopy) };
             ~plonkMutate = obj[\mutate].copy;
+            if(obj[\pitch].notNil) {
+                ~plonkPitch = obj[\pitch].copy;
+            };
             ~plonkSetEditVariation.(~plonkSeq[\editVariation] ? 0);
             ~plonkClock.tempo = ~plonkSeq[\tempo] / 60;
             ("Loaded pattern: " ++ path).postln;
@@ -978,7 +1128,7 @@ s.waitForBoot({
     MIDIClient.init;
     MIDIIn.connectAll;
 
-    MIDIdef.noteOn(\plonkV591On, { |vel, note|
+    MIDIdef.noteOn(\plonkV510On, { |vel, note|
         ~plonkTrigger.((freq: note.midicps, velocity: vel / 127));
     });
 
@@ -1011,14 +1161,15 @@ s.waitForBoot({
         var chainVarMenus = Array.newClear(4);
         var chainBarBoxes = Array.newClear(4);
         var rangeSrcABox, rangeSrcBBox, rangeDstBox;
+        var rootMenu, scaleMenu;
 
         ~plonkStepIndicators = stepIndicators;
         ~plonkStepButtons = stepButtons;
 
-        win = Window("Plonk-ish v5.9.1", Rect(0, 40, 1498, 940)).front;
+        win = Window("Plonk-ish v5.10", Rect(0, 40, 1498, 940)).front;
         win.alwaysOnTop_(false);
         win.userCanClose_(true);
-        win.setInnerExtent(1450, 760);
+        win.setInnerExtent(1450, 780);
 
         uiW = win.view.bounds.width.asInteger;
         uiH = win.view.bounds.height.asInteger;
@@ -1127,45 +1278,46 @@ s.waitForBoot({
         };
 
         refreshVarButtons = {
-    4.do { |i|
-        if(varButtons[i].notNil) {
-            if(i == ~plonkSeq[\editVariation]) {
-                varButtons[i].states_([
-                    [~plonkVariationNames[i], Color.white, Color(0.15, 0.45, 0.85)]
+            4.do { |i|
+                if(varButtons[i].notNil) {
+                    if(i == ~plonkSeq[\editVariation]) {
+                        varButtons[i].states_([
+                            [~plonkVariationNames[i], Color.white, Color(0.15, 0.45, 0.85)]
+                        ]);
+                    }{
+                        varButtons[i].states_([
+                            [~plonkVariationNames[i], Color.black, Color.grey(0.85)]
+                        ]);
+                    };
+                };
+            };
+
+            if(fillButton.notNil) {
+                if(~plonkSeq[\fillMode]) {
+                    fillButton.states_([["Fill", Color.white, Color(0.80, 0.35, 0.1)]]);
+                    fillButton.value_(1);
+                }{
+                    fillButton.states_([["Fill", Color.black, Color.grey(0.85)]]);
+                    fillButton.value_(0);
+                };
+            };
+
+            if(mutateEnableButton.notNil) {
+                mutateEnableButton.states_([
+                    ["Mut Off", Color.black, Color.grey(0.85)],
+                    ["Mut On", Color.white, Color(0.20, 0.60, 0.20)]
                 ]);
-            }{
-                varButtons[i].states_([
-                    [~plonkVariationNames[i], Color.black, Color.grey(0.85)]
+                mutateEnableButton.value_(~plonkMutate[\enabled].asInteger);
+            };
+
+            if(chainEnableButton.notNil) {
+                chainEnableButton.states_([
+                    ["Chain Off", Color.black, Color.grey(0.85)],
+                    ["Chain On", Color.white, Color(0.35, 0.35, 0.80)]
                 ]);
+                chainEnableButton.value_(~plonkSeq[\chainEnabled].asInteger);
             };
         };
-    };
-
-    if(fillButton.notNil) {
-        fillButton.value_(~plonkSeq[\fillMode].asInteger);
-        if(~plonkSeq[\fillMode]) {
-            fillButton.states_([["Fill", Color.white, Color(0.80, 0.35, 0.1)]]);
-        }{
-            fillButton.states_([["Fill", Color.black, Color.grey(0.85)]]);
-        };
-    };
-
-if(mutateEnableButton.notNil) {
-    mutateEnableButton.states_([
-        ["Mut Off", Color.black, Color.grey(0.85)],
-        ["Mut On", Color.white, Color(0.20, 0.60, 0.20)]
-    ]);
-    mutateEnableButton.value_(~plonkMutate[\enabled].asInteger);
-};
-
-if(chainEnableButton.notNil) {
-    chainEnableButton.states_([
-        ["Chain Off", Color.black, Color.grey(0.85)],
-        ["Chain On", Color.white, Color(0.35, 0.35, 0.80)]
-    ]);
-    chainEnableButton.value_(~plonkSeq[\chainEnabled].asInteger);
-};
-};
 
         refreshChainUI = {
             4.do { |i|
@@ -1241,7 +1393,10 @@ if(chainEnableButton.notNil) {
 
                 if(condMiniLabels[i].notNil) {
                     if(isActive) {
-                        condMiniLabels[i].string_(~plonkCondShortName.(st));
+                        condMiniLabels[i].string_(
+                            ~plonkCondShortName.(st)
+                            ++ if((st[\tie] ? 0) == 1) { " T" } { "" }
+                        );
                     }{
                         condMiniLabels[i].string_("-");
                     };
@@ -1250,6 +1405,14 @@ if(chainEnableButton.notNil) {
 
             if(baseMidiLabel.notNil) {
                 baseMidiLabel.string_(~plonkMidiToName.(~plonkSeq[\baseMidi]));
+            };
+
+            if(rootMenu.notNil) {
+                rootMenu.value_(~plonkPitch[\root].asInteger);
+            };
+
+            if(scaleMenu.notNil) {
+                scaleMenu.value_(~plonkPitch[\scaleType].asInteger);
             };
 
             if(stepNoteLabel.notNil) {
@@ -1281,6 +1444,8 @@ if(chainEnableButton.notNil) {
             if(lockBoxes[\micro].notNil) { lockBoxes[\micro].value_(st[\micro]) };
             if(lockBoxes[\gate].notNil) { lockBoxes[\gate].value_(st[\gate]) };
             if(lockBoxes[\accent].notNil) { lockBoxes[\accent].value_(st[\accent]) };
+            if(lockBoxes[\length].notNil) { lockBoxes[\length].value_(st[\length] ? 1) };
+            if(lockEnableButtons[\tie].notNil) { lockEnableButtons[\tie].value_(st[\tie] ? 0) };
             if(lockBoxes[\condType].notNil) { lockBoxes[\condType].value_(st[\condType] ? 0) };
             if(lockBoxes[\condA].notNil) { lockBoxes[\condA].value_(st[\condA] ? 1) };
             if(lockBoxes[\condB].notNil) { lockBoxes[\condB].value_(st[\condB] ? 2) };
@@ -1448,7 +1613,7 @@ if(chainEnableButton.notNil) {
             condSummaryLabel = StaticText(v, Rect(460, 0, 400, 20));
             chainSummaryLabel = StaticText(v, Rect(860, 0, 520, 20));
 
-            // row 1 transport
+            // row 1 transport + scale
             StaticText(v, Rect(20, y1, 42, 20)).string_("Tempo");
             makeBoundedBox.(v, Rect(64, y1, 56, 20), ~plonkSeq[\tempo], 20, 300, 1, 0, { |nb, val|
                 ~plonkSeq[\tempo] = val.asInteger;
@@ -1481,10 +1646,30 @@ if(chainEnableButton.notNil) {
                 refreshPatternUI.();
             });
 
-            baseMidiLabel = StaticText(v, Rect(446, y1, 52, 20));
+            baseMidiLabel = StaticText(v, Rect(446, y1, 48, 20));
             baseMidiLabel.string_(~plonkMidiToName.(~plonkSeq[\baseMidi]));
 
-            Button(v, Rect(520, y1 - 1, 50, 22))
+            StaticText(v, Rect(500, y1, 30, 20)).string_("Root");
+            rootMenu = PopUpMenu(v, Rect(534, y1, 52, 20));
+            rootMenu.items_(~plonkNoteNames);
+            rootMenu.value_(~plonkPitch[\root].asInteger);
+            rootMenu.action_({
+                ~plonkPitch[\root] = rootMenu.value.asInteger;
+                refreshPatternUI.();
+                refreshLockEditor.();
+            });
+
+            StaticText(v, Rect(594, y1, 34, 20)).string_("Scale");
+            scaleMenu = PopUpMenu(v, Rect(632, y1, 112, 20));
+            scaleMenu.items_(~plonkScaleNames);
+            scaleMenu.value_(~plonkPitch[\scaleType].asInteger);
+            scaleMenu.action_({
+                ~plonkPitch[\scaleType] = scaleMenu.value.asInteger;
+                refreshPatternUI.();
+                refreshLockEditor.();
+            });
+
+            Button(v, Rect(760, y1 - 1, 50, 22))
             .states_([
                 ["Run", Color.white, Color.green(0.75)]
             ])
@@ -1492,7 +1677,7 @@ if(chainEnableButton.notNil) {
                 ~plonkSeqStart.();
             });
 
-            Button(v, Rect(576, y1 - 1, 50, 22))
+            Button(v, Rect(816, y1 - 1, 50, 22))
             .states_([
                 ["Stop", Color.white, Color.red(0.8)]
             ])
@@ -1549,7 +1734,7 @@ if(chainEnableButton.notNil) {
                 refreshLockEditor.();
             });
 
-            randSelButton = Button(v, Rect(420, y2 - 1, 60, 22))
+            randSelButton = Button(v, Rect(420, y2 - 1, 58, 22))
             .states_([["Rand Sel"]])
             .action_({
                 ~plonkRandomizePattern.();
@@ -1558,15 +1743,16 @@ if(chainEnableButton.notNil) {
             });
 
             StaticText(v, Rect(520, y2, 52, 20)).string_("Mutation");
-mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
-.states_([
-    ["Mut Off", Color.black, Color.grey(0.85)],
-    ["Mut On", Color.white, Color(0.20, 0.60, 0.20)]
-])
-.action_({ |bt|
-    ~plonkMutate[\enabled] = (bt.value == 1);
-    refreshVarButtons.();
-});
+            mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
+            .states_([
+                ["Mut Off", Color.black, Color.grey(0.85)],
+                ["Mut On", Color.white, Color(0.20, 0.60, 0.20)]
+            ])
+            .action_({ |bt|
+                ~plonkMutate[\enabled] = (bt.value == 1);
+                refreshVarButtons.();
+                refreshPatternUI.();
+            });
 
             StaticText(v, Rect(642, y2, 22, 20)).string_("Ev");
             mutateEveryBox = makeBoundedBox.(v, Rect(664, y2, 42, 20), ~plonkMutate[\everyCycles], 1, 32, 1, 0, { |nb, val|
@@ -1581,9 +1767,12 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
             // row 3 chain
             StaticText(v, Rect(20, y3, 40, 20)).string_("Chain");
             chainEnableButton = Button(v, Rect(62, y3 - 1, 68, 22))
-            .states_([["Chain Off"], ["Chain On"]])
-            .action_({
-                ~plonkSeq[\chainEnabled] = chainEnableButton.value == 1;
+            .states_([
+                ["Chain Off", Color.black, Color.grey(0.85)],
+                ["Chain On", Color.white, Color(0.35, 0.35, 0.80)]
+            ])
+            .action_({ |bt|
+                ~plonkSeq[\chainEnabled] = (bt.value == 1);
                 ~plonkResetChain.();
                 refreshVarButtons.();
                 refreshPatternUI.();
@@ -1616,7 +1805,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
             // row 4 utilities
             StaticText(v, Rect(20, y4, 50, 20)).string_("Utils");
 
-            Button(v, Rect(65, y4 - 1, 65, 22))
+            Button(v, Rect(74, y4 - 1, 78, 22))
             .states_([["Clear Var"]])
             .action_({
                 ~plonkClearCurrentVariation.();
@@ -1624,7 +1813,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
                 refreshLockEditor.();
             });
 
-            Button(v, Rect(136, y4 - 1, 42, 22))
+            Button(v, Rect(158, y4 - 1, 42, 22))
             .states_([["RotL"]])
             .action_({
                 ~plonkRotateCurrentVariation.(-1);
@@ -1632,7 +1821,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
                 refreshLockEditor.();
             });
 
-            Button(v, Rect(182, y4 - 1, 42, 22))
+            Button(v, Rect(204, y4 - 1, 42, 22))
             .states_([["RotR"]])
             .action_({
                 ~plonkRotateCurrentVariation.(1);
@@ -1640,17 +1829,17 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
                 refreshLockEditor.();
             });
 
-            StaticText(v, Rect(240, y4, 52, 20)).string_("CopyRange");
-            StaticText(v, Rect(298, y4, 18, 20)).string_("A");
-            rangeSrcABox = makeBoundedBox.(v, Rect(314, y4, 42, 20), 0, 0, 31, 1, 0, { |nb, val| });
+            StaticText(v, Rect(260, y4, 52, 20)).string_("CopyRange");
+            StaticText(v, Rect(318, y4, 18, 20)).string_("A");
+            rangeSrcABox = makeBoundedBox.(v, Rect(334, y4, 42, 20), 0, 0, 31, 1, 0, { |nb, val| });
 
-            StaticText(v, Rect(364, y4, 18, 20)).string_("B");
-            rangeSrcBBox = makeBoundedBox.(v, Rect(380, y4, 42, 20), 3, 0, 31, 1, 0, { |nb, val| });
+            StaticText(v, Rect(384, y4, 18, 20)).string_("B");
+            rangeSrcBBox = makeBoundedBox.(v, Rect(400, y4, 42, 20), 3, 0, 31, 1, 0, { |nb, val| });
 
-            StaticText(v, Rect(430, y4, 24, 20)).string_("Dst");
-            rangeDstBox = makeBoundedBox.(v, Rect(456, y4, 42, 20), 8, 0, 31, 1, 0, { |nb, val| });
+            StaticText(v, Rect(450, y4, 24, 20)).string_("Dst");
+            rangeDstBox = makeBoundedBox.(v, Rect(476, y4, 42, 20), 8, 0, 31, 1, 0, { |nb, val| });
 
-            Button(v, Rect(506, y4 - 1, 46, 22))
+            Button(v, Rect(526, y4 - 1, 46, 22))
             .states_([["Do"]])
             .action_({
                 ~plonkCopyStepRangeInCurrentVariation.(
@@ -1741,7 +1930,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
                 refreshLockEditor.();
             });
 
-            stepNoteLabel = StaticText(v, Rect(900, 40, 300, 20));
+            stepNoteLabel = StaticText(v, Rect(920, 40, 320, 20));
             stepNoteLabel.string_("Resulting Note: " ++ ~plonkMidiToName.(~plonkSeq[\baseMidi]));
 
             lockEnableButtons[\on] = Button(v, Rect(170, 38, 60, 24)).states_([["Off"], ["On"]]).action_({ |bt|
@@ -1772,6 +1961,18 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
             StaticText(v, Rect(750, 40, 54, 20)).string_("Accent");
             lockBoxes[\accent] = makeBoundedBox.(v, Rect(806, 40, 60, 20), 0.0, 0, 1, 0.01, 2, { |nb, val|
                 ~plonkSteps[lockStep][\accent] = val;
+            });
+
+            StaticText(v, Rect(880, 40, 34, 20)).string_("Len");
+            lockBoxes[\length] = makeBoundedBox.(v, Rect(912, 40, 44, 20), 1, 1, 8, 1, 0, { |nb, val|
+                ~plonkSteps[lockStep][\length] = val.asInteger.clip(1, 8);
+            });
+
+            lockEnableButtons[\tie] = Button(v, Rect(966, 38, 58, 24))
+            .states_([["Tie Off"], ["Tie On"]])
+            .action_({ |bt|
+                ~plonkSteps[lockStep][\tie] = bt.value;
+                refreshPatternUI.();
             });
 
             StaticText(v, Rect(20, 76, 90, 20)).string_("Condition");
@@ -1825,7 +2026,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
                         if(stepNoteLabel.notNil) {
                             stepNoteLabel.string_(
                                 "Resulting Note: " ++
-                                ~plonkMidiToName.((~plonkSeq[\baseMidi] + writeVal).clip(0, 127))
+                                ~plonkMidiToName.(~plonkStepMidiForIndex.(lockStep))
                             );
                         };
                     };
@@ -1958,7 +2159,7 @@ mutateEnableButton = Button(v, Rect(576, y2 - 1, 58, 22))
 
         win.onClose_({
             ~plonkSeqStop.();
-            MIDIdef.noteOn(\plonkV591On).free;
+            MIDIdef.noteOn(\plonkV510On).free;
             ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
             ~plonkVoices.clear;
         });
