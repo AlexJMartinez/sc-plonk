@@ -215,6 +215,9 @@ s.waitForBoot({
 
     ~plonkLayerModeNames = ["Single", "Layer", "Alt", "Random"];
 	~plonkRandSelModeNames = ["Full", "Selection", "Timing", "Pitch", "Accent", "Layer"];
+	~plonkSynth2TypeNames = ["FM Burst", "PWM Buzz", "Ring Metal", "Vowel Noise"];
+		~plonkSynth2VariantNames = ["Soft", "Bright", "Wide", "Hollow", "Nasal", "Harsh"];
+		~plonkSynth2PitchModeNames = ["Follow", "Semi", "Degree"];
 
     ~plonkPitch = (
         root: 0,
@@ -342,7 +345,21 @@ s.waitForBoot({
             velToBright=0.35,
             velToDecay=0.2,
             velToNoise=0.2,
-            velToClick=0.2|
+            velToClick=0.2,
+			filterMode=0,
+			filterCutoff=0.65,
+			filterRes=0.25,
+			filterEnvAmt=0.35,
+			filterEnvDecay=0.08,
+			combAmt=0.0,
+			combTime=0.008,
+			combDecay=0.18,
+			edgeDrive=1.0,
+			foldAmt=0.0,
+			presence=0.0,
+			crushMix=0.0,
+			bitDepth=12,
+			downsample=1|
 
             var ampEnv, excEnv, pitchEnv;
             var baseFreq, effBright, effDecay, effNoise, effClick;
@@ -353,10 +370,15 @@ s.waitForBoot({
             var modelPartialsA, modelPartialsB;
             var ampShapeA, ampShapeB, ringShapeA, ringShapeB;
             var mkBank, bankA, bankB;
+			var filterEnv, filtFreq, filtRq, filtered, comb, folded, crushed, ds, bits, step;
 
             pitchEnv = EnvGen.kr(
                 Env([1 + pitchEnvAmt, 1], [pitchEnvDecay], curve: -6)
             );
+
+			filterEnv = EnvGen.kr(
+    Env([1 + filterEnvAmt.clip(0, 4), 1], [filterEnvDecay.clip(0.005, 1.5)], curve: -6)
+);
 
             baseFreq = freq * pitchEnv;
 
@@ -498,15 +520,205 @@ s.waitForBoot({
                 BPF.ar(sig, baseFreq * 0.94, 0.42, body * 0.34) + BPF.ar(sig, baseFreq * 1.65, 0.36, body * 0.18)
             ]);
 
-            sig = sig + bodySig;
-            sig = LPF.ar(sig, effBright.linexp(0, 1, 2200, 17500));
-            sig = HPF.ar(sig, 28);
-            sig = LeakDC.ar(sig);
-            sig = tanh(sig * (1 + (drive * 0.5)));
-            sig = sig * amp * ampEnv;
+sig = sig + bodySig;
+
+// ----------------------------------------------------
+// multimode filter with env
+// ----------------------------------------------------
+filtFreq = (filterCutoff.clip(0, 1).linexp(0, 1, 120, 16000) * filterEnv).clip(40, 20000);
+filtRq = filterRes.clip(0.01, 0.98).linlin(0.01, 0.98, 0.95, 0.08);
+
+filtered = SelectX.ar(filterMode.clip(0, 3), [
+    RLPF.ar(sig, filtFreq, filtRq),              // 0 LP
+    RHPF.ar(sig, filtFreq, filtRq),              // 1 HP
+    BPF.ar(sig, filtFreq, filtRq.clip(0.08, 1)), // 2 BP
+    BRF.ar(sig, filtFreq, filtRq.clip(0.08, 1))  // 3 Notch
+]);
+
+sig = XFade2.ar(sig, filtered, 0.25);
+
+// ----------------------------------------------------
+// cavity / comb body
+// ----------------------------------------------------
+comb = CombC.ar(
+    sig,
+    0.05,
+    combTime.clip(0.0007, 0.03),
+    combDecay.clip(0.02, 2.0)
+);
+comb = LPF.ar(comb, filtFreq.clip(200, 14000));
+sig = sig + (comb * combAmt.clip(0, 1));
+
+// ----------------------------------------------------
+// edge shaping
+// ----------------------------------------------------
+sig = LeakDC.ar(sig);
+sig = tanh(sig * (1 + (drive * 0.5)));
+sig = tanh(sig * edgeDrive.clip(0.5, 8.0));
+
+folded = Fold.ar(sig * (1 + (foldAmt.clip(0, 1) * 6)), -1, 1);
+sig = SelectX.ar(foldAmt.clip(0, 1), [sig, folded]);
+
+sig = BPeakEQ.ar(
+    sig,
+    3200,
+    0.6,
+    presence.clip(-1, 1).linlin(-1, 1, -10, 12)
+);
+
+// ----------------------------------------------------
+// digital crush layer
+// ----------------------------------------------------
+bits = bitDepth.clip(2, 16);
+step = 2 ** (bits.neg + 1);
+crushed = (sig / step).round * step;
+
+ds = downsample.clip(1, 24).round.asInteger;
+crushed = Latch.ar(crushed, Impulse.ar(SampleRate.ir / ds.max(1)));
+
+sig = XFade2.ar(sig, crushed, crushMix.clip(0, 1).linlin(0, 1, -1, 1));
+
+// ----------------------------------------------------
+// final tone
+// ----------------------------------------------------
+sig = LPF.ar(sig, effBright.linexp(0, 1, 2500, 18000));
+sig = HPF.ar(sig, 28);
+sig = LeakDC.ar(sig);
+sig = sig * amp * ampEnv;
 
             Out.ar(out, Pan2.ar(sig, pan));
         }).add;
+
+		SynthDef(\plonkV520Layer2, {
+    |out=0, amp=0.12, pan=0,
+    freq=220, gate=1, velocity=0.9,
+    synthType=0,
+    color=0.5,
+    motion=0.25,
+    decay=0.25,
+    drive=1.4,
+    noise=0.0,
+    click=0.0,
+    pwmWidth=0.35,
+    fmRatio=2.0,
+    fmIndex=2.0,
+    formantMorph=0.3,
+    ringMix=0.5|
+
+    var ampEnv, pitchEnv, baseFreq;
+    var attack, sig, fmSig, pwmSig, ringSig, vowelSig;
+    var widthMod, modFreq, modAmt, mod;
+    var form1, form2, noiseSrc, oscA, oscB;
+
+    ampEnv = EnvGen.kr(
+        Env.asr(0.001, 1, decay.clip(0.02, 2.0), curve: -4),
+        gate,
+        doneAction: 2
+    );
+
+    pitchEnv = EnvGen.kr(
+        Env(
+            [1 + (click.abs * 0.18), 1],
+            [0.015 + (motion * 0.03)],
+            curve: -6
+        )
+    );
+
+    baseFreq = freq * pitchEnv;
+
+    attack = Decay2.ar(
+        Impulse.ar(0),
+        0.0002,
+        0.002 + (click.abs * 0.004)
+    ) * (0.12 + (click.abs * 0.25));
+    attack = HPF.ar(attack, 1800);
+
+    // -----------------------------
+    // 0 = FM Burst
+    // -----------------------------
+    modFreq = baseFreq * (fmRatio.clip(0.25, 10) + (motion * 1.5));
+    modAmt = baseFreq * fmIndex.clip(0.1, 8) * (0.15 + (color * 0.85));
+    mod = SinOsc.ar(modFreq, 0, modAmt);
+    fmSig = SinOsc.ar(baseFreq + mod);
+    fmSig = (fmSig * 0.6)
+        + BPF.ar(fmSig, (baseFreq * (2 + color * 8)).clip(80, 16000), 0.4);
+
+    // -----------------------------
+    // 1 = PWM Buzz
+    // -----------------------------
+widthMod = LFNoise2.kr(3 + (motion * 22)).range(
+    (0.04 + (color * 0.10)).neg,
+    (0.04 + (color * 0.10))
+);
+
+    pwmSig = Mix(Pulse.ar(
+        baseFreq * [1, 1.0015 + (motion * 0.01), 1.997],
+        (pwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
+    )) * 0.33;
+
+    pwmSig = HPF.ar(
+        RLPF.ar(
+            pwmSig,
+            (baseFreq * (3 + color * 10)).clip(120, 18000),
+            0.2
+        ),
+        50
+    );
+
+    // -----------------------------
+    // 2 = Ring Metal
+    // -----------------------------
+    oscA = Saw.ar(baseFreq * (1 + (motion * 0.015)));
+    oscB = SinOsc.ar(baseFreq * (1.5 + (color * 5.5) + (noise.abs * 1.5)));
+    ringSig = oscA * oscB;
+    ringSig = BPF.ar(
+        ringSig,
+        (baseFreq * (2.2 + (color * 9))).clip(100, 18000),
+        0.25 + (motion * 0.2)
+    );
+
+    // -----------------------------
+    // 3 = Vowel / Formant Noise
+    // -----------------------------
+    noiseSrc = PinkNoise.ar(0.7 + (noise.abs * 0.6));
+    form1 = formantMorph.clip(0, 1).linexp(0, 1, 350, 1100);
+    form2 = formantMorph.clip(0, 1).linexp(0, 1, 900, 3200);
+
+    vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
+        + BPF.ar(noiseSrc, form2, 0.12, 0.75);
+
+    vowelSig = vowelSig + (SinOsc.ar(baseFreq, 0, 0.15) * ringMix.clip(0, 1));
+    vowelSig = HPF.ar(vowelSig, 100);
+
+    sig = SelectX.ar(synthType.clip(0, 3), [
+        fmSig,
+        pwmSig,
+        ringSig,
+        vowelSig
+    ]);
+
+    sig = sig + attack;
+
+    sig = sig + LPF.ar(
+        WhiteNoise.ar(noise.abs.clip(0, 1) * 0.08),
+        (baseFreq * (6 + color * 12)).clip(500, 16000)
+    );
+
+    sig = LeakDC.ar(sig);
+    sig = tanh(sig * drive.clip(0.6, 6.0));
+
+    sig = BPeakEQ.ar(
+        sig,
+        (baseFreq * (4 + color * 8)).clip(800, 7000),
+        0.5,
+        velocity.linlin(0, 1, -2, 6)
+    );
+
+    sig = HPF.ar(sig, 35);
+    sig = sig * amp * ampEnv * velocity.linlin(0, 1, 0.35, 1.0);
+
+    Out.ar(out, Pan2.ar(sig, pan));
+}).add;
     };
 
     ~plonkDefineSynth.();
@@ -529,7 +741,10 @@ s.waitForBoot({
             decay: 1.2, body: 0.45, damp: 0.25, drive: 1.15, tone: 0.58,
             noiseAmt: 0.32, clickAmt: 0.82, excDecay: 0.025, detune: 0.0025, spread: 1.0,
             pitchEnvAmt: 0.0, pitchEnvDecay: 0.03,
-            velToBright: 0.35, velToDecay: 0.20, velToNoise: 0.20, velToClick: 0.20
+            velToBright: 0.35, velToDecay: 0.20, velToNoise: 0.20, velToClick: 0.20, filterMode: 0,
+			filterCutoff: 0.65, filterRes: 0.25, filterEnvAmt: 0.35, filterEnvDecay: 0.08, combAmt: 0.0,
+			combTime: 0.008, combDecay: 0.18, edgeDrive: 1.0, foldAmt: 0.0, presence: 0.0, crushMix: 0.0,
+			bitDepth: 12, downsample: 1
         );
 
         switch(which,
@@ -714,26 +929,46 @@ s.waitForBoot({
         };
     };
 
-    ~plonkTrigger = { |overrides|
-        var args, synth, trackIdx;
-        overrides = overrides ? ();
-        args = overrides.copy;
-        trackIdx = (args.removeAt(\trackIndex) ? -1).asInteger;
+~plonkTriggerWithDef = { |defName, overrides|
+    var args, synth, trackIdx, voiceModelTag;
 
-        if((args[\model] ? 0) == 3 and: { trackIdx >= 0 }) {
-            ~plonkChokeDrum.(trackIdx);
-        };
+    overrides = overrides ? ();
+    args = overrides.copy;
 
-        ~plonkStealVoice.();
-        synth = Synth(\plonkV520, args.asKeyValuePairs);
-        ~plonkVoices.add((synth: synth, model: args[\model], track: trackIdx, time: Main.elapsedTime));
+    trackIdx = (args.removeAt(\trackIndex) ? -1).asInteger;
+    voiceModelTag = (args.removeAt(\voiceModelTag) ? (args[\model] ? -999)).asInteger;
 
-        synth.onFree({
-            { ~plonkVoices = ~plonkVoices.select { |entry| entry[\synth] != synth } }.defer;
-        });
-
-        synth;
+    if((voiceModelTag == 3) and: { trackIdx >= 0 }) {
+        ~plonkChokeDrum.(trackIdx);
     };
+
+    ~plonkStealVoice.();
+    synth = Synth(defName, args.asKeyValuePairs);
+
+    ~plonkVoices.add((
+        synth: synth,
+        model: voiceModelTag,
+        track: trackIdx,
+        time: Main.elapsedTime
+    ));
+
+    synth.onFree({
+        { ~plonkVoices = ~plonkVoices.select { |entry| entry[\synth] != synth } }.defer;
+    });
+
+    synth;
+};
+
+~plonkTrigger = { |overrides|
+    ~plonkTriggerWithDef.(\plonkV520, overrides);
+};
+
+~plonkTriggerLayer2 = { |overrides|
+    var args = (overrides ? ()).copy;
+    args[\voiceModelTag] = -1; // prevent drum choke logic from treating synth2 as main model
+    ~plonkTriggerWithDef.(\plonkV520Layer2, args);
+};
+
 
     // --------------------------------------------------------
     // sequencer / patterns / chain
@@ -741,7 +976,11 @@ s.waitForBoot({
 ~plonkLockKeys = [
     \semi, \velocity, \decay, \brightness, \material, \inharm, \position,
     \body, \damp, \drive, \tone, \noiseAmt, \clickAmt, \exciterType,
-    \model, \pitchEnvAmt, \pitchEnvDecay, \detune, \spread, \pan
+    \model, \pitchEnvAmt, \pitchEnvDecay, \detune, \spread, \pan,
+    \filterMode, \filterCutoff, \filterRes, \filterEnvAmt, \filterEnvDecay,
+    \combAmt, \combTime, \combDecay,
+    \edgeDrive, \foldAmt, \presence,
+    \crushMix, \bitDepth, \downsample
 ];
 
     ~makePlonkStep = { |on=0|
@@ -758,8 +997,8 @@ s.waitForBoot({
             condA: 1,
             condB: 2,
             layerMode: 0,
-            engine2Model: 3,
-            engine2Exciter: 2,
+            engine2Model: 0,
+            engine2Exciter: 0,
             layerLevel: 0.60,
             engine2PitchMode: 0,
             engine2SemiOffset: 0,
@@ -1057,12 +1296,13 @@ s.waitForBoot({
 };
 
 ~plonkBuildLayer2Args = { |trackIdx, step|
-    var args = ~plonkBuildStepArgs.(trackIdx, step).copy;
     var mainLocks = step[\locks];
     var useDegree = (mainLocks[\useDegree] ? 0).asInteger;
     var pitchMode = (step[\engine2PitchMode] ? 0).asInteger.clip(0, 2);
-    var mainMidi, layerMidi;
     var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
+    var baseArgs = ~plonkBuildStepArgs.(trackIdx, step).copy;
+    var mainMidi, layerMidi, excIdx, synthType;
+    var args = ();
 
     if(useDegree == 1) {
         mainMidi = ~plonkDegreeToMidi.(mainLocks[\degree] ? 0, mainLocks[\degreeOct] ? 0);
@@ -1091,16 +1331,48 @@ s.waitForBoot({
         }
     );
 
-    args[\freq] = layerMidi.clip(0, 127).midicps;
-    args[\model] = (step[\engine2Model] ? 3).asInteger.clip(0, 3);
-    args[\exciterType] = (step[\engine2Exciter] ? 2).asInteger.clip(0, 5);
-    args[\amp] = (args[\amp] * (step[\layerLevel] ? 0.60)).clip(0.001, 1.0);
-    args[\decay] = (args[\decay] * (step[\engine2DecayMul] ? 1.0)).clip(0.03, 6.0);
-    args[\noiseAmt] = (args[\noiseAmt] + (step[\engine2NoiseOffset] ? 0.0)).clip(0.0, 1.2);
-    args[\clickAmt] = (args[\clickAmt] + (step[\engine2ClickOffset] ? 0.0)).clip(0.0, 2.0);
-    args[\pan] = (args[\pan] + (step[\engine2PanOffset] ? 0.0)).clip(-1.0, 1.0);
-    args[\trackIndex] = trackIdx;
+    excIdx = (step[\engine2Exciter] ? 0).asInteger.clip(0, 5);
+    synthType = (step[\engine2Model] ? 0).asInteger.clip(0, 3);
 
+    args[\freq] = layerMidi.clip(0, 127).midicps;
+    args[\amp] = (baseArgs[\amp] * (step[\layerLevel] ? 0.60)).clip(0.001, 1.0);
+    args[\pan] = (baseArgs[\pan] + (step[\engine2PanOffset] ? 0.0)).clip(-1.0, 1.0);
+    args[\velocity] = baseArgs[\velocity].clip(0, 1);
+
+    args[\decay] = (baseArgs[\decay] * (step[\engine2DecayMul] ? 1.0)).clip(0.02, 2.0);
+    args[\synthType] = synthType;
+
+    args[\color] = (
+        excIdx.linlin(0, 5, 0.15, 0.95)
+        + ((step[\engine2NoiseOffset] ? 0.0) * 0.15)
+    ).clip(0, 1);
+
+    args[\motion] = (
+        ((step[\engine2DecayMul] ? 1.0).linlin(0.2, 3.0, 0.05, 0.95))
+        + ((step[\engine2ClickOffset] ? 0.0).abs * 0.20)
+    ).clip(0, 1);
+
+    args[\drive] = (
+        1.0
+        + ((step[\layerLevel] ? 0.60) * 1.5)
+        + ((step[\engine2ClickOffset] ? 0.0) * 0.8)
+    ).clip(0.6, 6.0);
+
+    args[\noise] = (step[\engine2NoiseOffset] ? 0.0).clip(-1.0, 1.0);
+    args[\click] = (step[\engine2ClickOffset] ? 0.0).clip(-1.0, 1.0);
+
+    args[\pwmWidth] = excIdx.linlin(0, 5, 0.18, 0.82).clip(0.05, 0.95);
+    args[\fmRatio] = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0].wrapAt(excIdx);
+    args[\fmIndex] = (
+        0.3
+        + ((step[\engine2DecayMul] ? 1.0) * 2.0)
+        + ((step[\engine2ClickOffset] ? 0.0).abs * 2.0)
+    ).clip(0.1, 8.0);
+
+    args[\formantMorph] = excIdx.linlin(0, 5, 0.0, 1.0).clip(0, 1);
+    args[\ringMix] = (0.2 + ((step[\layerLevel] ? 0.60) * 0.7)).clip(0, 1);
+
+    args[\trackIndex] = trackIdx;
     args;
 };
 
@@ -1127,47 +1399,45 @@ s.waitForBoot({
         )
     };
 
-    ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
-        var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
-        var mainArgs = ~plonkBuildStepArgs.(trackIdx, step);
-        var layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
-        var synths = List.new;
+   ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
+    var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
+    var mainArgs = ~plonkBuildStepArgs.(trackIdx, step);
+    var layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
+    var synths = List.new;
 
-        switch(mode,
-            0, {
+    switch(mode,
+        0, {
+            synths.add(~plonkTrigger.(mainArgs));
+        },
+        1, {
+            synths.add(~plonkTrigger.(mainArgs));
+            synths.add(~plonkTriggerLayer2.(layerArgs));
+        },
+        2, {
+            if(~plonkAltState[trackIdx][stepIndex] == 0) {
                 synths.add(~plonkTrigger.(mainArgs));
-            },
-            1, {
-                synths.add(~plonkTrigger.(mainArgs));
-                synths.add(~plonkTrigger.(layerArgs));
-            },
-            2, {
-                if(~plonkAltState[trackIdx][stepIndex] == 0) {
-                    synths.add(~plonkTrigger.(mainArgs));
-                    ~plonkAltState[trackIdx][stepIndex] = 1;
-                }{
-                    synths.add(~plonkTrigger.(layerArgs));
-                    ~plonkAltState[trackIdx][stepIndex] = 0;
-                };
-            },
-            3, {
-                if(1.0.rand < 0.5) {
-                    synths.add(~plonkTrigger.(mainArgs));
-                }{
-                    synths.add(~plonkTrigger.(layerArgs));
-                };
-            }
-        );
-
-        SystemClock.sched(gateDurSecs, {
-            synths.do { |sy|
-                sy.set(\gate, 0);
+                ~plonkAltState[trackIdx][stepIndex] = 1;
+            }{
+                synths.add(~plonkTriggerLayer2.(layerArgs));
+                ~plonkAltState[trackIdx][stepIndex] = 0;
             };
-            nil
-        });
+        },
+        3, {
+            if(1.0.rand < 0.5) {
+                synths.add(~plonkTrigger.(mainArgs));
+            }{
+                synths.add(~plonkTriggerLayer2.(layerArgs));
+            };
+        }
+    );
 
-        synths;
-    };
+    SystemClock.sched(gateDurSecs, {
+        synths.do { |sy| sy.set(\gate, 0) };
+        nil
+    });
+
+    synths;
+};
 
     ~plonkMutateVariation = { |trackIdx, varIdx|
         var steps = ~plonkTrackPatterns[trackIdx][varIdx];
@@ -1438,6 +1708,25 @@ s.waitForBoot({
             if(0.30.coin) { st[\locks][\decay] = rrand(0.08, 2.5) } { st[\locks][\decay] = nil };
             if(0.25.coin) { st[\locks][\exciterType] = rrand(0, 5) } { st[\locks][\exciterType] = nil };
             if(0.20.coin) { st[\locks][\model] = rrand(0, 3) } { st[\locks][\model] = nil };
+
+			if(0.35.coin) { st[\locks][\filterCutoff] = rrand(0.08, 0.95) } { st[\locks][\filterCutoff] = nil };
+			if(0.30.coin) { st[\locks][\filterRes] = rrand(0.05, 0.90) } { st[\locks][\filterRes] = nil };
+			if(0.25.coin) { st[\locks][\filterEnvAmt] = rrand(0.0, 2.8) } { st[\locks][\filterEnvAmt] = nil };
+			if(0.22.coin) { st[\locks][\filterEnvDecay] = rrand(0.01, 0.45) } { st[\locks][\filterEnvDecay] = nil };
+
+			if(0.20.coin) { st[\locks][\combAmt] = rrand(0.0, 0.55) } { st[\locks][\combAmt] = nil };
+			if(0.18.coin) { st[\locks][\combTime] = exprand(0.0009, 0.018) } { st[\locks][\combTime] = nil };
+			if(0.16.coin) { st[\locks][\combDecay] = rrand(0.04, 0.75) } { st[\locks][\combDecay] = nil };
+
+			if(0.28.coin) { st[\locks][\edgeDrive] = rrand(0.8, 4.5) } { st[\locks][\edgeDrive] = nil };
+			if(0.22.coin) { st[\locks][\foldAmt] = rrand(0.0, 0.45) } { st[\locks][\foldAmt] = nil };
+			if(0.20.coin) { st[\locks][\presence] = rrand(-0.2, 0.8) } { st[\locks][\presence] = nil };
+
+			if(0.16.coin) { st[\locks][\crushMix] = rrand(0.0, 0.35) } { st[\locks][\crushMix] = nil };
+			if(0.14.coin) { st[\locks][\bitDepth] = rrand(6, 14) } { st[\locks][\bitDepth] = nil };
+			if(0.14.coin) { st[\locks][\downsample] = [1, 2, 3, 4, 6, 8, 12].choose } { st[\locks][\downsample] = nil };
+
+			if(0.12.coin) { st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose } { st[\locks][\filterMode] = nil };
         };
     };
 
@@ -1598,6 +1887,53 @@ s.waitForBoot({
                     st[\engine2ClickOffset] = rrand(-0.40, 0.40);
                     st[\engine2PanOffset] = rrand(-0.70, 0.70);
                 };
+
+					if((amount * 0.45).coin) {
+    st[\locks][\filterCutoff] = rrand(0.08, 0.95);
+};
+if((amount * 0.35).coin) {
+    st[\locks][\filterRes] = rrand(0.05, 0.90);
+};
+if((amount * 0.28).coin) {
+    st[\locks][\filterEnvAmt] = rrand(0.0, 2.8);
+};
+if((amount * 0.24).coin) {
+    st[\locks][\filterEnvDecay] = rrand(0.01, 0.45);
+};
+
+if((amount * 0.22).coin) {
+    st[\locks][\combAmt] = rrand(0.0, 0.55);
+};
+if((amount * 0.18).coin) {
+    st[\locks][\combTime] = exprand(0.0009, 0.018);
+};
+if((amount * 0.18).coin) {
+    st[\locks][\combDecay] = rrand(0.04, 0.75);
+};
+
+if((amount * 0.35).coin) {
+    st[\locks][\edgeDrive] = rrand(0.8, 4.5);
+};
+if((amount * 0.24).coin) {
+    st[\locks][\foldAmt] = rrand(0.0, 0.45);
+};
+if((amount * 0.20).coin) {
+						st[\locks][\presence] = rrand(-0.2, 0.8);
+};
+
+if((amount * 0.18).coin) {
+    st[\locks][\crushMix] = rrand(0.0, 0.35);
+};
+if((amount * 0.15).coin) {
+    st[\locks][\bitDepth] = rrand(6, 14);
+};
+if((amount * 0.15).coin) {
+    st[\locks][\downsample] = [1, 2, 3, 4, 6, 8, 12].choose;
+};
+
+if((amount * 0.12).coin) {
+    st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose;
+};
             }
         );
     };
@@ -1712,14 +2048,15 @@ MIDIdef.noteOn(\plonkV520On, { |vel, note|
         var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox;
         var modelNames = ["Bar", "Plate", "Bell", "Drum"];
         var exciterNames = ["Mallet", "HardPick", "Brush", "Scrape", "Burst", "ImpulseCluster"];
+
         var varButtons = Array.newClear(4);
         var trackButtons = Array.newClear(4);
        var fillButton, mutateEnableButton, copyVarButton, pasteVarButton, dupVarButton, chainEnableButton, allEditChainButton;
-var chainVarMenus = Array.newClear(4);
-var chainBarBoxes = Array.newClear(4);
-var rangeSrcABox, rangeSrcBBox, rangeDstBox;
-var randSelButton, randModeMenu, randAmtBox;
-var rootMenu, scaleMenu, layerModeMenu, eng2ModelMenu, eng2ExcMenu;
+		var chainVarMenus = Array.newClear(4);
+		var chainBarBoxes = Array.newClear(4);
+		var rangeSrcABox, rangeSrcBBox, rangeDstBox;
+		var randSelButton, randModeMenu, randAmtBox;
+		var rootMenu, scaleMenu, layerModeMenu, eng2ModelMenu, eng2ExcMenu;
 
         ~plonkStepIndicators = stepIndicators;
         ~plonkStepButtons = stepButtons;
@@ -1727,7 +2064,7 @@ var rootMenu, scaleMenu, layerModeMenu, eng2ModelMenu, eng2ExcMenu;
         win = Window("Plonk-ish v5.20", Rect(0, 40, 1498, 940)).front;
         win.alwaysOnTop_(false);
         win.userCanClose_(true);
-        win.setInnerExtent(1450, 740);
+        win.setInnerExtent(1450, 980);
 
         uiW = win.view.bounds.width.asInteger;
         uiH = win.view.bounds.height.asInteger;
@@ -1960,14 +2297,18 @@ refreshControls = {
         var stPlay = playSteps[i];
         var isActive = i < ~plonkSeq[\steps];
         var noteName = ~plonkMidiToName.(~plonkStepMidiForIndex.(i));
-        var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
-            1, {
-                switch((stEdit[\engine2PitchMode] ? 0).asInteger, 1, { "L:S" }, 2, { "L:D" }, { "L" })
-            },
-            2, { "A" },
-            3, { "R" },
-            { "" }
-        );
+var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
+    1, {
+        switch((stEdit[\engine2PitchMode] ? 0).asInteger,
+            1, { "S2:S" },
+            2, { "S2:D" },
+            { "S2" }
+        )
+    },
+    2, { "ALT" },
+    3, { "RND" },
+    { "" }
+);
 
         if(stepButtons[i].notNil) {
             stepButtons[i].enabled_(isActive);
@@ -2074,11 +2415,11 @@ refreshControls = {
     if(lockBoxes[\degreeOct].notNil) { lockBoxes[\degreeOct].value_(locks[\degreeOct] ? 0) };
     if(lockBoxes[\semi].notNil) { lockBoxes[\semi].value_(locks[\semi] ? 0) };
 
-    if(layerModeMenu.notNil) { layerModeMenu.value_((st[\layerMode] ? 0).asInteger) };
-    if(eng2ModelMenu.notNil) { eng2ModelMenu.value_((st[\engine2Model] ? 3).asInteger) };
-    if(eng2ExcMenu.notNil) { eng2ExcMenu.value_((st[\engine2Exciter] ? 2).asInteger) };
-    if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.60) };
-    if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((st[\engine2PitchMode] ? 0).asInteger) };
+   if(layerModeMenu.notNil) { layerModeMenu.value_((st[\layerMode] ? 0).asInteger.clip(0, ~plonkLayerModeNames.size - 1)) };
+if(eng2ModelMenu.notNil) { eng2ModelMenu.value_((st[\engine2Model] ? 0).asInteger.clip(0, ~plonkSynth2TypeNames.size - 1)) };
+if(eng2ExcMenu.notNil) { eng2ExcMenu.value_((st[\engine2Exciter] ? 0).asInteger.clip(0, ~plonkSynth2VariantNames.size - 1)) };
+if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.60) };
+if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((st[\engine2PitchMode] ? 0).asInteger.clip(0, ~plonkSynth2PitchModeNames.size - 1)) };
     if(lockBoxes[\engine2SemiOffset].notNil) { lockBoxes[\engine2SemiOffset].value_(st[\engine2SemiOffset] ? 0) };
     if(lockBoxes[\engine2DegreeOffset].notNil) { lockBoxes[\engine2DegreeOffset].value_(st[\engine2DegreeOffset] ? 0) };
     if(lockBoxes[\engine2DegreeOctOffset].notNil) { lockBoxes[\engine2DegreeOctOffset].value_(st[\engine2DegreeOctOffset] ? 0) };
@@ -2224,6 +2565,24 @@ refreshControls = {
             makeSlider.(v, 20, y, "Vel->Decay", \velToDecay, 0, 0.5, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Vel->Noise", \velToNoise, 0, 0.5, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Vel->Click", \velToClick, 0, 0.5, \lin); y = y + 28;
+
+			makeMenu.(v, 460, 20, "FilterMode", \filterMode, ["LP", "HP", "BP", "Notch"]);
+			makeSlider.(v, 460, 48, "FiltCut", \filterCutoff, 0, 1, \lin);
+			makeSlider.(v, 460, 76, "FiltRes", \filterRes, 0.01, 0.98, \lin);
+			makeSlider.(v, 460, 104, "FiltEnvAmt", \filterEnvAmt, 0, 4, \lin);
+			makeSlider.(v, 460, 132, "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, \exp);
+
+			makeSlider.(v, 460, 188, "CombAmt", \combAmt, 0, 1, \lin);
+			makeSlider.(v, 460, 216, "CombTime", \combTime, 0.0007, 0.03, \exp);
+			makeSlider.(v, 460, 244, "CombDecay", \combDecay, 0.02, 2.0, \exp);
+
+			makeSlider.(v, 460, 300, "EdgeDrive", \edgeDrive, 0.5, 8.0, \exp);
+			makeSlider.(v, 460, 328, "FoldAmt", \foldAmt, 0, 1, \lin);
+			makeSlider.(v, 460, 356, "Presence", \presence, -1, 1, \lin);
+
+			makeSlider.(v, 460, 412, "CrushMix", \crushMix, 0, 1, \lin);
+			makeSlider.(v, 460, 440, "BitDepth", \bitDepth, 2, 16, \lin);
+			makeSlider.(v, 460, 468, "Downsample", \downsample, 1, 24, \lin);
         }.value;
 
         // pattern page
@@ -2430,7 +2789,7 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
                     refreshPatternUI.();
                 });
 
-                StaticText(v, Rect(x + 68, y3, 24, 20)).string_("Br");
+                StaticText(v, Rect(x + 68, y3, 24, 20)).string_("Cy");
                 chainBarBoxes[i] = makeBoundedBox.(v, Rect(x + 92, y3, 26, 20), (~plonkSeq[\chainSlots][i][\bars] ? 1), 1, 8, 1, 0, { |nb, val|
                     ~plonkSeq[\chainSlots][i][\bars] = val.asInteger.max(1);
                     refreshPatternUI.();
@@ -2440,7 +2799,7 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             StaticText(v, Rect(20, y4, 50, 20)).string_("Utils");
 
             Button(v, Rect(74, y4 - 1, 78, 22))
-            .states_([["Clear Var"]])
+            .states_([["ClearPat"]])
             .action_({
                 ~plonkClearCurrentVariation.();
                 refreshPatternUI.();
@@ -2480,7 +2839,7 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             });
 
 Button(v, Rect(625, y4 - 1, 74, 22))
-.states_([["CopyRange"]])
+.states_([["CopyRan"]])
 .action_({
     ~plonkCopyStepRangeInCurrentVariation.(
         (rangeSrcABox.value.asInteger - 1).clip(0, 31),
@@ -2580,127 +2939,106 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 
 
 // step page
+
+
+
+
+
+// step page
 {
     var v = makePage.(\step);
-    var rowGap = 24;
+    var rowGap = 27;
     var addLockRow;
     var condMenu;
     var pageTitle;
 
     var yTitle = 8;
-    var yRow1 = 64;    // basic step params
-    var yRow2 = 108;   // degree + condition
-    var yRow3 = 176;   // layer row 1
-    var yRow4 = 214;   // layer row 2
-    var yLocks = 304;  // lock matrix start
-    var yBottom = 604; // bottom buttons
+    var yRow1 = 54;
+    var yRow2 = 98;
 
-    // lock matrix layout
-    var col1X = 28;
-    var col2X = 470;
-    var labelW = 108;
+    var ySynthHdr = 146;
+    var yRow3 = 176;
+    var yRow4 = 218;
+
+    var yLocksHdr = 274;
+    var yLocks = 304;
+    var yBottom = 756;
+
+    var col1X = 22;
+    var col2X = 492;
+    var col3X = 962;
+
+    var labelW = 112;
     var toggleW = 48;
-    var valueW = 90;
+    var valueW = 96;
     var valueGap = 10;
 
-    // section helpers
-    var sectionHdr, sectionLine, sectionPanel;
-
-    sectionHdr = { |x, y, text|
-        var t = StaticText(v, Rect(x, y, 260, 20));
-        t.string_(text);
-        t.font_(Font.default.boldVariant.size_(13));
-        t;
-    };
-
-    sectionLine = { |x, y, w=1280|
-        var u = UserView(v, Rect(x, y, w, 1));
-        u.background_(Color.grey(0.72));
-        u;
-    };
-
-    sectionPanel = { |x, y, w, h, color|
-        var p = UserView(v, Rect(x, y, w, h));
-        p.background_(color);
-        p;
-    };
-
-    // --------------------------------------------------
-    // page title
-    // --------------------------------------------------
-    pageTitle = StaticText(v, Rect(20, yTitle, 420, 28));
+    pageTitle = StaticText(v, Rect(20, yTitle, 420, 30));
     pageTitle.string_("Per-step Editor");
     pageTitle.font_(Font.default.boldVariant.size_(18));
 
     // --------------------------------------------------
-    // subtle tinted background panels
+    // TIMING + CONDITIONS
     // --------------------------------------------------
-    sectionPanel.(16, 36, 1185, 110, Color(0.95, 0.95, 0.93));// timing + conditions
-    sectionPanel.(16, 146, 1185, 110, Color(0.93, 0.95, 0.97)); // layering
-    sectionPanel.(16, 274, 920, 278, Color(0.95, 0.94, 0.96));  // lock matrix
-    sectionPanel.(16, 594, 420, 46, Color(0.94, 0.94, 0.94));   // bottom actions
-
-    // --------------------------------------------------
-    // SECTION 1: TIMING + CONDITIONS
-    // --------------------------------------------------
-    sectionHdr.(20, 40, "Timing + Conditions");
-    sectionLine.(20, 58, 1160);
+    StaticText(v, Rect(20, 32, 260, 20))
+    .string_("Timing + Conditions")
+    .font_(Font.default.boldVariant.size_(13));
 
     StaticText(v, Rect(20, yRow1, 80, 20)).string_("Step");
-    lockBoxes[\stepNum] = makeBoundedBox.(v, Rect(100, yRow1, 50, 20), 1, 1, 32, 1, 0, { |nb, val|
-    lockStep = (val.asInteger - 1).clip(0, 31);
-    refreshLockEditor.();
-});
+    lockBoxes[\stepNum] = makeBoundedBox.(v, Rect(102, yRow1, 52, 20), 1, 1, 32, 1, 0, { |nb, val|
+        lockStep = (val.asInteger - 1).clip(0, 31);
+        refreshLockEditor.();
+    });
 
-    lockEnableButtons[\on] = Button(v, Rect(170, yRow1 - 2, 60, 24))
+    lockEnableButtons[\on] = Button(v, Rect(174, yRow1 - 2, 64, 24))
     .states_([["Off"], ["On"]])
     .action_({ |bt|
         ~plonkSteps[lockStep][\on] = bt.value;
         refreshPatternUI.();
     });
 
-    StaticText(v, Rect(250, yRow1, 44, 20)).string_("Prob");
-    lockBoxes[\prob] = makeBoundedBox.(v, Rect(294, yRow1, 60, 20), 1.0, 0, 1, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(258, yRow1, 42, 20)).string_("Prob");
+    lockBoxes[\prob] = makeBoundedBox.(v, Rect(304, yRow1, 64, 20), 1.0, 0, 1, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\prob] = val;
     });
 
-    StaticText(v, Rect(370, yRow1, 52, 20)).string_("Rat");
-    lockBoxes[\ratchet] = makeBoundedBox.(v, Rect(420, yRow1, 60, 20), 1, 1, 4, 1, 0, { |nb, val|
+    StaticText(v, Rect(386, yRow1, 34, 20)).string_("Rat");
+    lockBoxes[\ratchet] = makeBoundedBox.(v, Rect(424, yRow1, 64, 20), 1, 1, 4, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\ratchet] = val.asInteger;
     });
 
-    StaticText(v, Rect(500, yRow1, 52, 20)).string_("Micro");
-    lockBoxes[\micro] = makeBoundedBox.(v, Rect(552, yRow1, 60, 20), 0.0, -0.49, 0.49, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(506, yRow1, 42, 20)).string_("Micro");
+    lockBoxes[\micro] = makeBoundedBox.(v, Rect(552, yRow1, 64, 20), 0.0, -0.49, 0.49, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\micro] = val;
     });
 
-    StaticText(v, Rect(630, yRow1, 44, 20)).string_("Gate");
-    lockBoxes[\gate] = makeBoundedBox.(v, Rect(674, yRow1, 60, 20), 0.85, 0.05, 1.25, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(634, yRow1, 38, 20)).string_("Gate");
+    lockBoxes[\gate] = makeBoundedBox.(v, Rect(676, yRow1, 64, 20), 0.85, 0.05, 1.25, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\gate] = val;
     });
 
-    StaticText(v, Rect(750, yRow1, 54, 20)).string_("Accent");
-    lockBoxes[\accent] = makeBoundedBox.(v, Rect(806, yRow1, 60, 20), 0.0, 0, 1, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(758, yRow1, 50, 20)).string_("Accent");
+    lockBoxes[\accent] = makeBoundedBox.(v, Rect(812, yRow1, 64, 20), 0.0, 0, 1, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\accent] = val;
     });
 
-    StaticText(v, Rect(880, yRow1, 34, 20)).string_("Len");
-    lockBoxes[\length] = makeBoundedBox.(v, Rect(912, yRow1, 44, 20), 1, 1, 8, 1, 0, { |nb, val|
+    StaticText(v, Rect(894, yRow1, 28, 20)).string_("Len");
+    lockBoxes[\length] = makeBoundedBox.(v, Rect(926, yRow1, 54, 20), 1, 1, 8, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\length] = val.asInteger.clip(1, 8);
     });
 
-    lockEnableButtons[\tie] = Button(v, Rect(972, yRow1 - 2, 68, 24))
+    lockEnableButtons[\tie] = Button(v, Rect(998, yRow1 - 2, 70, 24))
     .states_([["Tie Off"], ["Tie On"]])
     .action_({ |bt|
         ~plonkSteps[lockStep][\tie] = bt.value;
         refreshPatternUI.();
     });
 
-    stepNoteLabel = StaticText(v, Rect(1060, yRow1, 260, 20));
+    stepNoteLabel = StaticText(v, Rect(1088, yRow1, 260, 20));
     stepNoteLabel.string_("Resulting Note: " ++ ~plonkMidiToName.(~plonkSeq[\baseMidi]));
 
     StaticText(v, Rect(20, yRow2, 64, 20)).string_("UseDeg");
-    lockEnableButtons[\useDegree] = Button(v, Rect(86, yRow2 - 2, 58, 24))
+    lockEnableButtons[\useDegree] = Button(v, Rect(88, yRow2 - 2, 58, 24))
     .states_([["Off"], ["On"]])
     .action_({ |bt|
         ~plonkSteps[lockStep][\locks][\useDegree] = bt.value;
@@ -2708,22 +3046,22 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
         refreshLockEditor.();
     });
 
-    StaticText(v, Rect(160, yRow2, 54, 20)).string_("Degree");
-    lockBoxes[\degree] = makeBoundedBox.(v, Rect(216, yRow2, 52, 20), 0, -14, 14, 1, 0, { |nb, val|
+    StaticText(v, Rect(164, yRow2, 54, 20)).string_("Degree");
+    lockBoxes[\degree] = makeBoundedBox.(v, Rect(222, yRow2, 64, 20), 0, -14, 14, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\locks][\degree] = val.asInteger;
         refreshPatternUI.();
         refreshLockEditor.();
     });
 
-    StaticText(v, Rect(280, yRow2, 52, 20)).string_("DegOct");
-    lockBoxes[\degreeOct] = makeBoundedBox.(v, Rect(334, yRow2, 52, 20), 0, -3, 3, 1, 0, { |nb, val|
+    StaticText(v, Rect(300, yRow2, 52, 20)).string_("DegOct");
+    lockBoxes[\degreeOct] = makeBoundedBox.(v, Rect(356, yRow2, 54, 20), 0, -3, 3, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\locks][\degreeOct] = val.asInteger;
         refreshPatternUI.();
         refreshLockEditor.();
     });
 
-    StaticText(v, Rect(400, yRow2, 90, 20)).string_("Condition");
-    condMenu = PopUpMenu(v, Rect(492, yRow2, 140, 20));
+    StaticText(v, Rect(428, yRow2, 72, 20)).string_("Condition");
+    condMenu = PopUpMenu(v, Rect(504, yRow2, 150, 20));
     condMenu.items_(~plonkCondNames);
     condMenu.action_({
         ~plonkSteps[lockStep][\condType] = condMenu.value;
@@ -2731,98 +3069,113 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     });
     lockBoxes[\condType] = condMenu;
 
-    StaticText(v, Rect(646, yRow2, 20, 20)).string_("A");
-    lockBoxes[\condA] = makeBoundedBox.(v, Rect(666, yRow2, 48, 20), 1, 1, 16, 1, 0, { |nb, val|
+    StaticText(v, Rect(672, yRow2, 18, 20)).string_("A");
+    lockBoxes[\condA] = makeBoundedBox.(v, Rect(694, yRow2, 54, 20), 1, 1, 16, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\condA] = val.asInteger;
         refreshPatternUI.();
     });
 
-    StaticText(v, Rect(726, yRow2, 20, 20)).string_("B");
-    lockBoxes[\condB] = makeBoundedBox.(v, Rect(746, yRow2, 48, 20), 2, 1, 16, 1, 0, { |nb, val|
+    StaticText(v, Rect(764, yRow2, 18, 20)).string_("B");
+    lockBoxes[\condB] = makeBoundedBox.(v, Rect(786, yRow2, 54, 20), 2, 1, 16, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\condB] = val.asInteger;
         refreshPatternUI.();
     });
 
     // --------------------------------------------------
-    // SECTION 2: LAYERING
+    // SYNTH2 PARALLEL ENGINE
     // --------------------------------------------------
-    sectionHdr.(20, 150, "Layering");
-    sectionLine.(20, 168, 1160);
+    StaticText(v, Rect(20, ySynthHdr, 260, 20))
+    .string_("Synth2 Parallel Engine")
+    .font_(Font.default.boldVariant.size_(13));
 
-    StaticText(v, Rect(20, yRow3, 74, 20)).string_("LayerMode");
-    layerModeMenu = PopUpMenu(v, Rect(96, yRow3, 100, 20));
+    StaticText(v, Rect(20, yRow3, 40, 20)).string_("Mode");
+    layerModeMenu = PopUpMenu(v, Rect(64, yRow3, 110, 20));
     layerModeMenu.items_(~plonkLayerModeNames);
     layerModeMenu.action_({
         ~plonkSteps[lockStep][\layerMode] = layerModeMenu.value.asInteger;
         refreshPatternUI.();
     });
 
-    StaticText(v, Rect(212, yRow3, 74, 20)).string_("Eng2Model");
-    eng2ModelMenu = PopUpMenu(v, Rect(288, yRow3, 84, 20));
-    eng2ModelMenu.items_(modelNames);
+    StaticText(v, Rect(192, yRow3, 50, 20)).string_("Synth2");
+    eng2ModelMenu = PopUpMenu(v, Rect(246, yRow3, 120, 20));
+    eng2ModelMenu.items_(~plonkSynth2TypeNames);
     eng2ModelMenu.action_({
         ~plonkSteps[lockStep][\engine2Model] = eng2ModelMenu.value.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(388, yRow3, 62, 20)).string_("Eng2Exc");
-    eng2ExcMenu = PopUpMenu(v, Rect(452, yRow3, 110, 20));
-    eng2ExcMenu.items_(exciterNames);
+    StaticText(v, Rect(384, yRow3, 52, 20)).string_("Variant");
+    eng2ExcMenu = PopUpMenu(v, Rect(440, yRow3, 116, 20));
+    eng2ExcMenu.items_(~plonkSynth2VariantNames);
     eng2ExcMenu.action_({
         ~plonkSteps[lockStep][\engine2Exciter] = eng2ExcMenu.value.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(578, yRow3, 54, 20)).string_("LayerLvl");
-    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(636, yRow3, 52, 20), 0.60, 0.05, 1.0, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(574, yRow3, 38, 20)).string_("Level");
+    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(616, yRow3, 60, 20), 0.60, 0.05, 1.0, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\layerLevel] = val;
     });
 
-    StaticText(v, Rect(696, yRow3, 58, 20)).string_("Pitch2");
-    lockBoxes[\engine2PitchMode] = PopUpMenu(v, Rect(752, yRow3, 78, 20));
-    lockBoxes[\engine2PitchMode].items_(["Follow", "Semi", "Degree"]);
+    StaticText(v, Rect(694, yRow3, 36, 20)).string_("Pitch");
+    lockBoxes[\engine2PitchMode] = PopUpMenu(v, Rect(734, yRow3, 92, 20));
+    lockBoxes[\engine2PitchMode].items_(~plonkSynth2PitchModeNames);
     lockBoxes[\engine2PitchMode].action_({
         ~plonkSteps[lockStep][\engine2PitchMode] = lockBoxes[\engine2PitchMode].value.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(838, yRow3, 44, 20)).string_("Semi2");
-    lockBoxes[\engine2SemiOffset] = makeBoundedBox.(v, Rect(882, yRow3, 46, 20), 0, -24, 24, 1, 0, { |nb, val|
+    StaticText(v, Rect(844, yRow3, 32, 20)).string_("Semi");
+    lockBoxes[\engine2SemiOffset] = makeBoundedBox.(v, Rect(880, yRow3, 54, 20), 0, -24, 24, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\engine2SemiOffset] = val.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(936, yRow3, 40, 20)).string_("Deg2");
-    lockBoxes[\engine2DegreeOffset] = makeBoundedBox.(v, Rect(976, yRow3, 46, 20), 0, -14, 14, 1, 0, { |nb, val|
+    StaticText(v, Rect(950, yRow3, 24, 20)).string_("Deg");
+    lockBoxes[\engine2DegreeOffset] = makeBoundedBox.(v, Rect(978, yRow3, 54, 20), 0, -14, 14, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\engine2DegreeOffset] = val.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(1030, yRow3, 42, 20)).string_("Oct2");
-    lockBoxes[\engine2DegreeOctOffset] = makeBoundedBox.(v, Rect(1074, yRow3, 42, 20), 0, -3, 3, 1, 0, { |nb, val|
+    StaticText(v, Rect(1048, yRow3, 24, 20)).string_("Oct");
+    lockBoxes[\engine2DegreeOctOffset] = makeBoundedBox.(v, Rect(1076, yRow3, 54, 20), 0, -3, 3, 1, 0, { |nb, val|
         ~plonkSteps[lockStep][\engine2DegreeOctOffset] = val.asInteger;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(20, yRow4, 72, 20)).string_("Eng2DecMul");
-    lockBoxes[\engine2DecayMul] = makeBoundedBox.(v, Rect(96, yRow4, 58, 20), 1.00, 0.20, 3.00, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(20, yRow4, 66, 20)).string_("DecayMul");
+    lockBoxes[\engine2DecayMul] = makeBoundedBox.(v, Rect(90, yRow4, 62, 20), 1.00, 0.20, 3.00, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\engine2DecayMul] = val;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(170, yRow4, 64, 20)).string_("Eng2Noise+");
-    lockBoxes[\engine2NoiseOffset] = makeBoundedBox.(v, Rect(238, yRow4, 58, 20), 0.00, -1.2, 1.2, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(170, yRow4, 58, 20)).string_("Noise/Air");
+    lockBoxes[\engine2NoiseOffset] = makeBoundedBox.(v, Rect(232, yRow4, 62, 20), 0.00, -1.2, 1.2, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\engine2NoiseOffset] = val;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(312, yRow4, 60, 20)).string_("Eng2Click+");
-    lockBoxes[\engine2ClickOffset] = makeBoundedBox.(v, Rect(376, yRow4, 58, 20), 0.00, -2.0, 2.0, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(312, yRow4, 52, 20)).string_("Bite/Atk");
+    lockBoxes[\engine2ClickOffset] = makeBoundedBox.(v, Rect(368, yRow4, 62, 20), 0.00, -2.0, 2.0, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\engine2ClickOffset] = val;
+        refreshPatternUI.();
     });
 
-    StaticText(v, Rect(450, yRow4, 52, 20)).string_("Eng2Pan+");
-    lockBoxes[\engine2PanOffset] = makeBoundedBox.(v, Rect(506, yRow4, 58, 20), 0.00, -1.0, 1.0, 0.01, 2, { |nb, val|
+    StaticText(v, Rect(448, yRow4, 46, 20)).string_("PanOff");
+    lockBoxes[\engine2PanOffset] = makeBoundedBox.(v, Rect(498, yRow4, 62, 20), 0.00, -1.0, 1.0, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\engine2PanOffset] = val;
+        refreshPatternUI.();
     });
 
+    StaticText(v, Rect(584, yRow4, 560, 20))
+    .string_("Synth2 types: FM Burst / PWM Buzz / Ring Metal / Vowel Noise");
+
     // --------------------------------------------------
-    // SECTION 3: PER-STEP LOCKS
+    // PER-STEP LOCKS
     // --------------------------------------------------
-    sectionHdr.(20, 278, "Per-step Locks");
-    sectionLine.(20, 296, 900);
+    StaticText(v, Rect(20, yLocksHdr, 260, 20))
+    .string_("Per-step Locks")
+    .font_(Font.default.boldVariant.size_(13));
 
     addLockRow = { |x, y, label, key, min, max, step=0.01, decimals=2, isInt=false|
         var toggleX = x + labelW;
@@ -2873,6 +3226,7 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
         });
     };
 
+    // column 1
     addLockRow.(col1X, yLocks + (0 * rowGap), "Semi", \semi, -36, 36, 1, 0, true);
     addLockRow.(col1X, yLocks + (1 * rowGap), "Velocity", \velocity, 0, 1, 0.01, 2, false);
     addLockRow.(col1X, yLocks + (2 * rowGap), "Decay", \decay, 0.03, 6.0, 0.01, 2, false);
@@ -2884,6 +3238,7 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     addLockRow.(col1X, yLocks + (8 * rowGap), "Damp", \damp, 0, 1, 0.01, 2, false);
     addLockRow.(col1X, yLocks + (9 * rowGap), "Drive", \drive, 0.7, 2.0, 0.01, 2, false);
 
+    // column 2
     addLockRow.(col2X, yLocks + (0 * rowGap), "Tone", \tone, 0, 1, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (1 * rowGap), "NoiseAmt", \noiseAmt, 0, 1.2, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (2 * rowGap), "ClickAmt", \clickAmt, 0, 2.0, 0.01, 2, false);
@@ -2895,42 +3250,61 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     addLockRow.(col2X, yLocks + (8 * rowGap), "Spread", \spread, 0.2, 4.5, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (9 * rowGap), "Pan", \pan, -1, 1, 0.01, 2, false);
 
+    // column 3
+    addLockRow.(col3X, yLocks + (0 * rowGap), "FiltCut", \filterCutoff, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (1 * rowGap), "FiltRes", \filterRes, 0.01, 0.98, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (2 * rowGap), "FiltEnvAmt", \filterEnvAmt, 0, 4, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (3 * rowGap), "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, 0.001, 3, false);
+    addLockRow.(col3X, yLocks + (4 * rowGap), "CombAmt", \combAmt, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (5 * rowGap), "CombTime", \combTime, 0.0007, 0.03, 0.0005, 4, false);
+    addLockRow.(col3X, yLocks + (6 * rowGap), "CombDecay", \combDecay, 0.02, 2.0, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (7 * rowGap), "EdgeDrive", \edgeDrive, 0.5, 8.0, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (8 * rowGap), "FoldAmt", \foldAmt, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (9 * rowGap), "Presence", \presence, -1, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (10 * rowGap), "CrushMix", \crushMix, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (11 * rowGap), "BitDepth", \bitDepth, 2, 16, 1, 0, true);
+    addLockRow.(col3X, yLocks + (12 * rowGap), "Downsample", \downsample, 1, 24, 1, 0, true);
+    addLockRow.(col3X, yLocks + (13 * rowGap), "FilterMode", \filterMode, 0, 3, 1, 0, true);
+
     // --------------------------------------------------
     // bottom actions
     // --------------------------------------------------
-    makeButton.(v, Rect(20, yBottom, 90, 24), "Trig Step", {
-        var st = ~plonkSteps[lockStep];
-        if(st[\on] == 0) { st[\on] = 1 };
-        ~plonkTriggerStepVoices.(~plonkSelectedTrack, st, 0.35, lockStep);
-        refreshPatternUI.();
-    });
+yBottom = 712;
 
-    makeButton.(v, Rect(120, yBottom, 90, 24), "Clear", {
-        var oldSemi = ~plonkSteps[lockStep][\locks][\semi] ? 0;
-        var oldUseDegree = ~plonkSteps[lockStep][\locks][\useDegree] ? 0;
-        var oldDegree = ~plonkSteps[lockStep][\locks][\degree] ? 0;
-        var oldDegreeOct = ~plonkSteps[lockStep][\locks][\degreeOct] ? 0;
-        ~plonkSteps[lockStep] = ~makePlonkStep.(~plonkSteps[lockStep][\on]).deepCopy;
-        ~plonkSteps[lockStep][\locks][\semi] = oldSemi;
-        ~plonkSteps[lockStep][\locks][\useDegree] = oldUseDegree;
-        ~plonkSteps[lockStep][\locks][\degree] = oldDegree;
-        ~plonkSteps[lockStep][\locks][\degreeOct] = oldDegreeOct;
+makeButton.(v, Rect(24, yBottom, 96, 26), "Trig Step", {
+    var st = ~plonkSteps[lockStep];
+    if(st[\on] == 0) { st[\on] = 1 };
+    ~plonkTriggerStepVoices.(~plonkSelectedTrack, st, 0.35, lockStep);
+    refreshPatternUI.();
+});
+
+makeButton.(v, Rect(136, yBottom, 96, 26), "Clear", {
+    var oldSemi = ~plonkSteps[lockStep][\locks][\semi] ? 0;
+    var oldUseDegree = ~plonkSteps[lockStep][\locks][\useDegree] ? 0;
+    var oldDegree = ~plonkSteps[lockStep][\locks][\degree] ? 0;
+    var oldDegreeOct = ~plonkSteps[lockStep][\locks][\degreeOct] ? 0;
+    ~plonkSteps[lockStep] = ~makePlonkStep.(~plonkSteps[lockStep][\on]).deepCopy;
+    ~plonkSteps[lockStep][\locks][\semi] = oldSemi;
+    ~plonkSteps[lockStep][\locks][\useDegree] = oldUseDegree;
+    ~plonkSteps[lockStep][\locks][\degree] = oldDegree;
+    ~plonkSteps[lockStep][\locks][\degreeOct] = oldDegreeOct;
+    refreshLockEditor.();
+    refreshPatternUI.();
+});
+
+makeButton.(v, Rect(248, yBottom, 96, 26), "Copy", {
+    ~copiedPlonkStep = ~plonkSteps[lockStep].deepCopy;
+});
+
+makeButton.(v, Rect(360, yBottom, 96, 26), "Paste", {
+    if(~copiedPlonkStep.notNil) {
+        ~plonkSteps[lockStep] = ~copiedPlonkStep.deepCopy;
+        refreshPatternUI.();
         refreshLockEditor.();
-        refreshPatternUI.();
-    });
-
-    makeButton.(v, Rect(220, yBottom, 90, 24), "Copy", {
-        ~copiedPlonkStep = ~plonkSteps[lockStep].deepCopy;
-    });
-
-    makeButton.(v, Rect(320, yBottom, 90, 24), "Paste", {
-        if(~copiedPlonkStep.notNil) {
-            ~plonkSteps[lockStep] = ~copiedPlonkStep.deepCopy;
-            refreshPatternUI.();
-            refreshLockEditor.();
-        };
-    });
+    };
+});
 }.value;
+
 
         // audio page
         {
