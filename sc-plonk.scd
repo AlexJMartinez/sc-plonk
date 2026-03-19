@@ -607,7 +607,10 @@ sig = sig * amp * ampEnv;
     unisonVoices=1,
     unisonDetune=0.0,
     unisonStereo=0.0,
-    unisonDrift=0.0|
+    unisonDrift=0.0,
+	pitchEnvAmt=0.0,
+    pitchEnvDecay=0.03,
+    pitchEnvCurve=(-6)|
 
     var ampEnv, pitchEnv, attack;
     var voiceCount, detAmt, stereoAmt, driftAmt;
@@ -615,7 +618,7 @@ sig = sig * amp * ampEnv;
     var activeMask;
     var mkVoice, sig;
 
-    ampEnv = EnvGen.kr(
+        ampEnv = EnvGen.kr(
         Env.asr(0.001, 1, decay.clip(0.02, 2.0), curve: -4),
         gate,
         doneAction: 2
@@ -623,11 +626,12 @@ sig = sig * amp * ampEnv;
 
     pitchEnv = EnvGen.kr(
         Env(
-            [1 + (click.abs * 0.18), 1],
-            [0.015 + (motion * 0.03)],
-            curve: -6
+            [1 + pitchEnvAmt, 1],
+            [pitchEnvDecay.clip(0.001, 1.5)],
+            curve: pitchEnvCurve.clip(-12, 12)
         )
     );
+
 
     attack = Decay2.ar(
         Impulse.ar(0),
@@ -1039,6 +1043,9 @@ sig = sig * amp * ampEnv;
             engine2ClickOffset: 0.00,
             engine2PanOffset: 0.00,
 
+			synth2PitchEnvAmt: 0.0,
+            synth2PitchEnvDecay: 0.03,
+            synth2PitchEnvCurve: -6.0,
 			synth2Drive: 1.40,
 			synth2Color: 0.50,
 			synth2Motion: 0.25,
@@ -1421,6 +1428,11 @@ sig = sig * amp * ampEnv;
     args[\unisonStereo] = (step[\synth2UnisonStereo] ? 0.0).clip(0.0, 1.0);
     args[\unisonDrift] = (step[\synth2UnisonDrift] ? 0.0).clip(0.0, 1.0);
 
+	args[\pitchEnvAmt] = (step[\synth2PitchEnvAmt] ? 0.0);
+    args[\pitchEnvDecay] = (step[\synth2PitchEnvDecay] ? 0.03);
+    args[\pitchEnvCurve] = (step[\synth2PitchEnvCurve] ? -6.0);
+
+
     args[\trackIndex] = trackIdx;
     args;
 };
@@ -1558,6 +1570,12 @@ sig = sig * amp * ampEnv;
 				st[\synth2UnisonDetune] = rrand(0.0, 0.18);
 				st[\synth2UnisonStereo] = rrand(0.0, 0.95);
 				st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+
+				st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
+				st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+				st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
+
+
             };
 
             if((amt * 0.16).coin) {
@@ -1755,6 +1773,10 @@ sig = sig * amp * ampEnv;
 			st[\synth2UnisonStereo] = rrand(0.0, 0.95);
 			st[\synth2UnisonDrift] = rrand(0.0, 0.45);
 
+			st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
+            st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+            st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
+
             if((~plonkPitch[\scaleType] ? 0).asInteger == 0) {
                 st[\locks][\useDegree] = [0, 0, 1].choose;
                 st[\locks][\degree] = [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].choose;
@@ -1892,6 +1914,10 @@ sig = sig * amp * ampEnv;
 					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
 					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
 					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+
+					st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
+					st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+					st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
                 };
             },
 
@@ -1967,6 +1993,10 @@ sig = sig * amp * ampEnv;
 					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
 					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
 					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+
+					st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
+					st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+					st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
                 };
 
 					if((amount * 0.45).coin) {
@@ -2142,19 +2172,22 @@ MIDIdef.noteOn(\plonkV520On, { |vel, note|
         ~plonkStepIndicators = stepIndicators;
         ~plonkStepButtons = stepButtons;
 
-        win = Window("Plonk-ish v5.20", Rect(0, 40, 1498, 940)).front;
-        win.alwaysOnTop_(false);
-        win.userCanClose_(true);
-        win.setInnerExtent(1450, 980);
+win = Window("Plonk-ish v5.20", Rect(40, 60, 1450, 900));
+win.alwaysOnTop_(false);
+win.userCanClose_(true);
+win.view.background_(Color.white);
 
-        uiW = win.view.bounds.width.asInteger;
-        uiH = win.view.bounds.height.asInteger;
+uiW = win.view.bounds.width.asInteger;
+uiH = win.view.bounds.height.asInteger;
 
-        header = View(win, Rect(0, 0, uiW, 64));
-        content = View(win, Rect(0, 66, uiW, uiH - 66));
+header = View(win, Rect(0, 0, uiW, 64));
+content = View(win, Rect(0, 66, uiW, uiH - 66));
 
-        header.resize_(2);
-        content.resize_(5);
+header.resize_(2);
+content.resize_(5);
+
+header.background_(Color.white);
+content.background_(Color.white);
 
         makeButton = { |parent, bounds, label, action|
             var b = Button(parent, bounds);
@@ -2163,13 +2196,14 @@ MIDIdef.noteOn(\plonkV520On, { |vel, note|
             b;
         };
 
-        makePage = { |key|
-            var v = View(content, Rect(0, 0, content.bounds.width, content.bounds.height));
-            v.visible_(false);
-            v.resize_(5);
-            pages[key] = v;
-            v;
-        };
+makePage = { |key|
+    var v = View(content, Rect(0, 0, content.bounds.width, content.bounds.height));
+    v.visible_(false);
+    v.resize_(5);
+    v.background_(Color.white);
+    pages[key] = v;
+    v;
+};
 
         makeBoundedBox = { |parent, bounds, init=0, lo=0, hi=1, step=0.01, decimals=2, action|
             var nb = NumberBox(parent, bounds);
@@ -2188,9 +2222,22 @@ MIDIdef.noteOn(\plonkV520On, { |vel, note|
             nb;
         };
 
-        showPage = { |key|
-            pages.keysValuesDo { |k, v| v.visible_(k == key) };
-        };
+showPage = { |key|
+    pages.keysValuesDo { |k, v|
+        v.visible_(false);
+    };
+
+    if(pages[key].notNil) {
+        pages[key].visible_(true);
+    };
+
+    if(refreshControls.notNil) { refreshControls.() };
+    if(refreshPatternUI.notNil) { refreshPatternUI.() };
+    if(refreshLockEditor.notNil) { refreshLockEditor.() };
+    if(~plonkRefreshAudioMenus.notNil and: { key == \audio }) { ~plonkRefreshAudioMenus.() };
+
+    content.refresh;
+};
 
 
 		makeSlider = { |parent, x, y, label, key, min=0.0, max=1.0, spec=\lin|
@@ -2516,6 +2563,11 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
     if(lockBoxes[\synth2UnisonDetune].notNil) { lockBoxes[\synth2UnisonDetune].value_(st[\synth2UnisonDetune] ? 0.00) };
     if(lockBoxes[\synth2UnisonStereo].notNil) { lockBoxes[\synth2UnisonStereo].value_(st[\synth2UnisonStereo] ? 0.00) };
     if(lockBoxes[\synth2UnisonDrift].notNil) { lockBoxes[\synth2UnisonDrift].value_(st[\synth2UnisonDrift] ? 0.00) };
+
+
+			    if(lockBoxes[\synth2PitchEnvAmt].notNil) { lockBoxes[\synth2PitchEnvAmt].value_(st[\synth2PitchEnvAmt] ? 0.0) };
+    if(lockBoxes[\synth2PitchEnvDecay].notNil) { lockBoxes[\synth2PitchEnvDecay].value_(st[\synth2PitchEnvDecay] ? 0.03) };
+    if(lockBoxes[\synth2PitchEnvCurve].notNil) { lockBoxes[\synth2PitchEnvCurve].value_(st[\synth2PitchEnvCurve] ? -6.0) };
 
 ~plonkLockKeys.do { |k|
     var enKey = (k.asString ++ "_en").asSymbol;
@@ -3295,6 +3347,24 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
         refreshPatternUI.();
     });
 
+	StaticText(v, Rect(580, yRow4, 54, 20)).string_("PitchAmt");
+    lockBoxes[\synth2PitchEnvAmt] = makeBoundedBox.(v, Rect(638, yRow4, 64, 20), 0.0, -1.0, 1.0, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2PitchEnvAmt] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(720, yRow4, 58, 20)).string_("PitchDec");
+    lockBoxes[\synth2PitchEnvDecay] = makeBoundedBox.(v, Rect(782, yRow4, 64, 20), 0.03, 0.001, 1.5, 0.001, 3, { |nb, val|
+        ~plonkSteps[lockStep][\synth2PitchEnvDecay] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(864, yRow4, 56, 20)).string_("PitchCrv");
+    lockBoxes[\synth2PitchEnvCurve] = makeBoundedBox.(v, Rect(924, yRow4, 64, 20), -6.0, -12.0, 12.0, 0.1, 1, { |nb, val|
+        ~plonkSteps[lockStep][\synth2PitchEnvCurve] = val;
+        refreshPatternUI.();
+    });
+
     // --------------------------------------------------
     // PER-STEP LOCKS
     // --------------------------------------------------
@@ -3501,6 +3571,8 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 		refreshLockEditor.();
         ~plonkRefreshAudioMenus.();
         showPage.(\main);
+
+		win.front;
 
         win.onClose_({
             ~plonkSeqStop.();
