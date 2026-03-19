@@ -603,12 +603,17 @@ sig = sig * amp * ampEnv;
     fmRatio=2.0,
     fmIndex=2.0,
     formantMorph=0.3,
-    ringMix=0.5|
+    ringMix=0.5,
+    unisonVoices=1,
+    unisonDetune=0.0,
+    unisonStereo=0.0,
+    unisonDrift=0.0|
 
-    var ampEnv, pitchEnv, baseFreq;
-    var attack, sig, fmSig, pwmSig, ringSig, vowelSig;
-    var widthMod, modFreq, modAmt, mod;
-    var form1, form2, noiseSrc, oscA, oscB;
+    var ampEnv, pitchEnv, attack;
+    var voiceCount, detAmt, stereoAmt, driftAmt;
+    var panPos;
+    var activeMask;
+    var mkVoice, sig;
 
     ampEnv = EnvGen.kr(
         Env.asr(0.001, 1, decay.clip(0.02, 2.0), curve: -4),
@@ -624,8 +629,6 @@ sig = sig * amp * ampEnv;
         )
     );
 
-    baseFreq = freq * pitchEnv;
-
     attack = Decay2.ar(
         Impulse.ar(0),
         0.0002,
@@ -633,91 +636,118 @@ sig = sig * amp * ampEnv;
     ) * (0.12 + (click.abs * 0.25));
     attack = HPF.ar(attack, 1800);
 
-    // -----------------------------
-    // 0 = FM Burst
-    // -----------------------------
-    modFreq = baseFreq * (fmRatio.clip(0.25, 10) + (motion * 1.5));
-    modAmt = baseFreq * fmIndex.clip(0.1, 8) * (0.15 + (color * 0.85));
-    mod = SinOsc.ar(modFreq, 0, modAmt);
-    fmSig = SinOsc.ar(baseFreq + mod);
-    fmSig = (fmSig * 0.6)
-        + BPF.ar(fmSig, (baseFreq * (2 + color * 8)).clip(80, 16000), 0.4);
+    voiceCount = unisonVoices.clip(1, 4).round;
+    detAmt = unisonDetune.clip(0, 0.5);   // semitones
+    stereoAmt = unisonStereo.clip(0, 1);
+    driftAmt = unisonDrift.clip(0, 1);
 
-    // -----------------------------
-    // 1 = PWM Buzz
-    // -----------------------------
-widthMod = LFNoise2.kr(3 + (motion * 22)).range(
-    (0.04 + (color * 0.10)).neg,
-    (0.04 + (color * 0.10))
-);
+    mkVoice = { |i, spreadPos|
+        var baseFreq, driftSemi, detSemi, voicePan;
+        var fmSig, pwmSig, ringSig, vowelSig, voiceSig;
+        var modFreq, modAmt, mod, widthMod;
+        var form1, form2, noiseSrc, oscA, oscB;
 
-    pwmSig = Mix(Pulse.ar(
-        baseFreq * [1, 1.0015 + (motion * 0.01), 1.997],
-        (pwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
-    )) * 0.33;
+        driftSemi = LFNoise2.kr(
+            0.18 + (driftAmt * 3.8) + (i * 0.11)
+        ).range(-0.08, 0.08) * driftAmt;
 
-    pwmSig = HPF.ar(
-        RLPF.ar(
+        detSemi = spreadPos * detAmt;
+        baseFreq = freq * pitchEnv * (2 ** ((detSemi + driftSemi) / 12));
+        voicePan = (pan + (spreadPos * stereoAmt * 0.8)).clip(-1, 1);
+
+        // 0 = FM Burst
+        modFreq = baseFreq * (fmRatio.clip(0.25, 10) + (motion * 1.5));
+        modAmt = baseFreq * fmIndex.clip(0.1, 8) * (0.15 + (color * 0.85));
+        mod = SinOsc.ar(modFreq, 0, modAmt);
+        fmSig = SinOsc.ar(baseFreq + mod);
+        fmSig = (fmSig * 0.6)
+            + BPF.ar(fmSig, (baseFreq * (2 + color * 8)).clip(80, 16000), 0.4);
+
+        // 1 = PWM Buzz
+        widthMod = LFNoise2.kr(3 + (motion * 22) + (i * 0.07)).range(
+            (0.04 + (color * 0.10)).neg,
+            (0.04 + (color * 0.10))
+        );
+
+        pwmSig = Mix(Pulse.ar(
+            baseFreq * [1, 1.0015 + (motion * 0.01), 1.997],
+            (pwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
+        )) * 0.33;
+
+        pwmSig = HPF.ar(
+            RLPF.ar(
+                pwmSig,
+                (baseFreq * (3 + color * 10)).clip(120, 18000),
+                0.2
+            ),
+            50
+        );
+
+        // 2 = Ring Metal
+        oscA = Saw.ar(baseFreq * (1 + (motion * 0.015)));
+        oscB = SinOsc.ar(baseFreq * (1.5 + (color * 5.5) + (noise.abs * 1.5)));
+        ringSig = oscA * oscB;
+        ringSig = BPF.ar(
+            ringSig,
+            (baseFreq * (2.2 + (color * 9))).clip(100, 18000),
+            0.25 + (motion * 0.2)
+        );
+
+        // 3 = Vowel / Formant Noise
+        noiseSrc = PinkNoise.ar(0.7 + (noise.abs * 0.6));
+        form1 = formantMorph.clip(0, 1).linexp(0, 1, 350, 1100);
+        form2 = formantMorph.clip(0, 1).linexp(0, 1, 900, 3200);
+
+        vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
+            + BPF.ar(noiseSrc, form2, 0.12, 0.75);
+
+        vowelSig = vowelSig + (SinOsc.ar(baseFreq, 0, 0.15) * ringMix.clip(0, 1));
+        vowelSig = HPF.ar(vowelSig, 100);
+
+        voiceSig = SelectX.ar(synthType.clip(0, 3), [
+            fmSig,
             pwmSig,
-            (baseFreq * (3 + color * 10)).clip(120, 18000),
-            0.2
-        ),
-        50
-    );
+            ringSig,
+            vowelSig
+        ]);
 
-    // -----------------------------
-    // 2 = Ring Metal
-    // -----------------------------
-    oscA = Saw.ar(baseFreq * (1 + (motion * 0.015)));
-    oscB = SinOsc.ar(baseFreq * (1.5 + (color * 5.5) + (noise.abs * 1.5)));
-    ringSig = oscA * oscB;
-    ringSig = BPF.ar(
-        ringSig,
-        (baseFreq * (2.2 + (color * 9))).clip(100, 18000),
-        0.25 + (motion * 0.2)
-    );
+        voiceSig = voiceSig + attack;
 
-    // -----------------------------
-    // 3 = Vowel / Formant Noise
-    // -----------------------------
-    noiseSrc = PinkNoise.ar(0.7 + (noise.abs * 0.6));
-    form1 = formantMorph.clip(0, 1).linexp(0, 1, 350, 1100);
-    form2 = formantMorph.clip(0, 1).linexp(0, 1, 900, 3200);
+        voiceSig = voiceSig + LPF.ar(
+            WhiteNoise.ar(noise.abs.clip(0, 1) * 0.08),
+            (baseFreq * (6 + color * 12)).clip(500, 16000)
+        );
 
-    vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
-        + BPF.ar(noiseSrc, form2, 0.12, 0.75);
+        voiceSig = LeakDC.ar(voiceSig);
+        voiceSig = tanh(voiceSig * drive.clip(0.6, 6.0));
 
-    vowelSig = vowelSig + (SinOsc.ar(baseFreq, 0, 0.15) * ringMix.clip(0, 1));
-    vowelSig = HPF.ar(vowelSig, 100);
+        voiceSig = BPeakEQ.ar(
+            voiceSig,
+            (baseFreq * (4 + color * 8)).clip(800, 7000),
+            0.5,
+            velocity.linlin(0, 1, -2, 6)
+        );
 
-    sig = SelectX.ar(synthType.clip(0, 3), [
-        fmSig,
-        pwmSig,
-        ringSig,
-        vowelSig
-    ]);
+        voiceSig = HPF.ar(voiceSig, 35);
+        Pan2.ar(voiceSig, voicePan);
+    };
 
-    sig = sig + attack;
+    panPos = [-1.5, -0.5, 0.5, 1.5] / 1.5;
 
-    sig = sig + LPF.ar(
-        WhiteNoise.ar(noise.abs.clip(0, 1) * 0.08),
-        (baseFreq * (6 + color * 12)).clip(500, 16000)
-    );
+    sig = Mix.fill(4, { |i|
+        activeMask = Select.kr(i, [
+            1,
+            (voiceCount > 1),
+            (voiceCount > 2),
+            (voiceCount > 3)
+        ]);
+        mkVoice.(i, panPos[i]) * activeMask
+    });
 
-    sig = LeakDC.ar(sig);
-    sig = tanh(sig * drive.clip(0.6, 6.0));
-
-    sig = BPeakEQ.ar(
-        sig,
-        (baseFreq * (4 + color * 8)).clip(800, 7000),
-        0.5,
-        velocity.linlin(0, 1, -2, 6)
-    );
-
-    sig = HPF.ar(sig, 35);
+    sig = sig / voiceCount.sqrt.max(1);
     sig = sig * amp * ampEnv * velocity.linlin(0, 1, 0.35, 1.0);
 
-    Out.ar(out, Pan2.ar(sig, pan));
+    Out.ar(out, sig);
 }).add;
     };
 
@@ -1008,6 +1038,15 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
             engine2NoiseOffset: 0.00,
             engine2ClickOffset: 0.00,
             engine2PanOffset: 0.00,
+
+			synth2Drive: 1.40,
+			synth2Color: 0.50,
+			synth2Motion: 0.25,
+			synth2UnisonVoices: 1,
+			synth2UnisonDetune: 0.00,
+			synth2UnisonStereo: 0.00,
+			synth2UnisonDrift: 0.00,
+
             locks: (
                 semi: 0,
                 useDegree: 0,
@@ -1302,6 +1341,7 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
     var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
     var baseArgs = ~plonkBuildStepArgs.(trackIdx, step).copy;
     var mainMidi, layerMidi, excIdx, synthType;
+    var inferredColor, inferredMotion, inferredDrive;
     var args = ();
 
     if(useDegree == 1) {
@@ -1334,6 +1374,22 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
     excIdx = (step[\engine2Exciter] ? 0).asInteger.clip(0, 5);
     synthType = (step[\engine2Model] ? 0).asInteger.clip(0, 3);
 
+    inferredColor = (
+        excIdx.linlin(0, 5, 0.15, 0.95)
+        + ((step[\engine2NoiseOffset] ? 0.0) * 0.15)
+    ).clip(0, 1);
+
+    inferredMotion = (
+        ((step[\engine2DecayMul] ? 1.0).linlin(0.2, 3.0, 0.05, 0.95))
+        + ((step[\engine2ClickOffset] ? 0.0).abs * 0.20)
+    ).clip(0, 1);
+
+    inferredDrive = (
+        1.0
+        + ((step[\layerLevel] ? 0.60) * 1.5)
+        + ((step[\engine2ClickOffset] ? 0.0) * 0.8)
+    ).clip(0.6, 6.0);
+
     args[\freq] = layerMidi.clip(0, 127).midicps;
     args[\amp] = (baseArgs[\amp] * (step[\layerLevel] ? 0.60)).clip(0.001, 1.0);
     args[\pan] = (baseArgs[\pan] + (step[\engine2PanOffset] ? 0.0)).clip(-1.0, 1.0);
@@ -1342,21 +1398,9 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
     args[\decay] = (baseArgs[\decay] * (step[\engine2DecayMul] ? 1.0)).clip(0.02, 2.0);
     args[\synthType] = synthType;
 
-    args[\color] = (
-        excIdx.linlin(0, 5, 0.15, 0.95)
-        + ((step[\engine2NoiseOffset] ? 0.0) * 0.15)
-    ).clip(0, 1);
-
-    args[\motion] = (
-        ((step[\engine2DecayMul] ? 1.0).linlin(0.2, 3.0, 0.05, 0.95))
-        + ((step[\engine2ClickOffset] ? 0.0).abs * 0.20)
-    ).clip(0, 1);
-
-    args[\drive] = (
-        1.0
-        + ((step[\layerLevel] ? 0.60) * 1.5)
-        + ((step[\engine2ClickOffset] ? 0.0) * 0.8)
-    ).clip(0.6, 6.0);
+    args[\color] = (step[\synth2Color] ? inferredColor).clip(0, 1);
+    args[\motion] = (step[\synth2Motion] ? inferredMotion).clip(0, 1);
+    args[\drive] = (step[\synth2Drive] ? inferredDrive).clip(0.6, 6.0);
 
     args[\noise] = (step[\engine2NoiseOffset] ? 0.0).clip(-1.0, 1.0);
     args[\click] = (step[\engine2ClickOffset] ? 0.0).clip(-1.0, 1.0);
@@ -1371,6 +1415,11 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
 
     args[\formantMorph] = excIdx.linlin(0, 5, 0.0, 1.0).clip(0, 1);
     args[\ringMix] = (0.2 + ((step[\layerLevel] ? 0.60) * 0.7)).clip(0, 1);
+
+    args[\unisonVoices] = (step[\synth2UnisonVoices] ? 1).asInteger.clip(1, 4);
+    args[\unisonDetune] = (step[\synth2UnisonDetune] ? 0.0).clip(0.0, 0.5);
+    args[\unisonStereo] = (step[\synth2UnisonStereo] ? 0.0).clip(0.0, 1.0);
+    args[\unisonDrift] = (step[\synth2UnisonDrift] ? 0.0).clip(0.0, 1.0);
 
     args[\trackIndex] = trackIdx;
     args;
@@ -1501,6 +1550,14 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
                 st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                 st[\engine2ClickOffset] = rrand(-0.40, 0.40);
                 st[\engine2PanOffset] = rrand(-0.70, 0.70);
+
+				st[\synth2Drive] = rrand(0.9, 3.8);
+				st[\synth2Color] = rrand(0.0, 1.0);
+				st[\synth2Motion] = rrand(0.0, 1.0);
+				st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
+				st[\synth2UnisonDetune] = rrand(0.0, 0.18);
+				st[\synth2UnisonStereo] = rrand(0.0, 0.95);
+				st[\synth2UnisonDrift] = rrand(0.0, 0.45);
             };
 
             if((amt * 0.16).coin) {
@@ -1690,6 +1747,14 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
             st[\engine2ClickOffset] = rrand(-0.40, 0.40);
             st[\engine2PanOffset] = rrand(-0.70, 0.70);
 
+			st[\synth2Drive] = rrand(0.9, 3.8);
+			st[\synth2Color] = rrand(0.0, 1.0);
+			st[\synth2Motion] = rrand(0.0, 1.0);
+			st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
+			st[\synth2UnisonDetune] = rrand(0.0, 0.18);
+			st[\synth2UnisonStereo] = rrand(0.0, 0.95);
+			st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+
             if((~plonkPitch[\scaleType] ? 0).asInteger == 0) {
                 st[\locks][\useDegree] = [0, 0, 1].choose;
                 st[\locks][\degree] = [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7].choose;
@@ -1819,6 +1884,14 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
                     st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                     st[\engine2ClickOffset] = rrand(-0.40, 0.40);
                     st[\engine2PanOffset] = rrand(-0.70, 0.70);
+
+					st[\synth2Drive] = rrand(0.9, 3.8);
+					st[\synth2Color] = rrand(0.0, 1.0);
+					st[\synth2Motion] = rrand(0.0, 1.0);
+					st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
+					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
+					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
+					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
                 };
             },
 
@@ -1886,6 +1959,14 @@ widthMod = LFNoise2.kr(3 + (motion * 22)).range(
                     st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                     st[\engine2ClickOffset] = rrand(-0.40, 0.40);
                     st[\engine2PanOffset] = rrand(-0.70, 0.70);
+
+					st[\synth2Drive] = rrand(0.9, 3.8);
+					st[\synth2Color] = rrand(0.0, 1.0);
+					st[\synth2Motion] = rrand(0.0, 1.0);
+					st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
+					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
+					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
+					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
                 };
 
 					if((amount * 0.45).coin) {
@@ -2428,6 +2509,14 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
     if(lockBoxes[\engine2ClickOffset].notNil) { lockBoxes[\engine2ClickOffset].value_(st[\engine2ClickOffset] ? 0.00) };
     if(lockBoxes[\engine2PanOffset].notNil) { lockBoxes[\engine2PanOffset].value_(st[\engine2PanOffset] ? 0.00) };
 
+    if(lockBoxes[\synth2Drive].notNil) { lockBoxes[\synth2Drive].value_(st[\synth2Drive] ? 1.40) };
+    if(lockBoxes[\synth2Color].notNil) { lockBoxes[\synth2Color].value_(st[\synth2Color] ? 0.50) };
+    if(lockBoxes[\synth2Motion].notNil) { lockBoxes[\synth2Motion].value_(st[\synth2Motion] ? 0.25) };
+    if(lockBoxes[\synth2UnisonVoices].notNil) { lockBoxes[\synth2UnisonVoices].value_(st[\synth2UnisonVoices] ? 1) };
+    if(lockBoxes[\synth2UnisonDetune].notNil) { lockBoxes[\synth2UnisonDetune].value_(st[\synth2UnisonDetune] ? 0.00) };
+    if(lockBoxes[\synth2UnisonStereo].notNil) { lockBoxes[\synth2UnisonStereo].value_(st[\synth2UnisonStereo] ? 0.00) };
+    if(lockBoxes[\synth2UnisonDrift].notNil) { lockBoxes[\synth2UnisonDrift].value_(st[\synth2UnisonDrift] ? 0.00) };
+
 ~plonkLockKeys.do { |k|
     var enKey = (k.asString ++ "_en").asSymbol;
     var v = locks[k];
@@ -2938,11 +3027,6 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 
 
 
-// step page
-
-
-
-
 
 // step page
 {
@@ -2959,10 +3043,11 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     var ySynthHdr = 146;
     var yRow3 = 176;
     var yRow4 = 218;
+    var yRow5 = 260;
 
-    var yLocksHdr = 274;
-    var yLocks = 304;
-    var yBottom = 756;
+    var yLocksHdr = 320;
+    var yLocks = 350;
+    var yBottom = 700;
 
     var col1X = 22;
     var col2X = 492;
@@ -3167,8 +3252,48 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
         refreshPatternUI.();
     });
 
-    StaticText(v, Rect(584, yRow4, 560, 20))
-    .string_("Synth2 types: FM Burst / PWM Buzz / Ring Metal / Vowel Noise");
+    // dedicated synth2 controls
+    StaticText(v, Rect(20, yRow5, 44, 20)).string_("Drive");
+    lockBoxes[\synth2Drive] = makeBoundedBox.(v, Rect(68, yRow5, 64, 20), 1.40, 0.60, 6.00, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2Drive] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(150, yRow5, 42, 20)).string_("Color");
+    lockBoxes[\synth2Color] = makeBoundedBox.(v, Rect(196, yRow5, 64, 20), 0.50, 0.00, 1.00, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2Color] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(278, yRow5, 48, 20)).string_("Motion");
+    lockBoxes[\synth2Motion] = makeBoundedBox.(v, Rect(330, yRow5, 64, 20), 0.25, 0.00, 1.00, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2Motion] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(418, yRow5, 72, 20)).string_("UniVoice");
+    lockBoxes[\synth2UnisonVoices] = makeBoundedBox.(v, Rect(494, yRow5, 54, 20), 1, 1, 4, 1, 0, { |nb, val|
+        ~plonkSteps[lockStep][\synth2UnisonVoices] = val.asInteger.clip(1, 4);
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(566, yRow5, 62, 20)).string_("UniDet");
+    lockBoxes[\synth2UnisonDetune] = makeBoundedBox.(v, Rect(632, yRow5, 64, 20), 0.00, 0.00, 0.50, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2UnisonDetune] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(714, yRow5, 64, 20)).string_("UniStereo");
+    lockBoxes[\synth2UnisonStereo] = makeBoundedBox.(v, Rect(782, yRow5, 64, 20), 0.00, 0.00, 1.00, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2UnisonStereo] = val;
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(864, yRow5, 56, 20)).string_("UniDrift");
+    lockBoxes[\synth2UnisonDrift] = makeBoundedBox.(v, Rect(924, yRow5, 64, 20), 0.00, 0.00, 1.00, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\synth2UnisonDrift] = val;
+        refreshPatternUI.();
+    });
 
     // --------------------------------------------------
     // PER-STEP LOCKS
@@ -3269,40 +3394,38 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     // --------------------------------------------------
     // bottom actions
     // --------------------------------------------------
-yBottom = 712;
-
-makeButton.(v, Rect(24, yBottom, 96, 26), "Trig Step", {
-    var st = ~plonkSteps[lockStep];
-    if(st[\on] == 0) { st[\on] = 1 };
-    ~plonkTriggerStepVoices.(~plonkSelectedTrack, st, 0.35, lockStep);
-    refreshPatternUI.();
-});
-
-makeButton.(v, Rect(136, yBottom, 96, 26), "Clear", {
-    var oldSemi = ~plonkSteps[lockStep][\locks][\semi] ? 0;
-    var oldUseDegree = ~plonkSteps[lockStep][\locks][\useDegree] ? 0;
-    var oldDegree = ~plonkSteps[lockStep][\locks][\degree] ? 0;
-    var oldDegreeOct = ~plonkSteps[lockStep][\locks][\degreeOct] ? 0;
-    ~plonkSteps[lockStep] = ~makePlonkStep.(~plonkSteps[lockStep][\on]).deepCopy;
-    ~plonkSteps[lockStep][\locks][\semi] = oldSemi;
-    ~plonkSteps[lockStep][\locks][\useDegree] = oldUseDegree;
-    ~plonkSteps[lockStep][\locks][\degree] = oldDegree;
-    ~plonkSteps[lockStep][\locks][\degreeOct] = oldDegreeOct;
-    refreshLockEditor.();
-    refreshPatternUI.();
-});
-
-makeButton.(v, Rect(248, yBottom, 96, 26), "Copy", {
-    ~copiedPlonkStep = ~plonkSteps[lockStep].deepCopy;
-});
-
-makeButton.(v, Rect(360, yBottom, 96, 26), "Paste", {
-    if(~copiedPlonkStep.notNil) {
-        ~plonkSteps[lockStep] = ~copiedPlonkStep.deepCopy;
+    makeButton.(v, Rect(24, yBottom, 96, 26), "Trig Step", {
+        var st = ~plonkSteps[lockStep];
+        if(st[\on] == 0) { st[\on] = 1 };
+        ~plonkTriggerStepVoices.(~plonkSelectedTrack, st, 0.35, lockStep);
         refreshPatternUI.();
+    });
+
+    makeButton.(v, Rect(136, yBottom, 96, 26), "Clear", {
+        var oldSemi = ~plonkSteps[lockStep][\locks][\semi] ? 0;
+        var oldUseDegree = ~plonkSteps[lockStep][\locks][\useDegree] ? 0;
+        var oldDegree = ~plonkSteps[lockStep][\locks][\degree] ? 0;
+        var oldDegreeOct = ~plonkSteps[lockStep][\locks][\degreeOct] ? 0;
+        ~plonkSteps[lockStep] = ~makePlonkStep.(~plonkSteps[lockStep][\on]).deepCopy;
+        ~plonkSteps[lockStep][\locks][\semi] = oldSemi;
+        ~plonkSteps[lockStep][\locks][\useDegree] = oldUseDegree;
+        ~plonkSteps[lockStep][\locks][\degree] = oldDegree;
+        ~plonkSteps[lockStep][\locks][\degreeOct] = oldDegreeOct;
         refreshLockEditor.();
-    };
-});
+        refreshPatternUI.();
+    });
+
+    makeButton.(v, Rect(248, yBottom, 96, 26), "Copy", {
+        ~copiedPlonkStep = ~plonkSteps[lockStep].deepCopy;
+    });
+
+    makeButton.(v, Rect(360, yBottom, 96, 26), "Paste", {
+        if(~copiedPlonkStep.notNil) {
+            ~plonkSteps[lockStep] = ~copiedPlonkStep.deepCopy;
+            refreshPatternUI.();
+            refreshLockEditor.();
+        };
+    });
 }.value;
 
 
