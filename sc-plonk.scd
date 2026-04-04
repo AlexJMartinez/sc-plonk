@@ -885,19 +885,10 @@ sig = sig * amp * ampEnv;
 
 ~plonkRebuildAfterAudioChange = {
     ~plonkDefineSynth.();
-    MIDIClient.init;
-    MIDIIn.connectAll;
-
-    MIDIdef.noteOn(\plonkV520On, { |vel, note|
-        var trackIdx = ~plonkSelectedTrack;
-        var args = ~plonkTrackStates[trackIdx].copy;
-        args[\freq] = note.midicps;
-        args[\velocity] = vel / 127;
-        args[\trackIndex] = trackIdx;
-        ~plonkTrigger.(args);
-    });
-
+    ~plonkInstallMidi.();
     ~plonkRefreshAudioMenus.();
+    ~plonkUpdateMidiSyncStatus.();
+
     if(~plonkAudioStatus.notNil) {
         ~plonkAudioStatus.string_("Audio ready.");
     };
@@ -915,7 +906,7 @@ sig = sig * amp * ampEnv;
         ~plonkSeqStop.();
         ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
         ~plonkVoices.clear;
-        MIDIdef.noteOn(\plonkV520On).free;
+        ~plonkFreeMidiDefs.();
 
         s.options.memSize = 262144;
         s.options.sampleRate = sr;
@@ -938,6 +929,66 @@ sig = sig * amp * ampEnv;
 
     ~plonkSyncAudioStateFromServer.();
     ~plonkRefreshAudioDevices.();
+
+
+
+	    // --------------------------------------------------------
+    // MIDI sync state
+    // --------------------------------------------------------
+    ~plonkMidiSync = (
+    enabled: false,
+    sourceUID: nil,
+    isPlaying: false,
+    clockCount: 0,
+    stepIndex: 0,
+    clocksPerStep: 6,
+    lastClockTime: nil,
+    secPerClock: (1 / 48)   // default fallback ~120 BPM
+);
+
+    ~plonkMidiSources = Array.new;
+    ~plonkMidiSourceMenu = nil;
+    ~plonkMidiSyncStatus = nil;
+
+    ~plonkRefreshMidiSources = {
+    ~plonkMidiSources = (MIDIClient.sources ? []).asArray;
+};
+
+	~plonkRefreshMidiSourceMenuSelection = {
+    var idx = 0;
+
+    if(~plonkMidiSourceMenu.notNil) {
+        if(~plonkMidiSync[\sourceUID].notNil) {
+            idx = ~plonkMidiSources.detectIndex { |ep| ep.uid == ~plonkMidiSync[\sourceUID] };
+            if(idx.isNil) { idx = -1 };
+            ~plonkMidiSourceMenu.value_(idx + 1);
+        }{
+            ~plonkMidiSourceMenu.value_(0);
+        };
+    };
+};
+
+    ~plonkUpdateMidiSyncStatus = {
+        var srcLabel = "Any";
+        if(~plonkMidiSync[\sourceUID].notNil) {
+            var match = ~plonkMidiSources.detect { |ep| ep.uid == ~plonkMidiSync[\sourceUID] };
+            if(match.notNil) {
+                srcLabel = (match.device ? "Unknown") ++ " : " ++ (match.name ? "Unknown");
+            }{
+                srcLabel = ~plonkMidiSync[\sourceUID].asString;
+            };
+        };
+
+        if(~plonkMidiSyncStatus.notNil) {
+            ~plonkMidiSyncStatus.string_(
+                "Clock: "
+                ++ if(~plonkMidiSync[\enabled]) { "External MIDI" } { "Internal" }
+                ++ " | Playing: "
+                ++ if(~plonkMidiSync[\isPlaying]) { "Yes" } { "No" }
+                ++ " | Source: " ++ srcLabel
+            );
+        };
+    };
 
     // --------------------------------------------------------
     // voice management
@@ -1655,17 +1706,24 @@ sig = sig * amp * ampEnv;
     };
 };
 
-    ~plonkSeqStop = {
+        ~plonkSeqStop = {
         if(~plonkSeq[\task].notNil) {
             ~plonkSeq[\task].stop;
             ~plonkSeq[\task] = nil;
         };
+
         ~plonkSeq[\isRunning] = false;
         ~plonkSeq[\currentStep] = -1;
+
+        ~plonkMidiSync[\isPlaying] = false;
+        ~plonkMidiSync[\clockCount] = 0;
+        ~plonkMidiSync[\stepIndex] = 0;
+
         ~plonkRefreshPlayhead.();
+        ~plonkUpdateMidiSyncStatus.();
     };
 
-    ~plonkPlayLiveStep = { |stepIndex|
+        ~plonkProcessStep = { |stepIndex|
         var stepDur = ~plonkStepBeatDur.(stepIndex);
 
         ~plonkSeq[\currentStep] = stepIndex;
@@ -1692,12 +1750,20 @@ sig = sig * amp * ampEnv;
                     if(useTie == 1) {
                         noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
                         gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
-                        gateDurSecs = gateDurBeats / ~plonkClock.tempo.max(0.0001);
+                        gateDurSecs = if(~plonkMidiSync[\enabled]) {
+    gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1/48)) * 24);
+}{
+    gateDurBeats / (~plonkClock.tempo.max(0.0001));
+};
                         ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
                         didPlay = true;
                     }{
                         gateDurBeats = (stepDur * st[\gate].clip(0.05, 1.25)).max(0.01);
-                        gateDurSecs = gateDurBeats / ~plonkClock.tempo.max(0.0001);
+                        gateDurSecs = if(~plonkMidiSync[\enabled]) {
+    gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1/48)) * 24);
+}{
+    gateDurBeats / (~plonkClock.tempo.max(0.0001));
+};
                         ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
                         didPlay = true;
                     };
@@ -1706,36 +1772,68 @@ sig = sig * amp * ampEnv;
                 ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
             };
         };
+    };
 
+    ~plonkPlayLiveStep = { |stepIndex|
+        var stepDur = ~plonkStepBeatDur.(stepIndex);
+        ~plonkProcessStep.(stepIndex);
         stepDur.wait;
     };
 
-    ~plonkSeqStart = {
+    ~plonkAdvanceExternalStep = {
+        var idx = (~plonkMidiSync[\stepIndex] ? 0).clip(0, 31);
+
+        ~plonkProcessStep.(idx);
+
+        idx = (idx + 1) % ~plonkSeq[\steps].clip(1, 32);
+        ~plonkMidiSync[\stepIndex] = idx;
+
+        if(idx == 0) {
+            ~plonkSeq[\cycleCount] = (~plonkSeq[\cycleCount] ? 1) + 1;
+            ~plonkAdvanceChain.();
+            ~plonkRunMutationIfNeeded.();
+
+            AppClock.sched(0, {
+                if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+                nil
+            });
+        };
+    };
+
+        ~plonkSeqStart = {
         ~plonkSeqStop.();
         ~plonkSeq[\isRunning] = true;
         ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
         ~plonkResetChain.();
         ~plonkClock.tempo = ~plonkSeq[\tempo] / 60;
 
-        ~plonkSeq[\task] = Task({
-            var idx = 0;
-            loop {
-                ~plonkPlayLiveStep.(idx);
-                idx = (idx + 1) % ~plonkSeq[\steps].clip(1, 32);
+        if(~plonkMidiSync[\enabled]) {
+            ~plonkMidiSync[\isPlaying] = false;
+            ~plonkMidiSync[\clockCount] = 0;
+            ~plonkMidiSync[\stepIndex] = 0;
+            ~plonkUpdateMidiSyncStatus.();
+        }{
+            ~plonkSeq[\task] = Task({
+                var idx = 0;
+                loop {
+                    ~plonkPlayLiveStep.(idx);
+                    idx = (idx + 1) % ~plonkSeq[\steps].clip(1, 32);
 
-                if(idx == 0) {
-                    ~plonkSeq[\cycleCount] = ~plonkSeq[\cycleCount] + 1;
-                    ~plonkAdvanceChain.();
-                    ~plonkRunMutationIfNeeded.();
+                    if(idx == 0) {
+                        ~plonkSeq[\cycleCount] = ~plonkSeq[\cycleCount] + 1;
+                        ~plonkAdvanceChain.();
+                        ~plonkRunMutationIfNeeded.();
 
-                    AppClock.sched(0, {
-                        if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
-                        nil
-                    });
+                        AppClock.sched(0, {
+                            if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+                            nil
+                        });
+                    };
                 };
-            };
-        }).play(~plonkClock);
+            }).play(~plonkClock);
+        };
     };
+
 
     ~plonkRandomizeOnePattern = { |steps|
         32.do { |i|
@@ -2119,21 +2217,170 @@ if((amount * 0.12).coin) {
         };
     };
 
+
     // --------------------------------------------------------
     // MIDI
     // --------------------------------------------------------
-    MIDIClient.init;
+~plonkFreeMidiDefs = {
+    MIDIdef.noteOn(\plonkV520On).free;
+    MIDIdef.midiClock(\plonkClockIn).free;
+    MIDIdef.start(\plonkStartIn).free;
+    MIDIdef.continue(\plonkContinueIn).free;
+    MIDIdef.stop(\plonkStopIn).free;
+};
+
+
+	~plonkInitMidiSystem = {
+    MIDIClient.disposeClient;
+    MIDIClient.init(nil, nil, true);
     MIDIIn.connectAll;
+    ~plonkMidiSources = (MIDIClient.sources ? []).asArray;
+};
 
-MIDIdef.noteOn(\plonkV520On, { |vel, note|
-    var trackIdx = ~plonkSelectedTrack;
-    var args = ~plonkTrackStates[trackIdx].copy;
-    args[\freq] = note.midicps;
-    args[\velocity] = vel / 127;
-    args[\trackIndex] = trackIdx;
-    ~plonkTrigger.(args);
-});
+ ~plonkInstallMidi = {
+    var wantedUID;
 
+    ~plonkFreeMidiDefs.();
+    ~plonkInitMidiSystem.();
+
+    wantedUID = ~plonkMidiSync[\sourceUID];
+
+    MIDIdef.noteOn(\plonkV520On, { |vel, note, chan, src|
+        var trackIdx, args, accept;
+
+        accept = wantedUID.isNil or: { src == wantedUID };
+
+        ["NOTEON RAW", "src:", src, "wanted:", wantedUID, "chan:", chan, "note:", note, "vel:", vel].postln;
+
+        if(accept) {
+            trackIdx = ~plonkSelectedTrack;
+            args = ~plonkTrackStates[trackIdx].copy;
+            args[\freq] = note.midicps;
+            args[\velocity] = vel / 127;
+            args[\trackIndex] = trackIdx;
+            ~plonkTrigger.(args);
+        };
+    });
+
+    MIDIdef.start(\plonkStartIn, { |src|
+        var accept = wantedUID.isNil or: { src == wantedUID };
+
+        ["START RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+
+        if(accept and: { ~plonkMidiSync[\enabled] }) {
+            if(~plonkSeq[\task].notNil) {
+                ~plonkSeq[\task].stop;
+                ~plonkSeq[\task] = nil;
+            };
+
+            ~plonkSeq[\isRunning] = true;
+            ~plonkSeq[\currentStep] = -1;
+            ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
+            ~plonkSeq[\cycleCount] = 1;
+            ~plonkResetChain.();
+
+            ~plonkMidiSync[\isPlaying] = true;
+            ~plonkMidiSync[\clockCount] = 0;
+            ~plonkMidiSync[\stepIndex] = 0;
+            ~plonkMidiSync[\lastClockTime] = nil;
+
+            ["START ACCEPTED", "src:", src].postln;
+
+            {
+                ~plonkRefreshPlayhead.();
+                ~plonkUpdateMidiSyncStatus.();
+            }.defer;
+        };
+    });
+
+    MIDIdef.continue(\plonkContinueIn, { |src|
+        var accept = wantedUID.isNil or: { src == wantedUID };
+
+        ["CONTINUE RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+
+        if(accept and: { ~plonkMidiSync[\enabled] }) {
+            if(~plonkSeq[\task].notNil) {
+                ~plonkSeq[\task].stop;
+                ~plonkSeq[\task] = nil;
+            };
+
+            ~plonkSeq[\isRunning] = true;
+            ~plonkMidiSync[\isPlaying] = true;
+            ~plonkMidiSync[\lastClockTime] = nil;
+
+            ["CONTINUE ACCEPTED", "src:", src].postln;
+
+            {
+                ~plonkUpdateMidiSyncStatus.();
+            }.defer;
+        };
+    });
+
+    MIDIdef.stop(\plonkStopIn, { |src|
+        var accept = wantedUID.isNil or: { src == wantedUID };
+
+        ["STOP RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+
+        if(accept and: { ~plonkMidiSync[\enabled] }) {
+            ~plonkMidiSync[\isPlaying] = false;
+            ~plonkSeq[\isRunning] = false;
+            ~plonkSeq[\currentStep] = -1;
+            ~plonkMidiSync[\lastClockTime] = nil;
+            ~plonkMidiSync[\clockCount] = 0;
+
+            ["STOP ACCEPTED", "src:", src].postln;
+
+            {
+                ~plonkRefreshPlayhead.();
+                ~plonkUpdateMidiSyncStatus.();
+            }.defer;
+        };
+    });
+
+    MIDIdef.midiClock(\plonkClockIn, { |src|
+        var now, dt, accept;
+
+        accept = wantedUID.isNil or: { src == wantedUID };
+
+        if(accept) {
+            ["CLOCK RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled], "playing:", ~plonkMidiSync[\isPlaying]].postln;
+        };
+
+        if(accept and: { ~plonkMidiSync[\enabled] } and: { ~plonkMidiSync[\isPlaying] }) {
+            now = Main.elapsedTime;
+
+            if(~plonkMidiSync[\lastClockTime].notNil) {
+                dt = now - ~plonkMidiSync[\lastClockTime];
+                if(dt > 0) {
+                    ~plonkMidiSync[\secPerClock] = dt;
+                };
+            };
+
+            ~plonkMidiSync[\lastClockTime] = now;
+            ~plonkMidiSync[\clockCount] = (~plonkMidiSync[\clockCount] ? 0) + 1;
+
+            if((~plonkMidiSync[\clockCount] % 24) == 0) {
+                ["CLOCK ACCEPTED", "src:", src, "count:", ~plonkMidiSync[\clockCount]].postln;
+            };
+
+            if((~plonkMidiSync[\clockCount] % (~plonkMidiSync[\clocksPerStep] ? 6)) == 0) {
+                ~plonkAdvanceExternalStep.();
+            };
+        };
+    });
+
+    "Installed MIDI transport defs.".postln;
+    "Available MIDI sources:".postln;
+    ~plonkMidiSources.do { |ep|
+        [ep.uid, ep.device, ep.name].postln;
+    };
+
+    {
+        ~plonkUpdateMidiSyncStatus.();
+    }.defer;
+};
+
+    ~plonkInstallMidi.();
 
     // --------------------------------------------------------
     // GUI
@@ -3561,6 +3808,87 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
                 "That helps avoid sample-rate mismatch errors with BlackHole, Aggregate Device, or Multi-Output Device."
             );
 
+
+			            StaticText(v, Rect(20, 450, 1000, 20)).string_(
+                "External MIDI sync: slave sequencer transport to DAW MIDI clock/start/stop."
+            );
+
+            Button(v, Rect(20, 480, 140, 24))
+            .states_([
+                ["Internal Clock", Color.black, Color.grey(0.85)],
+                ["External MIDI", Color.white, Color(0.25, 0.55, 0.90)]
+            ])
+            .value_(~plonkMidiSync[\enabled].asInteger)
+            .action_({ |bt|
+                ~plonkMidiSync[\enabled] = (bt.value == 1);
+
+                if(~plonkMidiSync[\enabled].not) {
+                    ~plonkMidiSync[\isPlaying] = false;
+                    ~plonkMidiSync[\clockCount] = 0;
+                    ~plonkMidiSync[\stepIndex] = 0;
+                };
+
+                ~plonkInstallMidi.();
+                ~plonkUpdateMidiSyncStatus.();
+            });
+
+            StaticText(v, Rect(180, 482, 80, 20)).string_("MIDI Source");
+            ~plonkMidiSourceMenu = PopUpMenu(v, Rect(264, 480, 420, 22));
+
+            ~plonkMidiSourceMenu.items_(
+                ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+                    (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
+                }
+            );
+
+            ~plonkMidiSourceMenu.action_({
+                var idx = ~plonkMidiSourceMenu.value;
+
+                if(idx <= 0) {
+                    ~plonkMidiSync[\sourceUID] = nil;
+                }{
+                    ~plonkMidiSync[\sourceUID] = ~plonkMidiSources[idx - 1].uid;
+                };
+
+                ~plonkInstallMidi.();
+                ~plonkUpdateMidiSyncStatus.();
+            });
+
+          makeButton.(v, Rect(700, 480, 120, 24), "Refresh MIDI", {
+    ~plonkRefreshMidiSources.();
+
+    if(~plonkMidiSourceMenu.notNil) {
+        ~plonkMidiSourceMenu.items_(
+            ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+                (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
+            }
+        );
+        ~plonkRefreshMidiSourceMenuSelection.();
+    };
+
+    ~plonkInstallMidi.();
+    ~plonkUpdateMidiSyncStatus.();
+});
+
+            ~plonkMidiSyncStatus = StaticText(v, Rect(20, 516, 1200, 20));
+            ~plonkMidiSyncStatus.string_("Clock: Internal");
+
+            StaticText(v, Rect(20, 548, 1100, 60)).string_(
+                "In Ableton, enable Sync on the MIDI output port going to SuperCollider "
+                ++ "(for example an IAC bus on macOS), then press play in Ableton."
+            );
+
+            ~plonkRefreshMidiSources.();
+if(~plonkMidiSourceMenu.notNil) {
+    ~plonkMidiSourceMenu.items_(
+        ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+            (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
+        }
+    );
+    ~plonkRefreshMidiSourceMenuSelection.();
+};
+~plonkUpdateMidiSyncStatus.();
+
             ~plonkRefreshAudioMenus.();
         }.value;
 
@@ -3575,13 +3903,12 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 		win.front;
 
         win.onClose_({
-            ~plonkSeqStop.();
-            MIDIdef.noteOn(\plonkV520On).free;
-            ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
-            ~plonkVoices.clear;
-        });
+    ~plonkSeqStop.();
+    ~plonkFreeMidiDefs.();
+    ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
+    ~plonkVoices.clear;
+});
     }.defer;
 
 });
 )
-
