@@ -317,446 +317,939 @@ s.waitForBoot({
     };
 };
 
+
+	~plonkMaster = (
+    outBus: 0,
+    mixBus: nil,
+    trimDb: -12.0,
+    limiterLevel: 0.85,
+    limiterDur: 0.01,
+    softClipAmt: 0.15
+);
+
+	~plonkInitMasterOut = {
+    if(~plonkMaster[\mixBus].notNil) {
+        try { ~plonkMaster[\mixBus].free } { };
+    };
+
+    if(~plonkMaster[\synth].notNil) {
+        try { ~plonkMaster[\synth].free } { };
+    };
+
+    ~plonkMaster[\mixBus] = Bus.audio(s, 2);
+
+    ~plonkMaster[\synth] = Synth(\plonkV520MasterOut, [
+        \inBus, ~plonkMaster[\mixBus].index,
+        \out, ~plonkMaster[\outBus],
+        \trimDb, ~plonkMaster[\trimDb],
+        \limiterLevel, ~plonkMaster[\limiterLevel],
+        \limiterDur, ~plonkMaster[\limiterDur],
+        \softClipAmt, ~plonkMaster[\softClipAmt]
+    ]);
+};
+
+
+	~plonkFreeMixer = {
+    ~plonkMixer[\tracks].do { |ch|
+        if(ch[\synth].notNil) {
+            try { ch[\synth].free } { };
+            ch[\synth] = nil;
+        };
+        if(ch[\bus].notNil) {
+            try { ch[\bus].free } { };
+            ch[\bus] = nil;
+        };
+        if(ch[\meterBus].notNil) {
+            try { ch[\meterBus].free } { };
+            ch[\meterBus] = nil;
+        };
+    };
+};
+
+~plonkMixerEffectiveMute = { |trackIdx|
+    var ch = ~plonkMixer[\tracks][trackIdx];
+    var anySolo = ~plonkMixerAnySolo.();
+
+    if(anySolo) {
+        if((ch[\solo] ? 0) == 1) { 0 } { 1 }
+    }{
+        (ch[\mute] ? 0).asInteger
+    }
+};
+
+~plonkInitMixer = {
+    ~plonkFreeMixer.();
+
+    ~plonkTrackCount.do { |i|
+        var ch = ~plonkMixer[\tracks][i];
+
+        ch[\bus] = Bus.audio(s, 2);
+        ch[\meterBus] = Bus.control(s, 1);
+
+        ch[\synth] = Synth.before(~plonkMaster[\synth], \plonkV520MixerChan, [
+    \inBus, ch[\bus].index,
+    \outBus, ~plonkMaster[\mixBus].index,
+    \meterBus, ch[\meterBus].index,
+    \level, (ch[\level] ? 1.0),
+    \pan, (ch[\pan] ? 0.0),
+    \mute, ~plonkMixerEffectiveMute.(i)
+]);
+    };
+};
+
+~plonkUpdateMixerRouting = {
+    ~plonkTrackCount.do { |i|
+        var ch = ~plonkMixer[\tracks][i];
+        if(ch[\synth].notNil) {
+            ch[\synth].set(
+                \level, (ch[\level] ? 1.0),
+                \pan, (ch[\pan] ? 0.0),
+                \mute, ~plonkMixerEffectiveMute.(i)
+            );
+        };
+    };
+};
+
     // --------------------------------------------------------
     // synth definition
     // --------------------------------------------------------
     ~plonkDefineSynth = {
-        SynthDef(\plonkV520, {
-            |out=0, amp=0.22, pan=0,
-            freq=220, gate=1, velocity=0.9,
-            model=0,
-            exciterType=0,
-            brightness=0.65,
-            material=0.55,
-            inharm=0.22,
-            position=0.22,
-            decay=1.2,
-            body=0.45,
-            damp=0.25,
-            drive=1.15,
-            tone=0.58,
-            noiseAmt=0.32,
-            clickAmt=0.82,
-            excDecay=0.025,
-            detune=0.0025,
-            spread=1.0,
-            pitchEnvAmt=0.0,
-            pitchEnvDecay=0.03,
-            velToBright=0.35,
-            velToDecay=0.2,
-            velToNoise=0.2,
-            velToClick=0.2,
-			filterMode=0,
-			filterCutoff=0.65,
-			filterRes=0.25,
-			filterEnvAmt=0.35,
-			filterEnvDecay=0.08,
-			combAmt=0.0,
-			combTime=0.008,
-			combDecay=0.18,
-			edgeDrive=1.0,
-			foldAmt=0.0,
-			presence=0.0,
-			crushMix=0.0,
-			bitDepth=12,
-			downsample=1|
 
-            var ampEnv, excEnv, pitchEnv;
-            var baseFreq, effBright, effDecay, effNoise, effClick;
-            var mallet, hardPick, brush, scrape, burst, impulseCluster, exciter;
-            var sigA, sigB, sig, bodySig;
-            var numModes = 12;
-            var strikeShape, brightScale, lowBoost;
-            var modelPartialsA, modelPartialsB;
-            var ampShapeA, ampShapeB, ringShapeA, ringShapeB;
-            var mkBank, bankA, bankB;
-			var filterEnv, filtFreq, filtRq, filtered, comb, folded, crushed, ds, bits, step;
 
-            pitchEnv = EnvGen.kr(
-                Env([1 + pitchEnvAmt, 1], [pitchEnvDecay], curve: -6)
-            );
-
-			filterEnv = EnvGen.kr(
-    Env([1 + filterEnvAmt.clip(0, 4), 1], [filterEnvDecay.clip(0.005, 1.5)], curve: -6)
-);
-
-            baseFreq = freq * pitchEnv;
-
-            effBright = (brightness + ((velocity - 0.5) * 2 * velToBright)).clip(0, 1);
-            effDecay  = (decay * (1 + ((velocity - 0.5) * 2 * velToDecay))).clip(0.03, 6.0);
-            effNoise  = (noiseAmt + ((velocity - 0.5) * 2 * velToNoise)).clip(0, 1.2);
-            effClick  = (clickAmt + ((velocity - 0.5) * 2 * velToClick)).clip(0, 2.0);
-
-            excEnv = EnvGen.kr(Env.perc(0.0006, excDecay.clip(0.001, 0.2), curve: -4));
-            ampEnv = EnvGen.kr(Env.asr(0.001, 1, effDecay, curve: -4), gate, doneAction: 2);
-
-            mallet = LPF.ar(WhiteNoise.ar(effNoise * 0.55), tone.linexp(0, 1, 1200, 9000))
-                + Decay2.ar(Impulse.ar(0), 0.0004, 0.003) * effClick * 0.9;
-            mallet = mallet * EnvGen.kr(Env.perc(0.0004, excDecay * 1.0, curve: -5));
-
-            hardPick = HPF.ar(WhiteNoise.ar(effNoise * 0.25), 1800)
-                + Decay2.ar(Impulse.ar(0), 0.00015, 0.0016) * effClick * 1.25;
-            hardPick = hardPick * EnvGen.kr(Env.perc(0.0002, excDecay * 0.65, curve: -7));
-
-            brush = LPF.ar(PinkNoise.ar(effNoise * 0.85), tone.linexp(0, 1, 900, 7000));
-            brush = brush * EnvGen.kr(Env.perc(0.001, excDecay * 1.7, curve: -2));
-
-            scrape = HPF.ar(WhiteNoise.ar(effNoise * 0.9), 1400);
-            scrape = BPF.ar(scrape, tone.linexp(0, 1, 1800, 10000), 0.45);
-            scrape = scrape * EnvGen.kr(Env.perc(0.0008, excDecay * 2.0, curve: -1));
-
-            burst = BPF.ar(WhiteNoise.ar(effNoise * 0.75), tone.linexp(0, 1, 500, 8000), 0.5)
-                + Decay2.ar(Impulse.ar(0), 0.00025, 0.0022) * effClick * 0.55;
-            burst = burst * EnvGen.kr(Env.perc(0.0004, excDecay * 0.9, curve: -4));
-
-            impulseCluster = Mix.fill(4, { |i|
-                DelayN.ar(
-                    Decay2.ar(Impulse.ar(0), 0.00012, 0.0012 + (i * 0.00022)) * (effClick * (1 - (i * 0.12))),
-                    0.02,
-                    [0.0, 0.0015, 0.0033, 0.0052].wrapAt(i)
-                )
-            }) + HPF.ar(WhiteNoise.ar(effNoise * 0.18), 2500);
-            impulseCluster = impulseCluster * EnvGen.kr(Env.perc(0.0002, excDecay * 0.7, curve: -6));
-
-            exciter = SelectX.ar(exciterType.clip(0, 5), [
-                mallet, hardPick, brush, scrape, burst, impulseCluster
-            ]);
-
-            exciter = HPF.ar(exciter * excEnv * velocity, 25);
-            exciter = tanh(exciter * drive);
-
-            modelPartialsA = Select.kr(model.clip(0, 3), [
-                [1.00, 2.76, 5.40, 8.93, 13.34, 18.64, 24.83, 31.92, 39.91, 48.80, 58.59, 69.28],
-                [1.00, 1.63, 2.31, 2.92, 3.58, 4.21, 4.86, 5.53, 6.19, 6.88, 7.56, 8.24],
-                [1.00, 2.01, 2.97, 4.11, 5.43, 6.80, 8.21, 9.69, 11.20, 12.78, 14.40, 16.05],
-                [1.00, 1.59, 2.14, 2.30, 2.92, 3.45, 3.92, 4.50, 5.10, 5.76, 6.35, 6.98]
-            ]);
-
-            modelPartialsB = Select.kr(model.clip(0, 3), [
-                [1.00, 3.99, 9.30, 16.71, 26.22, 37.83, 51.54, 67.35, 85.26, 105.27, 127.38, 151.59],
-                [1.00, 1.41, 1.99, 2.58, 3.16, 3.73, 4.33, 4.91, 5.51, 6.11, 6.72, 7.34],
-                [0.50, 1.34, 2.72, 3.88, 5.02, 6.17, 7.51, 8.93, 10.40, 11.94, 13.53, 15.18],
-                [0.84, 1.28, 1.83, 2.41, 2.77, 3.18, 3.74, 4.12, 4.69, 5.31, 5.89, 6.42]
-            ]);
-
-            strikeShape = Array.fill(numModes, { |i|
-                var n = i + 1;
-                sin(pi * n * position.clip(0.01, 0.49)).abs.pow(spread.clip(0.25, 4.5)).max(0.0001)
-            });
-
-            brightScale = Array.fill(numModes, { |i|
-                var norm = i / (numModes - 1).max(1);
-                ((1 - norm).blend(norm, effBright)).linlin(0, 1, 1.0, 0.18)
-            });
-
-            lowBoost = Array.fill(numModes, { |i|
-                var norm = i / (numModes - 1).max(1);
-                (1.0 - (norm * 0.35)).clip(0.25, 1.0)
-            });
-
-            ampShapeA = Select.kr(model.clip(0, 3), [
-                [1.00, 0.80, 0.65, 0.52, 0.42, 0.34, 0.28, 0.23, 0.19, 0.16, 0.13, 0.11],
-                [1.00, 0.94, 0.88, 0.80, 0.72, 0.66, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36],
-                [1.00, 0.85, 0.76, 0.88, 0.70, 0.60, 0.52, 0.46, 0.40, 0.35, 0.31, 0.28],
-                [1.00, 0.52, 0.84, 0.46, 0.58, 0.36, 0.28, 0.23, 0.19, 0.16, 0.14, 0.12]
-            ]);
-
-            ampShapeB = Select.kr(model.clip(0, 3), [
-                [0.42, 0.34, 0.27, 0.22, 0.18, 0.15, 0.12, 0.10, 0.085, 0.072, 0.061, 0.052],
-                [0.65, 0.60, 0.56, 0.52, 0.47, 0.43, 0.39, 0.35, 0.31, 0.28, 0.25, 0.22],
-                [0.32, 0.44, 0.52, 0.46, 0.39, 0.34, 0.30, 0.26, 0.23, 0.20, 0.18, 0.16],
-                [0.54, 0.38, 0.42, 0.28, 0.24, 0.20, 0.17, 0.145, 0.125, 0.108, 0.094, 0.082]
-            ]);
-
-            ringShapeA = Select.kr(model.clip(0, 3), [
-                [1.00, 0.90, 0.82, 0.75, 0.69, 0.63, 0.58, 0.53, 0.49, 0.45, 0.41, 0.38],
-                [1.00, 0.97, 0.94, 0.91, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64, 0.60],
-                [1.00, 1.00, 0.98, 0.97, 0.95, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82],
-                [1.00, 0.78, 0.68, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36, 0.33, 0.30, 0.27]
-            ]);
-
-            ringShapeB = Select.kr(model.clip(0, 3), [
-                [0.55, 0.48, 0.42, 0.37, 0.33, 0.29, 0.26, 0.23, 0.21, 0.19, 0.17, 0.15],
-                [0.78, 0.76, 0.74, 0.72, 0.69, 0.66, 0.63, 0.60, 0.57, 0.54, 0.51, 0.48],
-                [0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74, 0.72, 0.70],
-                [0.42, 0.39, 0.36, 0.33, 0.30, 0.27, 0.24, 0.22, 0.20, 0.18, 0.16, 0.145]
-            ]);
-
-            mkBank = { |partials, ampShape, ringShape, bankLevel=1.0, bankDetune=0.0|
-                var freqs, amps, rings;
-
-                freqs = Array.fill(numModes, { |i|
-                    var p = partials.wrapAt(i);
-                    var harmBlend = ((i + 1).asFloat).blend(p, material.clip(0, 1));
-                    var norm = i / (numModes - 1).max(1);
-                    var stretch = 1 + (inharm.clip(0, 0.8) * norm.squared * 1.8);
-                    (baseFreq * harmBlend * stretch * (1 + Rand((detune + bankDetune).neg, (detune + bankDetune)))).clip(20, 20000)
-                });
-
-                amps = Array.fill(numModes, { |i|
-                    (ampShape.wrapAt(i) * strikeShape.wrapAt(i) * brightScale.wrapAt(i) * lowBoost.wrapAt(i) * bankLevel).max(0.0001)
-                });
-
-                rings = Array.fill(numModes, { |i|
-                    var base = effDecay * ringShape.wrapAt(i);
-                    var dampScale = 1 / ((i + 1).pow(damp.linlin(0, 1, 0.0, 0.6)));
-                    (base * dampScale).clip(0.03, 6.0)
-                });
-
-                [freqs, amps, rings];
-            };
-
-            bankA = mkBank.(modelPartialsA, ampShapeA, ringShapeA, 1.0, 0.0);
-            bankB = mkBank.(modelPartialsB, ampShapeB, ringShapeB, 0.62, 0.0009);
-
-            sigA = DynKlank.ar(`[bankA[0], bankA[1], bankA[2]], exciter);
-            sigB = DynKlank.ar(`[bankB[0], bankB[1], bankB[2]], exciter * 0.8);
-            sig = sigA + sigB;
-
-            bodySig = SelectX.ar(model.clip(0, 3), [
-                BPF.ar(sig, baseFreq * 1.15, 0.22, body * 0.24) + BPF.ar(sig, baseFreq * 0.78, 0.18, body * 0.12),
-                BPF.ar(sig, baseFreq * 1.8, 0.34, body * 0.16) + BPF.ar(sig, baseFreq * 3.4, 0.42, body * 0.12),
-                BPF.ar(sig, baseFreq * 2.3, 0.16, body * 0.14) + BPF.ar(sig, baseFreq * 4.7, 0.14, body * 0.10),
-                BPF.ar(sig, baseFreq * 0.94, 0.42, body * 0.34) + BPF.ar(sig, baseFreq * 1.65, 0.36, body * 0.18)
-            ]);
-
-sig = sig + bodySig;
-
-// ----------------------------------------------------
-// multimode filter with env
-// ----------------------------------------------------
-filtFreq = (filterCutoff.clip(0, 1).linexp(0, 1, 120, 16000) * filterEnv).clip(40, 20000);
-filtRq = filterRes.clip(0.01, 0.98).linlin(0.01, 0.98, 0.95, 0.08);
-
-filtered = SelectX.ar(filterMode.clip(0, 3), [
-    RLPF.ar(sig, filtFreq, filtRq),              // 0 LP
-    RHPF.ar(sig, filtFreq, filtRq),              // 1 HP
-    BPF.ar(sig, filtFreq, filtRq.clip(0.08, 1)), // 2 BP
-    BRF.ar(sig, filtFreq, filtRq.clip(0.08, 1))  // 3 Notch
-]);
-
-sig = XFade2.ar(sig, filtered, 0.25);
-
-// ----------------------------------------------------
-// cavity / comb body
-// ----------------------------------------------------
-comb = CombC.ar(
-    sig,
-    0.05,
-    combTime.clip(0.0007, 0.03),
-    combDecay.clip(0.02, 2.0)
-);
-comb = LPF.ar(comb, filtFreq.clip(200, 14000));
-sig = sig + (comb * combAmt.clip(0, 1));
-
-// ----------------------------------------------------
-// edge shaping
-// ----------------------------------------------------
-sig = LeakDC.ar(sig);
-sig = tanh(sig * (1 + (drive * 0.5)));
-sig = tanh(sig * edgeDrive.clip(0.5, 8.0));
-
-folded = Fold.ar(sig * (1 + (foldAmt.clip(0, 1) * 6)), -1, 1);
-sig = SelectX.ar(foldAmt.clip(0, 1), [sig, folded]);
-
-sig = BPeakEQ.ar(
-    sig,
-    3200,
-    0.6,
-    presence.clip(-1, 1).linlin(-1, 1, -10, 12)
-);
-
-// ----------------------------------------------------
-// digital crush layer
-// ----------------------------------------------------
-bits = bitDepth.clip(2, 16);
-step = 2 ** (bits.neg + 1);
-crushed = (sig / step).round * step;
-
-ds = downsample.clip(1, 24).round.asInteger;
-crushed = Latch.ar(crushed, Impulse.ar(SampleRate.ir / ds.max(1)));
-
-sig = XFade2.ar(sig, crushed, crushMix.clip(0, 1).linlin(0, 1, -1, 1));
-
-// ----------------------------------------------------
-// final tone
-// ----------------------------------------------------
-sig = LPF.ar(sig, effBright.linexp(0, 1, 2500, 18000));
-sig = HPF.ar(sig, 28);
-sig = LeakDC.ar(sig);
-sig = sig * amp * ampEnv;
-
-            Out.ar(out, Pan2.ar(sig, pan));
-        }).add;
-
-		SynthDef(\plonkV520Layer2, {
-    |out=0, amp=0.12, pan=0,
+		SynthDef(\plonkV520, {
+    |out=0, amp=0.22, pan=0,
     freq=220, gate=1, velocity=0.9,
-    synthType=0,
-    color=0.5,
-    motion=0.25,
-    decay=0.25,
-    drive=1.4,
-    noise=0.0,
-    click=0.0,
-    pwmWidth=0.35,
-    fmRatio=2.0,
-    fmIndex=2.0,
-    formantMorph=0.3,
-    ringMix=0.5,
-    unisonVoices=1,
-    unisonDetune=0.0,
-    unisonStereo=0.0,
-    unisonDrift=0.0,
-	pitchEnvAmt=0.0,
+    model=0,
+    exciterType=0,
+    brightness=0.65,
+    material=0.55,
+    inharm=0.22,
+    position=0.22,
+    decay=1.2,
+    body=0.45,
+    damp=0.25,
+    drive=1.15,
+    tone=0.58,
+    noiseAmt=0.32,
+    clickAmt=0.82,
+    excDecay=0.025,
+    detune=0.0025,
+    spread=1.0,
+    pitchEnvAmt=0.0,
     pitchEnvDecay=0.03,
-    pitchEnvCurve=(-6)|
+    velToBright=0.35,
+    velToDecay=0.2,
+    velToNoise=0.2,
+    velToClick=0.2,
+    filterMode=0,
+    filterCutoff=0.65,
+    filterRes=0.25,
+    filterEnvAmt=0.35,
+    filterEnvDecay=0.08,
+    combAmt=0.0,
+    combTime=0.008,
+    combDecay=0.18,
+    edgeDrive=1.0,
+    foldAmt=0.0,
+    presence=0.0,
+    crushMix=0.0,
+    bitDepth=12,
+    downsample=1,
 
-    var ampEnv, pitchEnv, attack;
-    var voiceCount, detAmt, stereoAmt, driftAmt;
-    var panPos;
-    var activeMask;
-    var mkVoice, sig;
+    // internal synth2 branch
+    layerMode=0,          // 0=main only, 1=layered, 2=synth2 only
+    layerLevel=0.60,
+    synth2Freq=220,
+    synth2Type=0,
+    synth2Color=0.5,
+    synth2Motion=0.25,
+    synth2Drive=1.4,
+    synth2Noise=0.0,
+    synth2Click=0.0,
+    synth2PwmWidth=0.35,
+    synth2FmRatio=2.0,
+    synth2FmIndex=2.0,
+    synth2FormantMorph=0.3,
+    synth2RingMix=0.5,
+    synth2UnisonVoices=1,
+    synth2UnisonDetune=0.0,
+    synth2UnisonStereo=0.0,
+    synth2UnisonDrift=0.0,
+    synth2PitchEnvAmt=0.0,
+    synth2PitchEnvDecay=0.03,
+    synth2PitchEnvCurve=(-6),
 
-        ampEnv = EnvGen.kr(
-        Env.asr(0.001, 1, decay.clip(0.02, 2.0), curve: -4),
-        gate,
-        doneAction: 2
-    );
+    // new glue controls
+    synth2Glue=0.72,
+    synth2BodyGlue=0.62,
+    synth2ToneFollow=0.58|
+
+    var ampEnv, excEnv, pitchEnv;
+    var baseFreq, effBright, effDecay, effNoise, effClick;
+    var mallet, hardPick, brush, scrape, burst, impulseCluster, exciter;
+    var mainSigA, mainSigB, mainSig, sig, bodySig, bodyBaseFreq;
+    var numModes = 12;
+    var strikeShape, brightScale, lowBoost;
+    var modelPartialsA, modelPartialsB;
+    var ampShapeA, ampShapeB, ringShapeA, ringShapeB;
+    var mkBank, bankA, bankB;
+    var filterEnv, filtFreq, filtRq, filtered, comb, folded, crushed, ds, bits, step;
+
+    // synth2 internals
+    var synth2PitchEnv, synth2Sig, synth2Attack;
+    var synth2VoiceCount, synth2DetAmt, synth2StereoAmt, synth2DriftAmt;
+    var synth2PanPos, synth2ActiveMask, mkSynth2Voice;
+    var synth2Mode;
+    var synth2SharedColor, synth2SharedBody, synth2SharedBright;
+    var synth2ModelBodyMul1, synth2ModelBodyMul2, synth2ModelBodyRq1, synth2ModelBodyRq2;
+    var synth2ModelAirMul, synth2ModelAirRq, synth2ModelToneMul;
+
+    // new synth2 glue vars
+    var glueAmt, bodyGlueAmt, toneFollowAmt;
+    var modelBase1, modelBase2, modelRQ1, modelRQ2;
+    var tiltFreq, airFreq, weight, brightTilt, darkTilt;
+    var contour1, contour2, contour3, contour4;
+    var sharedExciterColor, sharedBodyLift, synth2BodyFreq;
+    var synth2PreTilt, synth2Contoured, synth2ExcResid;
+    var modelLPF, modelHPF;
+
+	// new reduced mode-bank borrowing
+    var synth2BorrowPartialsA, synth2BorrowPartialsB;
+    var synth2BorrowMix, synth2BorrowWarp;
+
+	// synth2 micro modal tail
+    var synth2Tail, synth2TailExc;
+    var synth2TailMode1, synth2TailMode2, synth2TailMode3, synth2TailMode4;
+    var synth2TailFreqs, synth2TailAmps, synth2TailRings;
+    var synth2TailAmt, synth2TailDecayScale;
+    var synth2TailTypeAmt, synth2TailTypeDecay, synth2TailTypeBright, synth2TailTypeExcHPF;
 
     pitchEnv = EnvGen.kr(
+        Env([1 + pitchEnvAmt, 1], [pitchEnvDecay], curve: -6)
+    );
+
+    filterEnv = EnvGen.kr(
+        Env([1 + filterEnvAmt.clip(0, 4), 1], [filterEnvDecay.clip(0.005, 1.5)], curve: -6)
+    );
+
+    baseFreq = freq * pitchEnv;
+
+    effBright = (brightness + ((velocity - 0.5) * 2 * velToBright)).clip(0, 1);
+    effDecay  = (decay * (1 + ((velocity - 0.5) * 2 * velToDecay))).clip(0.03, 6.0);
+    effNoise  = (noiseAmt + ((velocity - 0.5) * 2 * velToNoise)).clip(0, 1.2);
+    effClick  = (clickAmt + ((velocity - 0.5) * 2 * velToClick)).clip(0, 2.0);
+
+    excEnv = EnvGen.kr(Env.perc(0.0006, excDecay.clip(0.001, 0.2), curve: -4));
+    ampEnv = EnvGen.kr(Env.asr(0.001, 1, effDecay, curve: -4), gate, doneAction: 2);
+
+    mallet = LPF.ar(WhiteNoise.ar(effNoise * 0.55), tone.linexp(0, 1, 1200, 9000))
+        + Decay2.ar(Impulse.ar(0), 0.0004, 0.003) * effClick * 0.9;
+    mallet = mallet * EnvGen.kr(Env.perc(0.0004, excDecay * 1.0, curve: -5));
+
+    hardPick = HPF.ar(WhiteNoise.ar(effNoise * 0.25), 1800)
+        + Decay2.ar(Impulse.ar(0), 0.00015, 0.0016) * effClick * 1.25;
+    hardPick = hardPick * EnvGen.kr(Env.perc(0.0002, excDecay * 0.65, curve: -7));
+
+    brush = LPF.ar(PinkNoise.ar(effNoise * 0.85), tone.linexp(0, 1, 900, 7000));
+    brush = brush * EnvGen.kr(Env.perc(0.001, excDecay * 1.7, curve: -2));
+
+    scrape = HPF.ar(WhiteNoise.ar(effNoise * 0.9), 1400);
+    scrape = BPF.ar(scrape, tone.linexp(0, 1, 1800, 10000), 0.45);
+    scrape = scrape * EnvGen.kr(Env.perc(0.0008, excDecay * 2.0, curve: -1));
+
+    burst = BPF.ar(WhiteNoise.ar(effNoise * 0.75), tone.linexp(0, 1, 500, 8000), 0.5)
+        + Decay2.ar(Impulse.ar(0), 0.00025, 0.0022) * effClick * 0.55;
+    burst = burst * EnvGen.kr(Env.perc(0.0004, excDecay * 0.9, curve: -4));
+
+    impulseCluster = Mix.fill(4, { |i|
+        DelayN.ar(
+            Decay2.ar(Impulse.ar(0), 0.00012, 0.0012 + (i * 0.00022)) * (effClick * (1 - (i * 0.12))),
+            0.02,
+            [0.0, 0.0015, 0.0033, 0.0052].wrapAt(i)
+        )
+    }) + HPF.ar(WhiteNoise.ar(effNoise * 0.18), 2500);
+    impulseCluster = impulseCluster * EnvGen.kr(Env.perc(0.0002, excDecay * 0.7, curve: -6));
+
+    exciter = SelectX.ar(exciterType.clip(0, 5), [
+        mallet, hardPick, brush, scrape, burst, impulseCluster
+    ]);
+
+    exciter = HPF.ar(exciter * excEnv * velocity, 25);
+    exciter = tanh(exciter * drive);
+
+    modelPartialsA = Select.kr(model.clip(0, 3), [
+        [1.00, 2.76, 5.40, 8.93, 13.34, 18.64, 24.83, 31.92, 39.91, 48.80, 58.59, 69.28],
+        [1.00, 1.63, 2.31, 2.92, 3.58, 4.21, 4.86, 5.53, 6.19, 6.88, 7.56, 8.24],
+        [1.00, 2.01, 2.97, 4.11, 5.43, 6.80, 8.21, 9.69, 11.20, 12.78, 14.40, 16.05],
+        [1.00, 1.59, 2.14, 2.30, 2.92, 3.45, 3.92, 4.50, 5.10, 5.76, 6.35, 6.98]
+    ]);
+
+    modelPartialsB = Select.kr(model.clip(0, 3), [
+        [1.00, 3.99, 9.30, 16.71, 26.22, 37.83, 51.54, 67.35, 85.26, 105.27, 127.38, 151.59],
+        [1.00, 1.41, 1.99, 2.58, 3.16, 3.73, 4.33, 4.91, 5.51, 6.11, 6.72, 7.34],
+        [0.50, 1.34, 2.72, 3.88, 5.02, 6.17, 7.51, 8.93, 10.40, 11.94, 13.53, 15.18],
+        [0.84, 1.28, 1.83, 2.41, 2.77, 3.18, 3.74, 4.12, 4.69, 5.31, 5.89, 6.42]
+    ]);
+
+    strikeShape = Array.fill(numModes, { |i|
+        var n = i + 1;
+        sin(pi * n * position.clip(0.01, 0.49)).abs.pow(spread.clip(0.25, 4.5)).max(0.0001)
+    });
+
+    brightScale = Array.fill(numModes, { |i|
+        var norm = i / (numModes - 1).max(1);
+        ((1 - norm).blend(norm, effBright)).linlin(0, 1, 1.0, 0.18)
+    });
+
+    lowBoost = Array.fill(numModes, { |i|
+        var norm = i / (numModes - 1).max(1);
+        (1.0 - (norm * 0.35)).clip(0.25, 1.0)
+    });
+
+    ampShapeA = Select.kr(model.clip(0, 3), [
+        [1.00, 0.80, 0.65, 0.52, 0.42, 0.34, 0.28, 0.23, 0.19, 0.16, 0.13, 0.11],
+        [1.00, 0.94, 0.88, 0.80, 0.72, 0.66, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36],
+        [1.00, 0.85, 0.76, 0.88, 0.70, 0.60, 0.52, 0.46, 0.40, 0.35, 0.31, 0.28],
+        [1.00, 0.52, 0.84, 0.46, 0.58, 0.36, 0.28, 0.23, 0.19, 0.16, 0.14, 0.12]
+    ]);
+
+    ampShapeB = Select.kr(model.clip(0, 3), [
+        [0.42, 0.34, 0.27, 0.22, 0.18, 0.15, 0.12, 0.10, 0.085, 0.072, 0.061, 0.052],
+        [0.65, 0.60, 0.56, 0.52, 0.47, 0.43, 0.39, 0.35, 0.31, 0.28, 0.25, 0.22],
+        [0.32, 0.44, 0.52, 0.46, 0.39, 0.34, 0.30, 0.26, 0.23, 0.20, 0.18, 0.16],
+        [0.54, 0.38, 0.42, 0.28, 0.24, 0.20, 0.17, 0.145, 0.125, 0.108, 0.094, 0.082]
+    ]);
+
+    ringShapeA = Select.kr(model.clip(0, 3), [
+        [1.00, 0.90, 0.82, 0.75, 0.69, 0.63, 0.58, 0.53, 0.49, 0.45, 0.41, 0.38],
+        [1.00, 0.97, 0.94, 0.91, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64, 0.60],
+        [1.00, 1.00, 0.98, 0.97, 0.95, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82],
+        [1.00, 0.78, 0.68, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36, 0.33, 0.30, 0.27]
+    ]);
+
+    ringShapeB = Select.kr(model.clip(0, 3), [
+        [0.55, 0.48, 0.42, 0.37, 0.33, 0.29, 0.26, 0.23, 0.21, 0.19, 0.17, 0.15],
+        [0.78, 0.76, 0.74, 0.72, 0.69, 0.66, 0.63, 0.60, 0.57, 0.54, 0.51, 0.48],
+        [0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74, 0.72, 0.70],
+        [0.42, 0.39, 0.36, 0.33, 0.30, 0.27, 0.24, 0.22, 0.20, 0.18, 0.16, 0.145]
+    ]);
+
+    mkBank = { |partials, ampShape, ringShape, bankLevel=1.0, bankDetune=0.0|
+        var freqs, amps, rings;
+
+        freqs = Array.fill(numModes, { |i|
+            var p = partials.wrapAt(i);
+            var harmBlend = ((i + 1).asFloat).blend(p, material.clip(0, 1));
+            var norm = i / (numModes - 1).max(1);
+            var stretch = 1 + (inharm.clip(0, 0.8) * norm.squared * 1.8);
+            (baseFreq * harmBlend * stretch * (1 + Rand((detune + bankDetune).neg, (detune + bankDetune)))).clip(20, 20000)
+        });
+
+        amps = Array.fill(numModes, { |i|
+            (ampShape.wrapAt(i) * strikeShape.wrapAt(i) * brightScale.wrapAt(i) * lowBoost.wrapAt(i) * bankLevel).max(0.0001)
+        });
+
+        rings = Array.fill(numModes, { |i|
+            var base = effDecay * ringShape.wrapAt(i);
+            var dampScale = 1 / ((i + 1).pow(damp.linlin(0, 1, 0.0, 0.6)));
+            (base * dampScale).clip(0.03, 6.0)
+        });
+
+        [freqs, amps, rings];
+    };
+
+    bankA = mkBank.(modelPartialsA, ampShapeA, ringShapeA, 1.0, 0.0);
+    bankB = mkBank.(modelPartialsB, ampShapeB, ringShapeB, 0.62, 0.0009);
+
+    mainSigA = DynKlank.ar(`[bankA[0], bankA[1], bankA[2]], exciter);
+	mainSigB = DynKlank.ar(`[bankB[0], bankB[1], bankB[2]], exciter * 0.8);
+    mainSig = (mainSigA + (mainSigB * 0.82)) * 0.78;
+
+
+	synth2SharedBright = effBright.clip(0, 1);
+    synth2SharedBody = body.clip(0, 1);
+    synth2SharedColor = ((synth2Color * 0.62) + (synth2SharedBright * 0.38)).clip(0, 1);
+
+    synth2ModelBodyMul1 = Select.kr(model.clip(0, 3), [1.15, 1.80, 2.30, 0.94]);
+    synth2ModelBodyMul2 = Select.kr(model.clip(0, 3), [0.78, 3.40, 4.70, 1.65]);
+    synth2ModelBodyRq1  = Select.kr(model.clip(0, 3), [0.22, 0.34, 0.16, 0.42]);
+    synth2ModelBodyRq2  = Select.kr(model.clip(0, 3), [0.18, 0.42, 0.14, 0.36]);
+
+    synth2ModelAirMul = Select.kr(model.clip(0, 3), [4.6, 6.2, 7.8, 3.8]);
+    synth2ModelAirRq  = Select.kr(model.clip(0, 3), [0.34, 0.28, 0.22, 0.40]);
+    synth2ModelToneMul = Select.kr(model.clip(0, 3), [3.2, 4.4, 5.0, 2.9]);
+
+
+
+    // -----------------------------
+    // internal synth2 branch
+    // -----------------------------
+    glueAmt = synth2Glue.clip(0, 1);
+    bodyGlueAmt = synth2BodyGlue.clip(0, 1);
+    toneFollowAmt = synth2ToneFollow.clip(0, 1);
+
+
+	synth2BorrowPartialsA = Select.kr(model.clip(0, 3), [
+        [1.00, 2.76, 5.40, 8.93],
+        [1.00, 1.63, 2.31, 2.92],
+        [1.00, 2.01, 2.97, 4.11],
+        [1.00, 1.59, 2.14, 2.30]
+    ]);
+
+    synth2BorrowPartialsB = Select.kr(model.clip(0, 3), [
+        [1.00, 3.99, 9.30, 16.71],
+        [1.00, 1.41, 1.99, 2.58],
+        [0.50, 1.34, 2.72, 3.88],
+        [0.84, 1.28, 1.83, 2.41]
+    ]);
+
+    synth2BorrowMix = glueAmt.linlin(0, 1, 0.08, 0.42).clip(0.05, 0.50);
+    synth2BorrowWarp = (
+        0.35
+        + (material * 0.35)
+        + (inharm * 0.45)
+        + (synth2Motion * 0.20)
+    ).clip(0.15, 1.0);
+
+
+    synth2PitchEnv = EnvGen.kr(
         Env(
-            [1 + pitchEnvAmt, 1],
-            [pitchEnvDecay.clip(0.001, 1.5)],
-            curve: pitchEnvCurve.clip(-12, 12)
+            [1 + synth2PitchEnvAmt, 1],
+            [synth2PitchEnvDecay.clip(0.001, 1.5)],
+            curve: synth2PitchEnvCurve.clip(-12, 12)
         )
     );
 
+    sharedExciterColor = LPF.ar(exciter, tone.linexp(0, 1, 1200, 9500));
+    synth2Attack = (HPF.ar(exciter, 900) * (0.10 + (synth2Click.abs.clip(0, 1) * 0.25)))
+        + (sharedExciterColor * 0.12 * glueAmt);
 
-    attack = Decay2.ar(
-        Impulse.ar(0),
-        0.0002,
-        0.002 + (click.abs * 0.004)
-    ) * (0.12 + (click.abs * 0.25));
-    attack = HPF.ar(attack, 1800);
+    synth2VoiceCount = synth2UnisonVoices.clip(1, 4).round;
+    synth2DetAmt = synth2UnisonDetune.clip(0, 0.5);
+    synth2StereoAmt = synth2UnisonStereo.clip(0, 1);
+    synth2DriftAmt = synth2UnisonDrift.clip(0, 1);
+    synth2PanPos = [-1.5, -0.5, 0.5, 1.5] / 1.5;
 
-    voiceCount = unisonVoices.clip(1, 4).round;
-    detAmt = unisonDetune.clip(0, 0.5);   // semitones
-    stereoAmt = unisonStereo.clip(0, 1);
-    driftAmt = unisonDrift.clip(0, 1);
-
-    mkVoice = { |i, spreadPos|
-        var baseFreq, driftSemi, detSemi, voicePan;
+           mkSynth2Voice = { |i, spreadPos|
+        var baseFreq2, driftSemi, detSemi;
         var fmSig, pwmSig, ringSig, vowelSig, voiceSig;
         var modFreq, modAmt, mod, widthMod;
         var form1, form2, noiseSrc, oscA, oscB;
+        var sharedColor, bodyFocus1, bodyFocus2, bodyRes1, bodyRes2;
+        var bodyGlue, airFocus, toneCut;
+
+        var modeA1, modeA2, modeA3, modeA4;
+        var modeB1, modeB2, modeB3, modeB4;
+        var borrow1, borrow2, borrow3, borrow4;
+        var baseRatio1, baseRatio2, baseRatio3;
+        var pwmRatios, ringRatioA, ringRatioB;
+        var formModel1, formModel2;
 
         driftSemi = LFNoise2.kr(
-            0.18 + (driftAmt * 3.8) + (i * 0.11)
-        ).range(-0.08, 0.08) * driftAmt;
+            0.18 + (synth2DriftAmt * 3.8) + (i * 0.11)
+        ).range(-0.08, 0.08) * synth2DriftAmt;
 
-        detSemi = spreadPos * detAmt;
-        baseFreq = freq * pitchEnv * (2 ** ((detSemi + driftSemi) / 12));
-        voicePan = (pan + (spreadPos * stereoAmt * 0.8)).clip(-1, 1);
+        detSemi = spreadPos * synth2DetAmt * (1 + (synth2StereoAmt * 0.4));
+        baseFreq2 = synth2Freq * synth2PitchEnv * (2 ** ((detSemi + driftSemi) / 12));
 
-        // 0 = FM Burst
-        modFreq = baseFreq * (fmRatio.clip(0.25, 10) + (motion * 1.5));
-        modAmt = baseFreq * fmIndex.clip(0.1, 8) * (0.15 + (color * 0.85));
-        mod = SinOsc.ar(modFreq, 0, modAmt);
-        fmSig = SinOsc.ar(baseFreq + mod);
-        fmSig = (fmSig * 0.6)
-            + BPF.ar(fmSig, (baseFreq * (2 + color * 8)).clip(80, 16000), 0.4);
+        sharedColor = ((synth2Color * 0.55) + (synth2SharedColor * 0.45)).clip(0, 1);
 
-        // 1 = PWM Buzz
-        widthMod = LFNoise2.kr(3 + (motion * 22) + (i * 0.07)).range(
-            (0.04 + (color * 0.10)).neg,
-            (0.04 + (color * 0.10))
+        modeA1 = synth2BorrowPartialsA[0];
+        modeA2 = synth2BorrowPartialsA[1];
+        modeA3 = synth2BorrowPartialsA[2];
+        modeA4 = synth2BorrowPartialsA[3];
+
+        modeB1 = synth2BorrowPartialsB[0];
+        modeB2 = synth2BorrowPartialsB[1];
+        modeB3 = synth2BorrowPartialsB[2];
+        modeB4 = synth2BorrowPartialsB[3];
+
+        borrow1 = modeA1.blend(modeB1, synth2BorrowWarp * 0.35);
+        borrow2 = modeA2.blend(modeB2, synth2BorrowWarp * 0.45);
+        borrow3 = modeA3.blend(modeB3, synth2BorrowWarp * 0.60);
+        borrow4 = modeA4.blend(modeB4, synth2BorrowWarp * 0.75);
+
+        baseRatio1 = (1.0.blend(borrow2, synth2BorrowMix)).clip(0.5, 8.0);
+        baseRatio2 = (2.0.blend(borrow3 / borrow2.max(0.0001), synth2BorrowMix * 0.9)).clip(0.5, 10.0);
+        baseRatio3 = (1.5.blend(borrow4 / borrow2.max(0.0001), synth2BorrowMix * 0.8)).clip(0.5, 10.0);
+
+        modFreq = baseFreq2 * (
+            synth2FmRatio.clip(0.25, 10).blend(baseRatio1, synth2BorrowMix)
+            + (synth2Motion * 1.2)
+            + (synth2SharedBright * 0.35)
         );
 
+        modAmt = baseFreq2 * synth2FmIndex.clip(0.1, 8) * (
+            0.12 + (sharedColor * 0.75) + (synth2SharedBody * 0.25)
+        );
+
+        mod = SinOsc.ar(modFreq, 0, modAmt);
+        fmSig = SinOsc.ar(baseFreq2 + mod);
+
+        fmSig = (fmSig * 0.6)
+            + BPF.ar(
+                fmSig,
+                (baseFreq2 * (baseRatio2 + sharedColor * 4.5)).clip(80, 16000),
+                0.4
+            );
+
+        widthMod = LFNoise2.kr(3 + (synth2Motion * 22) + (i * 0.07)).range(
+            (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03)).neg,
+            (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03))
+        );
+
+        pwmRatios = [
+            1,
+            (1.0015 + (synth2Motion * 0.01)).blend(baseRatio1, synth2BorrowMix * 0.45),
+            1.997.blend(baseRatio2, synth2BorrowMix * 0.65)
+        ];
+
         pwmSig = Mix(Pulse.ar(
-            baseFreq * [1, 1.0015 + (motion * 0.01), 1.997],
-            (pwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
+            baseFreq2 * pwmRatios,
+            (synth2PwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
         )) * 0.33;
 
         pwmSig = HPF.ar(
             RLPF.ar(
                 pwmSig,
-                (baseFreq * (3 + color * 10)).clip(120, 18000),
+                (baseFreq2 * (synth2ModelToneMul.blend(baseRatio3 + 1.6, synth2BorrowMix * 0.7) + (sharedColor * 5.5))).clip(120, 18000),
                 0.2
             ),
             50
         );
 
-        // 2 = Ring Metal
-        oscA = Saw.ar(baseFreq * (1 + (motion * 0.015)));
-        oscB = SinOsc.ar(baseFreq * (1.5 + (color * 5.5) + (noise.abs * 1.5)));
-        ringSig = oscA * oscB;
-        ringSig = BPF.ar(
-            ringSig,
-            (baseFreq * (2.2 + (color * 9))).clip(100, 18000),
-            0.25 + (motion * 0.2)
+        ringRatioA = (1 + (synth2Motion * 0.015)).blend(baseRatio1, synth2BorrowMix * 0.35);
+        ringRatioB = (1.5 + (sharedColor * 5.8) + (synth2Noise.abs * 1.5)).blend(
+            baseRatio3 + (sharedColor * 1.6),
+            synth2BorrowMix * 0.75
         );
 
-        // 3 = Vowel / Formant Noise
-        noiseSrc = PinkNoise.ar(0.7 + (noise.abs * 0.6));
-        form1 = formantMorph.clip(0, 1).linexp(0, 1, 350, 1100);
-        form2 = formantMorph.clip(0, 1).linexp(0, 1, 900, 3200);
+        oscA = Saw.ar(baseFreq2 * ringRatioA);
+        oscB = SinOsc.ar(baseFreq2 * ringRatioB);
+        ringSig = oscA * oscB;
+
+        ringSig = BPF.ar(
+            ringSig,
+            (baseFreq2 * ((2.2 + (sharedColor * 9.5)).blend(baseRatio2 + 1.5, synth2BorrowMix * 0.7))).clip(100, 18000),
+            0.25 + (synth2Motion * 0.2)
+        );
+
+        noiseSrc = PinkNoise.ar(0.7 + (synth2Noise.abs * 0.6));
+
+        formModel1 = Select.kr(model.clip(0, 3), [0.95, 1.15, 1.30, 0.85]);
+        formModel2 = Select.kr(model.clip(0, 3), [0.95, 1.12, 1.25, 0.90]);
+
+        form1 = (
+            synth2FormantMorph.clip(0, 1).linexp(0, 1, 350, 1100)
+            * formModel1
+            * (1 + (synth2SharedBody * 0.15))
+            * (1.0.blend(baseRatio1.clip(0.7, 2.5), synth2BorrowMix * 0.30))
+        ).clip(180, 4000);
+
+        form2 = (
+            synth2FormantMorph.clip(0, 1).linexp(0, 1, 900, 3200)
+            * formModel2
+            * (1 + (sharedColor * 0.12))
+            * (1.0.blend(baseRatio2.clip(0.8, 3.5), synth2BorrowMix * 0.20))
+        ).clip(400, 9000);
 
         vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
             + BPF.ar(noiseSrc, form2, 0.12, 0.75);
 
-        vowelSig = vowelSig + (SinOsc.ar(baseFreq, 0, 0.15) * ringMix.clip(0, 1));
+        vowelSig = vowelSig + (SinOsc.ar(baseFreq2 * baseRatio1, 0, 0.15) * synth2RingMix.clip(0, 1));
         vowelSig = HPF.ar(vowelSig, 100);
 
-        voiceSig = SelectX.ar(synthType.clip(0, 3), [
+        voiceSig = SelectX.ar(synth2Type.clip(0, 3), [
             fmSig,
             pwmSig,
             ringSig,
             vowelSig
         ]);
 
-        voiceSig = voiceSig + attack;
+        voiceSig = voiceSig + (synth2Attack * (0.6 + (synth2Click.abs.clip(0, 1) * 0.8)));
 
         voiceSig = voiceSig + LPF.ar(
-            WhiteNoise.ar(noise.abs.clip(0, 1) * 0.08),
-            (baseFreq * (6 + color * 12)).clip(500, 16000)
+            WhiteNoise.ar(synth2Noise.abs.clip(0, 1) * 0.08),
+            (baseFreq2 * ((6 + sharedColor * 12).blend(baseRatio3 * 2.8, synth2BorrowMix * 0.35))).clip(500, 16000)
         );
 
+        bodyFocus1 = (baseFreq2 * synth2ModelBodyMul1 * (1 + (synth2SharedBody * 0.18))).clip(80, 12000);
+        bodyFocus2 = (baseFreq2 * synth2ModelBodyMul2 * (1 + (synth2SharedBody * 0.12))).clip(100, 16000);
+        bodyRes1 = synth2ModelBodyRq1;
+        bodyRes2 = synth2ModelBodyRq2;
+
+        bodyGlue =
+            BPF.ar(voiceSig, bodyFocus1, bodyRes1, 0.08 + (synth2SharedBody * 0.18))
+            + BPF.ar(voiceSig, bodyFocus2, bodyRes2, 0.05 + (synth2SharedBody * 0.12));
+
+        voiceSig = voiceSig + bodyGlue;
+
         voiceSig = LeakDC.ar(voiceSig);
-        voiceSig = tanh(voiceSig * drive.clip(0.6, 6.0));
+        voiceSig = tanh(voiceSig * synth2Drive.clip(0.6, 6.0));
 
         voiceSig = BPeakEQ.ar(
             voiceSig,
-            (baseFreq * (4 + color * 8)).clip(800, 7000),
-            0.5,
-            velocity.linlin(0, 1, -2, 6)
+            bodyFocus1.clip(220, 5000),
+            0.8,
+            synth2SharedBody.linlin(0, 1, -1, 4)
         );
 
-        voiceSig = HPF.ar(voiceSig, 35);
-        Pan2.ar(voiceSig, voicePan);
+        airFocus = (
+            baseFreq2
+            * synth2ModelAirMul
+            * sharedColor.linexp(0, 1, 0.8, 1.25)
+        ).clip(700, 14000);
+
+        voiceSig = BPeakEQ.ar(
+            voiceSig,
+            airFocus,
+            synth2ModelAirRq,
+            ((sharedColor * 0.7) + (synth2SharedBright * 0.3)).linlin(0, 1, -4, 4)
+        );
+
+        toneCut = (
+    baseFreq2
+    * synth2ModelToneMul
+    * sharedColor.linexp(0, 1, 1.1, 2.2)
+    * tone.linexp(0, 1, 0.8, 1.35).blend(1.0, toneFollowAmt)
+).clip(1200, 12000);
+
+        voiceSig = LPF.ar(voiceSig, toneCut);
+        voiceSig = HPF.ar(voiceSig, 70);
+        voiceSig = voiceSig * 0.72;
     };
 
-    panPos = [-1.5, -0.5, 0.5, 1.5] / 1.5;
-
-    sig = Mix.fill(4, { |i|
-        activeMask = Select.kr(i, [
+    synth2Sig = Mix.fill(4, { |i|
+        synth2ActiveMask = Select.kr(i, [
             1,
-            (voiceCount > 1),
-            (voiceCount > 2),
-            (voiceCount > 3)
+            (synth2VoiceCount > 1),
+            (synth2VoiceCount > 2),
+            (synth2VoiceCount > 3)
         ]);
-        mkVoice.(i, panPos[i]) * activeMask
+        mkSynth2Voice.(i, synth2PanPos[i]) * synth2ActiveMask
     });
 
-    sig = sig / voiceCount.sqrt.max(1);
-    sig = sig * amp * ampEnv * velocity.linlin(0, 1, 0.35, 1.0);
+    synth2Sig = synth2Sig / synth2VoiceCount.sqrt.max(1);
+
+    // model-dependent contouring to make synth2 inherit resonator identity
+    synth2BodyFreq = synth2Freq * synth2PitchEnv;
+
+	    synth2TailMode1 = synth2BorrowPartialsA[0].blend(synth2BorrowPartialsB[0], synth2BorrowWarp * 0.35);
+    synth2TailMode2 = synth2BorrowPartialsA[1].blend(synth2BorrowPartialsB[1], synth2BorrowWarp * 0.45);
+    synth2TailMode3 = synth2BorrowPartialsA[2].blend(synth2BorrowPartialsB[2], synth2BorrowWarp * 0.60);
+    synth2TailMode4 = synth2BorrowPartialsA[3].blend(synth2BorrowPartialsB[3], synth2BorrowWarp * 0.75);
+
+    // synth2 type-dependent tail behavior:
+    // 0 = FM Burst, 1 = PWM Buzz, 2 = Ring Metal, 3 = Vowel Noise
+    synth2TailTypeAmt = Select.kr(synth2Type.clip(0, 3), [
+        1.18,  // FM Burst
+        0.82,  // PWM Buzz
+        1.28,  // Ring Metal
+        0.62   // Vowel Noise
+    ]);
+
+    synth2TailTypeDecay = Select.kr(synth2Type.clip(0, 3), [
+        1.12,  // FM Burst
+        0.72,  // PWM Buzz
+        1.22,  // Ring Metal
+        0.68   // Vowel Noise
+    ]);
+
+    synth2TailTypeBright = Select.kr(synth2Type.clip(0, 3), [
+        1.08,  // FM Burst
+        0.76,  // PWM Buzz
+        1.30,  // Ring Metal
+        0.70   // Vowel Noise
+    ]);
+
+    synth2TailTypeExcHPF = Select.kr(synth2Type.clip(0, 3), [
+        1500,  // FM Burst
+        2200,  // PWM Buzz
+        1200,  // Ring Metal
+        2600   // Vowel Noise
+    ]);
+
+    synth2TailAmt = (
+        0.04
+        + (glueAmt * 0.06)
+        + (bodyGlueAmt * 0.05)
+        + (synth2BorrowMix * 0.10)
+    );
+    synth2TailAmt = (synth2TailAmt * synth2TailTypeAmt).clip(0.02, 0.22);
+
+    synth2TailDecayScale = (
+        0.035
+        + (body * 0.035)
+        + ((1 - damp) * 0.030)
+        + (glueAmt * 0.020)
+    );
+    synth2TailDecayScale = (synth2TailDecayScale * synth2TailTypeDecay).clip(0.018, 0.18);
+
+    synth2TailFreqs = [
+        (synth2BodyFreq * synth2TailMode1).clip(70, 14000),
+        (synth2BodyFreq * synth2TailMode2).clip(90, 16000),
+        (synth2BodyFreq * synth2TailMode3).clip(120, 18000),
+        (synth2BodyFreq * synth2TailMode4).clip(150, 19000)
+    ];
+
+        synth2TailAmps = [
+        0.22,
+        0.16,
+        0.11,
+        0.08
+    ].collect { |a, i|
+        var brightTiltAmt = [1.00, 0.92, 0.82, 0.72].wrapAt(i);
+        (
+            a
+            * brightTiltAmt
+            * (0.7 + (effBright * 0.5))
+            * synth2TailTypeBright
+        ).max(0.0001)
+    };
+
+    synth2TailRings = [
+        (synth2TailDecayScale * 1.00).clip(0.02, 0.18),
+        (synth2TailDecayScale * 0.82).clip(0.02, 0.14),
+        (synth2TailDecayScale * 0.66).clip(0.02, 0.11),
+        (synth2TailDecayScale * 0.52).clip(0.02, 0.09)
+    ];
+
+    synth2TailExc =
+        HPF.ar(sharedExciterColor, synth2TailTypeExcHPF) * (0.18 + (glueAmt * 0.20))
+        + HPF.ar(synth2Attack, synth2TailTypeExcHPF * 0.8) * 0.45
+        + BPF.ar(
+            synth2Sig,
+            (synth2BodyFreq * (1.1 + (synth2TailTypeBright * 0.18))).clip(120, 9000),
+            0.35,
+            0.08
+        );
+
+    synth2TailExc = LeakDC.ar(synth2TailExc) * synth2TailAmt;
+
+    synth2Tail = DynKlank.ar(
+        `[synth2TailFreqs, synth2TailAmps, synth2TailRings],
+        synth2TailExc
+    );
+
+        synth2Tail = LPF.ar(
+        synth2Tail,
+        (
+            Select.kr(model.clip(0, 3), [9000, 12000, 15000, 7000])
+            * (0.65 + (effBright * 0.55))
+            * synth2TailTypeBright.linlin(0.62, 1.30, 0.82, 1.18)
+        ).clip(1200, 18000)
+    );
+
+    synth2Tail = HPF.ar(
+        synth2Tail,
+        (
+            Select.kr(model.clip(0, 3), [80, 120, 150, 55])
+            + (damp * 60)
+            + synth2TailTypeBright.linlin(0.62, 1.30, 20, -10)
+        ).clip(30, 500)
+    );
+
+    synth2Tail = tanh(synth2Tail * 1.4);
+
+    synth2Sig = (synth2Sig + (synth2Tail * 0.75)) * 0.88;
+
+    modelBase1 = Select.kr(model.clip(0, 3), [
+        synth2BodyFreq * 1.05,   // bar
+        synth2BodyFreq * 1.75,   // plate
+        synth2BodyFreq * 2.25,   // bell
+        synth2BodyFreq * 0.95    // drum
+    ]);
+
+    modelBase2 = Select.kr(model.clip(0, 3), [
+        synth2BodyFreq * 2.20,
+        synth2BodyFreq * 3.30,
+        synth2BodyFreq * 4.60,
+        synth2BodyFreq * 1.55
+    ]);
+
+    modelRQ1 = Select.kr(model.clip(0, 3), [0.22, 0.30, 0.16, 0.38]);
+    modelRQ2 = Select.kr(model.clip(0, 3), [0.18, 0.36, 0.14, 0.30]);
+
+    contour1 = BPF.ar(synth2Sig, modelBase1.clip(70, 14000), modelRQ1, 0.55 + (body * 0.55));
+    contour2 = BPF.ar(synth2Sig, modelBase2.clip(120, 16000), modelRQ2, 0.30 + (effBright * 0.35));
+    contour3 = LPF.ar(synth2Sig, (modelBase2 * (1.2 + (effBright * 0.9))).clip(1200, 16000)) * (0.18 + (1 - damp) * 0.16);
+    contour4 = HPF.ar(synth2Sig, (modelBase1 * 0.55).clip(60, 2800)) * (0.10 + (inharm * 0.18));
+
+    sharedBodyLift = (contour1 + contour2 + contour3 + contour4);
+
+    tiltFreq = (synth2BodyFreq * (2.8 + (material * 2.2))).clip(300, 7000);
+    airFreq = (tiltFreq * (1.8 + (effBright * 1.4))).clip(1200, 14000);
+    brightTilt = BHiShelf.ar(synth2Sig, airFreq, 0.7, effBright.linlin(0, 1, -2.0, 5.0));
+    darkTilt = BLowShelf.ar(brightTilt, tiltFreq, 0.8, body.linlin(0, 1, 0.0, 4.5));
+
+    synth2PreTilt = XFade2.ar(
+        synth2Sig,
+        darkTilt,
+        glueAmt.linlin(0, 1, -1, 1)
+    );
+
+    synth2ExcResid = LPF.ar(sharedExciterColor, (synth2BodyFreq * (1.6 + (tone * 2.2))).clip(500, 9000))
+        * (0.05 + (glueAmt * 0.11));
+
+    synth2Contoured = XFade2.ar(
+        synth2PreTilt,
+        (synth2PreTilt * (0.72 + (body * 0.18))) + (sharedBodyLift * 0.42) + synth2ExcResid,
+        bodyGlueAmt.linlin(0, 1, -1, 1)
+    );
+
+    modelLPF = Select.kr(model.clip(0, 3), [
+        9000,   // bar
+        12000,  // plate
+        15000,  // bell
+        7000    // drum
+    ]) * (0.65 + (effBright * 0.55));
+
+    modelHPF = Select.kr(model.clip(0, 3), [
+        80,   // bar
+        120,  // plate
+        150,  // bell
+        55    // drum
+    ]) + (damp * 60);
+
+    synth2Sig = LPF.ar(synth2Contoured, modelLPF.clip(1200, 18000));
+    synth2Sig = HPF.ar(synth2Sig, modelHPF.clip(30, 400));
+    synth2Sig = synth2Sig * layerLevel.clip(0, 1) * velocity.linlin(0, 1, 0.35, 1.0);
+
+    synth2Mode = layerMode.clip(0, 2);
+
+    sig = SelectX.ar(synth2Mode, [
+    mainSig * 0.95,
+    (mainSig + synth2Sig) * 0.68,
+    synth2Sig * 0.90
+]);
+
+    bodyBaseFreq = SelectX.kr(synth2Mode, [
+        baseFreq,
+        ((baseFreq + (synth2Freq * synth2PitchEnv)) * 0.5),
+        (synth2Freq * synth2PitchEnv)
+    ]);
+
+    bodySig = SelectX.ar(model.clip(0, 3), [
+        BPF.ar(sig, bodyBaseFreq * 1.15, 0.22, body * 0.24) + BPF.ar(sig, bodyBaseFreq * 0.78, 0.18, body * 0.12),
+        BPF.ar(sig, bodyBaseFreq * 1.8, 0.34, body * 0.16) + BPF.ar(sig, bodyBaseFreq * 3.4, 0.42, body * 0.12),
+        BPF.ar(sig, bodyBaseFreq * 2.3, 0.16, body * 0.14) + BPF.ar(sig, bodyBaseFreq * 4.7, 0.14, body * 0.10),
+        BPF.ar(sig, bodyBaseFreq * 0.94, 0.42, body * 0.34) + BPF.ar(sig, bodyBaseFreq * 1.65, 0.36, body * 0.18)
+    ]);
+
+    sig = (sig + (bodySig * 0.72)) * 0.90;
+
+    filtFreq = (filterCutoff.clip(0, 1).linexp(0, 1, 120, 16000) * filterEnv).clip(40, 20000);
+    filtRq = filterRes.clip(0.01, 0.98).linlin(0.01, 0.98, 0.95, 0.08);
+
+    filtered = SelectX.ar(filterMode.clip(0, 3), [
+        RLPF.ar(sig, filtFreq, filtRq),
+        RHPF.ar(sig, filtFreq, filtRq),
+        BPF.ar(sig, filtFreq, filtRq.clip(0.08, 1)),
+        BRF.ar(sig, filtFreq, filtRq.clip(0.08, 1))
+    ]);
+
+    sig = XFade2.ar(sig, filtered, 0.25);
+
+    comb = CombC.ar(
+        sig,
+        0.05,
+        combTime.clip(0.0007, 0.03),
+        combDecay.clip(0.02, 2.0)
+    );
+    comb = LPF.ar(comb, filtFreq.clip(200, 14000));
+    sig = sig + (comb * combAmt.clip(0, 1) * 0.55);
+
+    sig = LeakDC.ar(sig);
+    sig = tanh(sig * (1 + (drive * 0.5)));
+    sig = tanh(sig * edgeDrive.clip(0.5, 8.0));
+
+    folded = Fold.ar(sig * (1 + (foldAmt.clip(0, 1) * 6)), -1, 1);
+    sig = SelectX.ar(foldAmt.clip(0, 1), [sig, folded]);
+
+    sig = BPeakEQ.ar(
+        sig,
+        3200,
+        0.6,
+        presence.clip(-1, 1).linlin(-1, 1, -10, 12)
+    );
+
+    bits = bitDepth.clip(2, 16);
+    step = 2 ** (bits.neg + 1);
+    crushed = (sig / step).round * step;
+
+    ds = downsample.clip(1, 24).round.asInteger;
+    crushed = Latch.ar(crushed, Impulse.ar(SampleRate.ir / ds.max(1)));
+
+    sig = XFade2.ar(sig, crushed, crushMix.clip(0, 1).linlin(0, 1, -1, 1));
+
+    sig = LPF.ar(sig, effBright.linexp(0, 1, 2500, 18000));
+    sig = HPF.ar(sig, 28);
+    sig = LeakDC.ar(sig);
+    sig = sig * amp * 0.90 * ampEnv;
+
+    Out.ar(out, Pan2.ar(sig, pan));
+}).add;
+
+
+		SynthDef(\plonkV520MasterOut, {
+    |inBus=0, out=0, trimDb=(-10), limiterLevel=0.92, limiterDur=0.01, softClipAmt=0.20|
+    var sig, trim, limited, clipped;
+
+    sig = In.ar(inBus, 2);
+    sig = LeakDC.ar(sig);
+
+    trim = trimDb.dbamp;
+    sig = sig * trim;
+
+    limited = Limiter.ar(sig, limiterLevel.clip(0.1, 1.0), limiterDur.clip(0.001, 0.1));
+    clipped = tanh(limited * (1 + (softClipAmt.clip(0, 1) * 2.5)));
+
+    sig = XFade2.ar(
+        limited,
+        clipped,
+        softClipAmt.clip(0, 1).linlin(0, 1, -1, 1)
+    );
 
     Out.ar(out, sig);
+}).add;
+
+		SynthDef(\plonkV520MixerChan, {
+    |inBus=0, outBus=0, meterBus=0, level=1.0, pan=0.0, mute=0|
+    var sig, monoForMeter, amp;
+
+    sig = In.ar(inBus, 2);
+    sig = Balance2.ar(sig[0], sig[1], pan.clip(-1, 1), level.clip(0, 2));
+
+    sig = sig * (1 - mute.clip(0, 1));
+
+    monoForMeter = (sig[0].abs + sig[1].abs) * 0.5;
+    amp = Amplitude.kr(monoForMeter, 0.01, 0.08);
+    Out.kr(meterBus, amp);
+
+    Out.ar(outBus, sig);
+}).add;
+
+SynthDef(\plonkV520TrackTap, {
+    |inBus=0, meterBus=0|
+    var sig, amp;
+    sig = In.ar(inBus, 2);
+    amp = Amplitude.kr((sig[0].abs + sig[1].abs) * 0.5, 0.01, 0.08);
+    Out.kr(meterBus, amp);
 }).add;
     };
 
     ~plonkDefineSynth.();
+
+AppClock.sched(0.1, {
+    if(~plonkInitMasterOut.notNil) {
+        ~plonkInitMasterOut.();
+    };
+    if(~plonkInitMixer.notNil) {
+        ~plonkInitMixer.();
+    };
     "Loaded \\plonkV520".postln;
+    nil
+});
 
     // --------------------------------------------------------
     // multi-track state
@@ -783,47 +1276,80 @@ sig = sig * amp * ampEnv;
 
         switch(which,
             0, {
-                st.putAll((
-                    model: 3, exciterType: 1, amp: 0.34,
-                    brightness: 0.22, material: 0.30, inharm: 0.08, position: 0.18,
-                    decay: 0.95, body: 0.90, damp: 0.42, drive: 1.28, tone: 0.28,
-                    noiseAmt: 0.12, clickAmt: 0.88, excDecay: 0.018, detune: 0.0012,
-                    pitchEnvAmt: 0.18, pitchEnvDecay: 0.028
-                ));
-            },
-            1, {
-                st.putAll((
-                    model: 1, exciterType: 4, amp: 0.26,
-                    brightness: 0.78, material: 0.82, inharm: 0.24, position: 0.29,
-                    decay: 0.78, body: 0.32, damp: 0.24, drive: 1.08, tone: 0.76,
-                    noiseAmt: 0.34, clickAmt: 0.66, excDecay: 0.020, detune: 0.0020,
-                    pitchEnvAmt: 0.02, pitchEnvDecay: 0.020
-                ));
-            },
-            2, {
-                st.putAll((
-                    model: 2, exciterType: 5, amp: 0.14,
-                    brightness: 0.95, material: 0.96, inharm: 0.36, position: 0.09,
-                    decay: 0.22, body: 0.08, damp: 0.15, drive: 1.02, tone: 0.92,
-                    noiseAmt: 0.22, clickAmt: 1.10, excDecay: 0.006, detune: 0.0008,
-                    pitchEnvAmt: 0.0, pitchEnvDecay: 0.012
-                ));
-            },
-            3, {
-                st.putAll((
-                    model: 0, exciterType: 2, amp: 0.18,
-                    brightness: 0.58, material: 0.68, inharm: 0.18, position: 0.36,
-                    decay: 0.55, body: 0.42, damp: 0.28, drive: 1.10, tone: 0.52,
-                    noiseAmt: 0.26, clickAmt: 0.74, excDecay: 0.012, detune: 0.0015,
-                    pitchEnvAmt: 0.05, pitchEnvDecay: 0.022
-                ));
-            }
+    st.putAll((
+        model: 3, exciterType: 1, amp: 0.17,
+        brightness: 0.22, material: 0.30, inharm: 0.08, position: 0.18,
+        decay: 0.95, body: 0.90, damp: 0.42, drive: 1.28, tone: 0.28,
+        noiseAmt: 0.12, clickAmt: 0.88, excDecay: 0.018, detune: 0.0012,
+        pitchEnvAmt: 0.18, pitchEnvDecay: 0.028
+    ));
+},
+1, {
+    st.putAll((
+        model: 1, exciterType: 4, amp: 0.15,
+        brightness: 0.78, material: 0.82, inharm: 0.24, position: 0.29,
+        decay: 0.78, body: 0.32, damp: 0.24, drive: 1.08, tone: 0.76,
+        noiseAmt: 0.34, clickAmt: 0.66, excDecay: 0.020, detune: 0.0020,
+        pitchEnvAmt: 0.02, pitchEnvDecay: 0.020
+    ));
+},
+2, {
+    st.putAll((
+        model: 2, exciterType: 5, amp: 0.08,
+        brightness: 0.95, material: 0.96, inharm: 0.36, position: 0.09,
+        decay: 0.22, body: 0.08, damp: 0.15, drive: 1.02, tone: 0.92,
+        noiseAmt: 0.22, clickAmt: 1.10, excDecay: 0.006, detune: 0.0008,
+        pitchEnvAmt: 0.0, pitchEnvDecay: 0.012
+    ));
+},
+3, {
+    st.putAll((
+        model: 0, exciterType: 2, amp: 0.11,
+        brightness: 0.58, material: 0.68, inharm: 0.18, position: 0.36,
+        decay: 0.55, body: 0.42, damp: 0.28, drive: 1.10, tone: 0.52,
+        noiseAmt: 0.26, clickAmt: 0.74, excDecay: 0.012, detune: 0.0015,
+        pitchEnvAmt: 0.05, pitchEnvDecay: 0.022
+    ));
+}
         );
 
         st;
     };
 
     ~plonkTrackStates = Array.fill(~plonkTrackCount, { |i| ~plonkMakeTrackState.(i) });
+
+	    ~plonkMixer = (
+    tracks: Array.fill(~plonkTrackCount, {
+        (
+            level: 1.0,
+            pan: 0.0,
+            mute: 0,
+            solo: 0,
+            bus: nil,
+            synth: nil,
+            meterBus: nil
+        )
+    })
+);
+
+    ~plonkMixerAnySolo = {
+        ~plonkMixer[\tracks].any { |ch| (ch[\solo] ? 0) == 1 }
+    };
+
+    ~plonkMixerTrackAudible = { |trackIdx|
+        var ch = ~plonkMixer[\tracks][trackIdx];
+        var anySolo = ~plonkMixerAnySolo.();
+
+        if((ch[\mute] ? 0) == 1) {
+            false
+        }{
+            if(anySolo) {
+                (ch[\solo] ? 0) == 1
+            }{
+                true
+            }
+        }
+    };
 
 
     // --------------------------------------------------------
@@ -832,6 +1358,9 @@ sig = sig * amp * ampEnv;
     ~plonkAudioState = (
         outDevice: "", inDevice: "", sampleRate: 48000, numOutChannels: 2, numInChannels: 0
     );
+
+
+
 
     ~plonkAudioDevices = Array.new;
     ~plonkAudioOutMenu = nil;
@@ -885,6 +1414,8 @@ sig = sig * amp * ampEnv;
 
 ~plonkRebuildAfterAudioChange = {
     ~plonkDefineSynth.();
+    ~plonkInitMasterOut.();
+    ~plonkInitMixer.();
     ~plonkInstallMidi.();
     ~plonkRefreshAudioMenus.();
     ~plonkUpdateMidiSyncStatus.();
@@ -908,7 +1439,7 @@ sig = sig * amp * ampEnv;
         ~plonkVoices.clear;
         ~plonkFreeMidiDefs.();
 
-        s.options.memSize = 262144;
+        s.options.memSize = 2097152;
         s.options.sampleRate = sr;
         s.options.numOutputBusChannels = outCh;
         s.options.numInputBusChannels = inCh;
@@ -920,11 +1451,21 @@ sig = sig * amp * ampEnv;
         };
 
         Routine({
-            s.reboot;
-            while { s.serverRunning.not } { 0.2.wait };
-            0.3.wait;
-            ~plonkRebuildAfterAudioChange.();
-        }).play(AppClock);
+    s.reboot;
+    0.8.wait;
+
+    if(s.serverRunning) {
+        ~plonkRebuildAfterAudioChange.();
+    }{
+        {
+            if(~plonkAudioStatus.notNil) {
+                ~plonkAudioStatus.string_("Audio reboot failed. Check device/sample-rate settings.");
+            };
+        }.defer;
+    };
+
+    nil
+}).play(AppClock);
     };
 
     ~plonkSyncAudioStateFromServer.();
@@ -1014,8 +1555,10 @@ sig = sig * amp * ampEnv;
         };
     };
 
+
+
 ~plonkTriggerWithDef = { |defName, overrides|
-    var args, synth, trackIdx, voiceModelTag;
+    var args, synth, trackIdx, voiceModelTag, outBus;
 
     overrides = overrides ? ();
     args = overrides.copy;
@@ -1026,6 +1569,31 @@ sig = sig * amp * ampEnv;
     if((voiceModelTag == 3) and: { trackIdx >= 0 }) {
         ~plonkChokeDrum.(trackIdx);
     };
+
+    if(~plonkMaster[\mixBus].isNil or: { ~plonkMaster[\synth].isNil }) {
+    "Master bus missing, rebuilding.".warn;
+    if(~plonkInitMasterOut.notNil) {
+        ~plonkInitMasterOut.();
+    };
+};
+
+if(
+    (trackIdx >= 0) and:
+    { ~plonkMixer.notNil } and:
+    { ~plonkMixer[\tracks].notNil } and:
+    { ~plonkMixer[\tracks][trackIdx].notNil } and:
+    { ~plonkMixer[\tracks][trackIdx][\bus].notNil }
+) {
+    outBus = ~plonkMixer[\tracks][trackIdx][\bus].index;
+}{
+    outBus = if(~plonkMaster[\mixBus].notNil) {
+        ~plonkMaster[\mixBus].index
+    }{
+        0
+    };
+};
+
+args[\out] = outBus;
 
     ~plonkStealVoice.();
     synth = Synth(defName, args.asKeyValuePairs);
@@ -1044,15 +1612,12 @@ sig = sig * amp * ampEnv;
     synth;
 };
 
+
 ~plonkTrigger = { |overrides|
     ~plonkTriggerWithDef.(\plonkV520, overrides);
 };
 
-~plonkTriggerLayer2 = { |overrides|
-    var args = (overrides ? ()).copy;
-    args[\voiceModelTag] = -1; // prevent drum choke logic from treating synth2 as main model
-    ~plonkTriggerWithDef.(\plonkV520Layer2, args);
-};
+
 
 
     // --------------------------------------------------------
@@ -1368,6 +1933,7 @@ sig = sig * amp * ampEnv;
     var accentAmt = step[\accent].clip(0, 1);
     var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
 
+
     if(useDegree == 1) {
         noteMidi = ~plonkDegreeToMidi.(locks[\degree] ? 0, locks[\degreeOct] ? 0);
     }{
@@ -1387,6 +1953,10 @@ sig = sig * amp * ampEnv;
     args[\brightness] = (args[\brightness] + (accentAmt * 0.10)).clip(0, 1);
     args[\clickAmt] = (args[\clickAmt] + (accentAmt * 0.18)).clip(0, 2.0);
     args[\drive] = (args[\drive] + (accentAmt * 0.08)).clip(0.7, 2.0);
+
+	args[\amp] = args[\amp].clip(0.0, 1.0);
+    args[\pan] = (args[\pan] ? 0.0).clip(-1.0, 1.0);
+
     args[\trackIndex] = trackIdx;
 
     args;
@@ -1400,6 +1970,7 @@ sig = sig * amp * ampEnv;
     var baseArgs = ~plonkBuildStepArgs.(trackIdx, step).copy;
     var mainMidi, layerMidi, excIdx, synthType;
     var inferredColor, inferredMotion, inferredDrive;
+    var inferredGlue, inferredBodyGlue, inferredToneFollow;
     var args = ();
 
     if(useDegree == 1) {
@@ -1415,16 +1986,16 @@ sig = sig * amp * ampEnv;
             layerMidi = mainMidi;
         },
         1, {
-            layerMidi = ~plonkQuantizeMidi.(mainMidi + (step[\engine2SemiOffset] ? 0));
+            layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-7, 7)));
         },
         2, {
             if(useDegree == 1) {
                 layerMidi = ~plonkDegreeToMidi.(
-                    (mainLocks[\degree] ? 0) + (step[\engine2DegreeOffset] ? 0),
-                    (mainLocks[\degreeOct] ? 0) + (step[\engine2DegreeOctOffset] ? 0)
+                    ((mainLocks[\degree] ? 0) + (step[\engine2DegreeOffset] ? 0).clip(-2, 2)),
+                    ((mainLocks[\degreeOct] ? 0) + (step[\engine2DegreeOctOffset] ? 0).clip(-1, 1))
                 );
             }{
-                layerMidi = ~plonkQuantizeMidi.(mainMidi + (step[\engine2SemiOffset] ? 0));
+                layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-7, 7)));
             };
         }
     );
@@ -1433,58 +2004,80 @@ sig = sig * amp * ampEnv;
     synthType = (step[\engine2Model] ? 0).asInteger.clip(0, 3);
 
     inferredColor = (
-        excIdx.linlin(0, 5, 0.15, 0.95)
-        + ((step[\engine2NoiseOffset] ? 0.0) * 0.15)
+        (baseArgs[\brightness] ? 0.5).linlin(0, 1, 0.25, 0.75)
+        + ((step[\engine2NoiseOffset] ? 0.0) * 0.05)
     ).clip(0, 1);
 
     inferredMotion = (
-        ((step[\engine2DecayMul] ? 1.0).linlin(0.2, 3.0, 0.05, 0.95))
-        + ((step[\engine2ClickOffset] ? 0.0).abs * 0.20)
+        ((baseArgs[\decay] ? 0.4).linlin(0.03, 6.0, 0.08, 0.55))
+        + ((step[\engine2ClickOffset] ? 0.0).abs * 0.08)
     ).clip(0, 1);
 
     inferredDrive = (
-        1.0
-        + ((step[\layerLevel] ? 0.60) * 1.5)
-        + ((step[\engine2ClickOffset] ? 0.0) * 0.8)
-    ).clip(0.6, 6.0);
+        0.9
+        + ((baseArgs[\drive] ? 1.0) * 0.45)
+        + ((step[\layerLevel] ? 0.60) * 0.25)
+    ).clip(0.6, 2.4);
 
-    args[\freq] = layerMidi.clip(0, 127).midicps;
-    args[\amp] = (baseArgs[\amp] * (step[\layerLevel] ? 0.60)).clip(0.001, 1.0);
-    args[\pan] = (baseArgs[\pan] + (step[\engine2PanOffset] ? 0.0)).clip(-1.0, 1.0);
-    args[\velocity] = baseArgs[\velocity].clip(0, 1);
+    inferredGlue = (
+        0.45
+        + ((baseArgs[\brightness] ? 0.5) * 0.20)
+        + ((baseArgs[\body] ? 0.45) * 0.22)
+        + ((baseArgs[\material] ? 0.55) * 0.10)
+    ).clip(0.25, 0.95);
 
-    args[\decay] = (baseArgs[\decay] * (step[\engine2DecayMul] ? 1.0)).clip(0.02, 2.0);
-    args[\synthType] = synthType;
+    inferredBodyGlue = (
+        0.35
+        + ((baseArgs[\body] ? 0.45) * 0.40)
+        + ((1 - (baseArgs[\damp] ? 0.25)) * 0.12)
+    ).clip(0.20, 0.95);
 
-    args[\color] = (step[\synth2Color] ? inferredColor).clip(0, 1);
-    args[\motion] = (step[\synth2Motion] ? inferredMotion).clip(0, 1);
-    args[\drive] = (step[\synth2Drive] ? inferredDrive).clip(0.6, 6.0);
+    inferredToneFollow = (
+        0.30
+        + ((baseArgs[\tone] ? 0.58) * 0.45)
+        + ((baseArgs[\brightness] ? 0.65) * 0.10)
+    ).clip(0.15, 1.00);
 
-    args[\noise] = (step[\engine2NoiseOffset] ? 0.0).clip(-1.0, 1.0);
-    args[\click] = (step[\engine2ClickOffset] ? 0.0).clip(-1.0, 1.0);
+    args[\synth2Freq] = layerMidi.clip(0, 127).midicps;
+    args[\layerLevel] = (step[\layerLevel] ? 0.60).clip(0.0, 1.0);
 
-    args[\pwmWidth] = excIdx.linlin(0, 5, 0.18, 0.82).clip(0.05, 0.95);
-    args[\fmRatio] = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0].wrapAt(excIdx);
-    args[\fmIndex] = (
+    args[\synth2Type] = synthType;
+    args[\synth2Color] = (step[\synth2Color] ? inferredColor).clip(0, 1);
+    args[\synth2Motion] = (step[\synth2Motion] ? inferredMotion).clip(0, 1);
+    args[\synth2Drive] = (step[\synth2Drive] ? inferredDrive).clip(0.6, 6.0);
+
+    args[\synth2Noise] = (step[\engine2NoiseOffset] ? 0.0).clip(-1.0, 1.0);
+    args[\synth2Click] = (step[\engine2ClickOffset] ? 0.0).clip(-1.0, 1.0);
+
+    args[\synth2PwmWidth] = excIdx.linlin(0, 5, 0.18, 0.82).clip(0.05, 0.95);
+    args[\synth2FmRatio] = [0.5, 1.0, 2.0, 3.0, 4.0, 6.0].wrapAt(excIdx);
+    args[\synth2FmIndex] = (
         0.3
         + ((step[\engine2DecayMul] ? 1.0) * 2.0)
         + ((step[\engine2ClickOffset] ? 0.0).abs * 2.0)
     ).clip(0.1, 8.0);
 
-    args[\formantMorph] = excIdx.linlin(0, 5, 0.0, 1.0).clip(0, 1);
-    args[\ringMix] = (0.2 + ((step[\layerLevel] ? 0.60) * 0.7)).clip(0, 1);
+    args[\synth2FormantMorph] = excIdx.linlin(0, 5, 0.0, 1.0).clip(0, 1);
+    args[\synth2RingMix] = (0.2 + ((step[\layerLevel] ? 0.60) * 0.7)).clip(0, 1);
 
-    args[\unisonVoices] = (step[\synth2UnisonVoices] ? 1).asInteger.clip(1, 4);
-    args[\unisonDetune] = (step[\synth2UnisonDetune] ? 0.0).clip(0.0, 0.5);
-    args[\unisonStereo] = (step[\synth2UnisonStereo] ? 0.0).clip(0.0, 1.0);
-    args[\unisonDrift] = (step[\synth2UnisonDrift] ? 0.0).clip(0.0, 1.0);
+    args[\synth2UnisonVoices] = (step[\synth2UnisonVoices] ? 1).asInteger.clip(1, 4);
+    args[\synth2UnisonDetune] = ((step[\synth2UnisonDetune] ? 0.0) * 0.45).clip(0.0, 0.12);
+    args[\synth2UnisonStereo] = ((step[\synth2UnisonStereo] ? 0.0) * 0.45).clip(0.0, 0.45);
+    args[\synth2UnisonDrift] = ((step[\synth2UnisonDrift] ? 0.0) * 0.35).clip(0.0, 0.20);
 
-	args[\pitchEnvAmt] = (step[\synth2PitchEnvAmt] ? 0.0);
-    args[\pitchEnvDecay] = (step[\synth2PitchEnvDecay] ? 0.03);
-    args[\pitchEnvCurve] = (step[\synth2PitchEnvCurve] ? -6.0);
+    args[\synth2PitchEnvAmt] = (step[\synth2PitchEnvAmt] ? 0.0);
+    args[\synth2PitchEnvDecay] = (step[\synth2PitchEnvDecay] ? 0.03);
+    args[\synth2PitchEnvCurve] = (step[\synth2PitchEnvCurve] ? -6.0);
 
+		args[\pan] = (
+    (baseArgs[\pan] ? 0.0)
+    + (step[\engine2PanOffset] ? 0.0)
+).clip(-1.0, 1.0);
 
-    args[\trackIndex] = trackIdx;
+    args[\synth2Glue] = inferredGlue;
+    args[\synth2BodyGlue] = inferredBodyGlue;
+    args[\synth2ToneFollow] = inferredToneFollow;
+
     args;
 };
 
@@ -1511,45 +2104,80 @@ sig = sig * amp * ampEnv;
         )
     };
 
-   ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
+  ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
     var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
-    var mainArgs = ~plonkBuildStepArgs.(trackIdx, step);
+    var args = ~plonkBuildStepArgs.(trackIdx, step).copy;
     var layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
-    var synths = List.new;
+    var effectiveMode;
+    var synth;
 
-    switch(mode,
-        0, {
-            synths.add(~plonkTrigger.(mainArgs));
-        },
-        1, {
-            synths.add(~plonkTrigger.(mainArgs));
-            synths.add(~plonkTriggerLayer2.(layerArgs));
-        },
-        2, {
+    effectiveMode = switch(mode,
+        0, { 0 },   // main only
+        1, { 1 },   // layered
+        2, {         // alternating: main only / synth2 only
             if(~plonkAltState[trackIdx][stepIndex] == 0) {
-                synths.add(~plonkTrigger.(mainArgs));
                 ~plonkAltState[trackIdx][stepIndex] = 1;
+                0
             }{
-                synths.add(~plonkTriggerLayer2.(layerArgs));
                 ~plonkAltState[trackIdx][stepIndex] = 0;
-            };
+                2
+            }
         },
-        3, {
-            if(1.0.rand < 0.5) {
-                synths.add(~plonkTrigger.(mainArgs));
-            }{
-                synths.add(~plonkTriggerLayer2.(layerArgs));
-            };
-        }
+        3, {         // random: main only / synth2 only
+            if(1.0.rand < 0.5) { 0 } { 2 }
+        },
+        { 0 }
     );
 
+    args.putAll(layerArgs);
+    args[\layerMode] = effectiveMode;
+
+    synth = ~plonkTrigger.(args);
+
     SystemClock.sched(gateDurSecs, {
-        synths.do { |sy| sy.set(\gate, 0) };
+        if(synth.notNil) { synth.set(\gate, 0) };
         nil
     });
 
-    synths;
+    synth;
 };
+
+
+	~plonkScheduleStepTriggers = { |trackIdx, step, gateDurSecs, stepIndex, stepDurBeats|
+    var ratchet = (step[\ratchet] ? 1).asInteger.clip(1, 8);
+    var micro = (step[\micro] ? 0.0).clip(-0.49, 0.49);
+    var stepDurSecs;
+    var microOffsetSecs;
+    var subDurSecs;
+    var startDelaySecs;
+
+    stepDurSecs = if(~plonkMidiSync[\enabled]) {
+        stepDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24)
+    }{
+        stepDurBeats / (~plonkClock.tempo.max(0.0001))
+    };
+
+    microOffsetSecs = micro * stepDurSecs;
+    startDelaySecs = microOffsetSecs.max(0.0);
+    subDurSecs = (stepDurSecs / ratchet).max(0.001);
+
+    ratchet.do { |r|
+        var trigDelay = startDelaySecs + (r * subDurSecs);
+        var thisGate;
+
+        thisGate = if(ratchet > 1) {
+            gateDurSecs.min(subDurSecs * 0.92).max(0.005)
+        }{
+            gateDurSecs
+        };
+
+        SystemClock.sched(trigDelay, {
+            ~plonkTriggerStepVoices.(trackIdx, step, thisGate, stepIndex);
+            nil
+        });
+    };
+};
+
 
     ~plonkMutateVariation = { |trackIdx, varIdx|
         var steps = ~plonkTrackPatterns[trackIdx][varIdx];
@@ -1723,56 +2351,88 @@ sig = sig * amp * ampEnv;
         ~plonkUpdateMidiSyncStatus.();
     };
 
-        ~plonkProcessStep = { |stepIndex|
-        var stepDur = ~plonkStepBeatDur.(stepIndex);
+       ~plonkProcessStep = { |stepIndex|
+    var stepDur = ~plonkStepBeatDur.(stepIndex);
 
-        ~plonkSeq[\currentStep] = stepIndex;
-        ~plonkRefreshPlayhead.();
+    ~plonkSeq[\currentStep] = stepIndex;
+    ~plonkRefreshPlayhead.();
 
-        ~plonkTrackCount.do { |trackIdx|
-            var steps = ~plonkPlaybackStepsForTrack.(trackIdx);
-            var st = steps[stepIndex];
-            var condPass, didPlay = false;
-            var isTieContinuation, noteHoldBeats, gateDurBeats, gateDurSecs;
-            var useTie, prevPlayed;
+    ~plonkTrackCount.do { |trackIdx|
+        var steps = ~plonkPlaybackStepsForTrack.(trackIdx);
+        var st = steps[stepIndex];
+        var audible = ~plonkMixerTrackAudible.(trackIdx);
+        var condPass, didPlay = false;
+        var isTieContinuation, noteHoldBeats, gateDurBeats, gateDurSecs;
+        var useTie, prevPlayed;
+        var micro, maxNegMicroFrac, negMicroFrac, earlyShiftBeats;
 
-            isTieContinuation = ~plonkIsTiedContinuation.(steps, stepIndex);
+        isTieContinuation = ~plonkIsTiedContinuation.(steps, stepIndex);
 
-            if(isTieContinuation) {
-                ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = true;
-            }{
-                prevPlayed = ~plonkSeq[\lastStepPlayedByTrack][trackIdx] ? false;
-                condPass = ~plonkCheckCondition.(st, prevPlayed);
+        if(isTieContinuation) {
+            ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = true;
+        }{
+            prevPlayed = ~plonkSeq[\lastStepPlayedByTrack][trackIdx] ? false;
+            condPass = ~plonkCheckCondition.(st, prevPlayed);
 
-                if(st[\on] == 1 and: { condPass } and: { 1.0.rand <= st[\prob] }) {
-                    useTie = (st[\tie] ? 0).asInteger;
+            if(
+                audible and:
+                { st[\on] == 1 } and:
+                { condPass } and:
+                { 1.0.rand <= st[\prob] }
+            ) {
+                useTie = (st[\tie] ? 0).asInteger;
+                micro = (st[\micro] ? 0.0).clip(-0.49, 0.49);
 
-                    if(useTie == 1) {
-                        noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
-                        gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
-                        gateDurSecs = if(~plonkMidiSync[\enabled]) {
-    gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1/48)) * 24);
-}{
-    gateDurBeats / (~plonkClock.tempo.max(0.0001));
-};
-                        ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
-                        didPlay = true;
+                // Negative microtiming should fire slightly early, so shorten the wait
+                // for the CURRENT step and let the helper handle only non-negative delay.
+                maxNegMicroFrac = 0.49;
+                negMicroFrac = micro.neg.max(0.0).min(maxNegMicroFrac);
+                earlyShiftBeats = stepDur * negMicroFrac;
+
+                if(useTie == 1) {
+                    noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
+                    gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
+                    gateDurSecs = if(~plonkMidiSync[\enabled]) {
+                        gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24);
                     }{
-                        gateDurBeats = (stepDur * st[\gate].clip(0.05, 1.25)).max(0.01);
-                        gateDurSecs = if(~plonkMidiSync[\enabled]) {
-    gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1/48)) * 24);
-}{
-    gateDurBeats / (~plonkClock.tempo.max(0.0001));
-};
-                        ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
-                        didPlay = true;
+                        gateDurBeats / (~plonkClock.tempo.max(0.0001));
                     };
-                };
 
-                ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
+                    if(micro < 0) {
+                        SystemClock.sched(0.0, {
+                            ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
+                            nil
+                        });
+                    }{
+                        ~plonkScheduleStepTriggers.(trackIdx, st, gateDurSecs, stepIndex, stepDur);
+                    };
+
+                    didPlay = true;
+                }{
+                    gateDurBeats = (stepDur * st[\gate].clip(0.05, 1.25)).max(0.01);
+                    gateDurSecs = if(~plonkMidiSync[\enabled]) {
+                        gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24);
+                    }{
+                        gateDurBeats / (~plonkClock.tempo.max(0.0001));
+                    };
+
+                    if(micro < 0) {
+                        SystemClock.sched(0.0, {
+                            ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
+                            nil
+                        });
+                    }{
+                        ~plonkScheduleStepTriggers.(trackIdx, st, gateDurSecs, stepIndex, stepDur);
+                    };
+
+                    didPlay = true;
+                };
             };
+
+            ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
         };
     };
+};
 
     ~plonkPlayLiveStep = { |stepIndex|
         var stepDur = ~plonkStepBeatDur.(stepIndex);
@@ -2160,9 +2820,8 @@ if((amount * 0.12).coin) {
 };
 
 ~plonkRandomizeCurrentSelectionAndRefresh = { |startStep=0, endStep=7, mode=\full, amount=1.0|
-    var wasRunning = ~plonkSeq[\isRunning];
     ~plonkRandomizeCurrentSelection.(startStep, endStep, mode, amount);
-    if(wasRunning) { ~plonkSeqStart.() };
+
     if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
     if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
 };
@@ -2171,11 +2830,12 @@ if((amount * 0.12).coin) {
         ~plonkRandomizeOnePattern.(~plonkTrackPatterns[~plonkSelectedTrack][~plonkSeq[\editVariation]]);
     };
 
-    ~plonkRandomizePatternAndRefresh = {
-        var wasRunning = ~plonkSeq[\isRunning];
-        ~plonkRandomizePattern.();
-        if(wasRunning) { ~plonkSeqStart.() };
-    };
+   ~plonkRandomizePatternAndRefresh = {
+    ~plonkRandomizePattern.();
+
+    if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+    if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+};
 
     // --------------------------------------------------------
     // save/load
@@ -2402,8 +3062,8 @@ if((amount * 0.12).coin) {
         var lockStep = 0;
         var lockBoxes = IdentityDictionary.new;
         var lockEnableButtons = IdentityDictionary.new;
-        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI;
-        var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox;
+        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI, refreshMasterUI;
+var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox;
         var modelNames = ["Bar", "Plate", "Bell", "Drum"];
         var exciterNames = ["Mallet", "HardPick", "Brush", "Scrape", "Burst", "ImpulseCluster"];
 
@@ -2415,6 +3075,7 @@ if((amount * 0.12).coin) {
 		var rangeSrcABox, rangeSrcBBox, rangeDstBox;
 		var randSelButton, randModeMenu, randAmtBox;
 		var rootMenu, scaleMenu, layerModeMenu, eng2ModelMenu, eng2ExcMenu;
+var masterTrimBox, masterLimiterLevelBox, masterLimiterDurBox, masterSoftClipAmtBox;
 
         ~plonkStepIndicators = stepIndicators;
         ~plonkStepButtons = stepButtons;
@@ -2481,6 +3142,8 @@ showPage = { |key|
     if(refreshControls.notNil) { refreshControls.() };
     if(refreshPatternUI.notNil) { refreshPatternUI.() };
     if(refreshLockEditor.notNil) { refreshLockEditor.() };
+    if(refreshMasterUI.notNil and: { key == \master }) { refreshMasterUI.() };
+	if(~plonkRefreshMixerUI.notNil and: { key == \mixer }) { ~plonkRefreshMixerUI.() };
     if(~plonkRefreshAudioMenus.notNil and: { key == \audio }) { ~plonkRefreshAudioMenus.() };
 
     content.refresh;
@@ -2867,28 +3530,37 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 ~plonkRefreshLockEditor = refreshLockEditor;
 ~plonkRefreshVarButtons = refreshVarButtons;
 
-        // header
-        makeButton.(header, Rect(10, 16, 70, 28), "Main", { showPage.(\main) });
-        makeButton.(header, Rect(90, 16, 70, 28), "Exciter", { showPage.(\exciter) });
-        makeButton.(header, Rect(170, 16, 90, 28), "Resonator", { showPage.(\res) });
-        makeButton.(header, Rect(270, 16, 100, 28), "Performance", { showPage.(\perf) });
-        makeButton.(header, Rect(380, 16, 100, 28), "Pattern", { showPage.(\pattern) });
-        makeButton.(header, Rect(490, 16, 80, 28), "Step", { showPage.(\step) });
-        makeButton.(header, Rect(580, 16, 80, 28), "Audio", { showPage.(\audio) });
+refreshMasterUI = {
+    if(masterTrimBox.notNil) { masterTrimBox.value_(~plonkMaster[\trimDb] ? -12.0) };
+    if(masterLimiterLevelBox.notNil) { masterLimiterLevelBox.value_(~plonkMaster[\limiterLevel] ? 0.85) };
+    if(masterLimiterDurBox.notNil) { masterLimiterDurBox.value_(~plonkMaster[\limiterDur] ? 0.01) };
+    if(masterSoftClipAmtBox.notNil) { masterSoftClipAmtBox.value_(~plonkMaster[\softClipAmt] ? 0.15) };
+};
 
-        Button(header, Rect(680, 16, 90, 28))
-        .states_([["Trigger", Color.white, Color(0.9, 0.7, 0.0)]])
-        .action_({
-            var args = ~plonkTrackStates[~plonkSelectedTrack].copy;
-            args[\trackIndex] = ~plonkSelectedTrack;
-            ~plonkTrigger.(args);
-        });
+      // header
+makeButton.(header, Rect(10, 16, 70, 28), "Main", { showPage.(\main) });
+makeButton.(header, Rect(90, 16, 70, 28), "Exciter", { showPage.(\exciter) });
+makeButton.(header, Rect(170, 16, 90, 28), "Resonator", { showPage.(\res) });
+makeButton.(header, Rect(270, 16, 100, 28), "Performance", { showPage.(\perf) });
+makeButton.(header, Rect(380, 16, 100, 28), "Pattern", { showPage.(\pattern) });
+makeButton.(header, Rect(490, 16, 80, 28), "Step", { showPage.(\step) });
+makeButton.(header, Rect(580, 16, 90, 28), "Mixer", { showPage.(\mixer) });
+makeButton.(header, Rect(680, 16, 110, 28), "Audio/Midi", { showPage.(\audio) });
+makeButton.(header, Rect(800, 16, 90, 28), "Master", { showPage.(\master) });
 
-        makeButton.(header, Rect(790, 16, 90, 28), "RandPat", {
-            ~plonkRandomizePatternAndRefresh.();
-            refreshPatternUI.();
-            refreshLockEditor.();
-        });
+Button(header, Rect(910, 16, 90, 28))
+.states_([["Trigger", Color.white, Color(0.9, 0.7, 0.0)]])
+.action_({
+    var args = ~plonkTrackStates[~plonkSelectedTrack].copy;
+    args[\trackIndex] = ~plonkSelectedTrack;
+    ~plonkTrigger.(args);
+});
+
+makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
+    ~plonkRandomizePatternAndRefresh.();
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
 
         // main page
         {
@@ -2973,6 +3645,276 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 			makeSlider.(v, 460, 468, "Downsample", \downsample, 1, 24, \lin);
         }.value;
 
+
+		              //MIXER PAGE
+        {
+            var v = makePage.(\mixer);
+            var levelSliders = Array.newClear(~plonkTrackCount);
+            var panBoxes = Array.newClear(~plonkTrackCount);
+            var muteButtons = Array.newClear(~plonkTrackCount);
+            var soloButtons = Array.newClear(~plonkTrackCount);
+            var ampBoxes = Array.newClear(~plonkTrackCount);
+            var meterViews = Array.newClear(~plonkTrackCount);
+            var meterRoutines = Array.newClear(~plonkTrackCount);
+            var levelValueLabels = Array.newClear(~plonkTrackCount);
+            var panValueLabels = Array.newClear(~plonkTrackCount);
+
+            var x0 = 36;
+            var colW = 350;
+            var rowH = 270;
+
+            StaticText(v, Rect(20, 10, 900, 20)).string_("Mixer — per-track mix controls");
+
+            ~plonkRefreshMixerUI = {
+                ~plonkTrackCount.do { |i|
+                    var ch = ~plonkMixer[\tracks][i];
+                    var lvl = (ch[\level] ? 1.0).clip(0.0, 1.5);
+                    var pan = (ch[\pan] ? 0.0).clip(-1.0, 1.0);
+                    var amp = (~plonkTrackStates[i][\amp] ? 0.0).clip(0.0, 0.6);
+
+                    if(levelSliders[i].notNil) {
+                        levelSliders[i].value_(lvl.linlin(0.0, 1.5, 0.0, 1.0));
+                    };
+
+                    if(levelValueLabels[i].notNil) {
+                        levelValueLabels[i].string_(lvl.round(0.01).asString);
+                    };
+
+                    if(panBoxes[i].notNil) {
+                        panBoxes[i].value_(pan);
+                    };
+
+                    if(panValueLabels[i].notNil) {
+                        panValueLabels[i].string_(
+                            if(pan > 0.001) {
+                                "R " ++ pan.abs.round(0.01).asString
+                            }{
+                                if(pan < -0.001) {
+                                    "L " ++ pan.abs.round(0.01).asString
+                                }{
+                                    "C"
+                                }
+                            }
+                        );
+                    };
+
+                    if(ampBoxes[i].notNil) {
+                        ampBoxes[i].value_(amp);
+                    };
+
+                    if(muteButtons[i].notNil) {
+                        muteButtons[i].states_([
+                            ["Mute", Color.black, Color.grey(0.85)],
+                            ["Muted", Color.white, Color.red(0.75)]
+                        ]);
+                        muteButtons[i].value_((ch[\mute] ? 0).asInteger);
+                    };
+
+                    if(soloButtons[i].notNil) {
+                        soloButtons[i].states_([
+                            ["Solo", Color.black, Color.grey(0.85)],
+                            ["Solo", Color.white, Color(0.20, 0.55, 0.90)]
+                        ]);
+                        soloButtons[i].value_((ch[\solo] ? 0).asInteger);
+                    };
+                };
+            };
+
+            ~plonkTrackCount.do { |i|
+                var x = x0 + ((i % 2) * colW);
+                var y = 52 + ((i div: 2) * rowH);
+
+                var stripX = x + 18;
+                var stripTopY = y + 56;
+                var faderH = 126;
+
+                var levelSliderX = stripX + 6;
+                var meterX = levelSliderX + 40;
+
+                var controlX = x + 130;
+                var ampLabelY = y + 28;
+                var ampBoxY = y + 24;
+                var panY = y + 88;
+                var buttonY = y + 136;
+                var selectY = y + 174;
+
+                StaticText(v, Rect(x, y, 220, 22))
+                .string_(~plonkTrackNames[i])
+                .font_(Font.default.boldVariant.size_(14));
+
+                // track amp row
+                StaticText(v, Rect(controlX, ampLabelY, 72, 18)).string_("Track Amp");
+                ampBoxes[i] = makeBoundedBox.(v, Rect(controlX + 82, ampBoxY, 72, 20), ~plonkTrackStates[i][\amp], 0.0, 0.6, 0.01, 2, { |nb, val|
+                    ~plonkTrackStates[i][\amp] = val;
+                    if(i == ~plonkSelectedTrack) { refreshControls.() };
+                });
+
+                // level
+                StaticText(v, Rect(levelSliderX - 8, stripTopY - 24, 42, 16)).string_("Level");
+                levelSliders[i] = Slider(v, Rect(levelSliderX, stripTopY, 20, faderH));
+                levelSliders[i].value_((~plonkMixer[\tracks][i][\level] ? 1.0).clip(0.0, 1.5).linlin(0.0, 1.5, 0.0, 1.0));
+                levelSliders[i].action_({ |sl|
+                    var val = sl.value.linlin(0.0, 1.0, 0.0, 1.5).clip(0.0, 1.5);
+                    ~plonkMixer[\tracks][i][\level] = val;
+                    if(levelValueLabels[i].notNil) {
+                        levelValueLabels[i].string_(val.round(0.01).asString);
+                    };
+                    ~plonkUpdateMixerRouting.();
+                });
+
+                levelValueLabels[i] = StaticText(v, Rect(levelSliderX - 12, stripTopY + faderH + 6, 52, 16));
+                levelValueLabels[i].align_(\center);
+
+                // meter
+                StaticText(v, Rect(meterX - 6, stripTopY - 24, 42, 16)).string_("Meter");
+                meterViews[i] = UserView(v, Rect(meterX, stripTopY, 16, faderH))
+                .background_(Color.grey(0.90));
+
+                meterViews[i].drawFunc = {
+                    var val = meterViews[i].getProperty(\meterVal) ? 0.0;
+                    var h = (meterViews[i].bounds.height * val.clip(0, 1)).asInteger;
+                    var fullH = meterViews[i].bounds.height.asInteger;
+                    var fullW = meterViews[i].bounds.width.asInteger;
+                    var yStart = fullH - h;
+
+                    Pen.fillColor = Color.grey(0.82);
+                    Pen.fillRect(Rect(0, 0, fullW, fullH));
+
+                    Pen.fillColor = if(val > 0.85) {
+                        Color.red(0.85)
+                    }{
+                        if(val > 0.55) {
+                            Color.yellow(0.85)
+                        }{
+                            Color(0.20, 0.75, 0.30)
+                        }
+                    };
+
+                    Pen.fillRect(Rect(0, yStart, fullW, h));
+                };
+
+                // pan row
+                StaticText(v, Rect(controlX, panY, 34, 18)).string_("Pan");
+                panBoxes[i] = makeBoundedBox.(v, Rect(controlX + 46, panY - 2, 64, 20), (~plonkMixer[\tracks][i][\pan] ? 0.0), -1.0, 1.0, 0.01, 2, { |nb, val|
+                    ~plonkMixer[\tracks][i][\pan] = val;
+                    if(panValueLabels[i].notNil) {
+                        panValueLabels[i].string_(
+                            if(val > 0.001) {
+                                "R " ++ val.abs.round(0.01).asString
+                            }{
+                                if(val < -0.001) {
+                                    "L " ++ val.abs.round(0.01).asString
+                                }{
+                                    "C"
+                                }
+                            }
+                        );
+                    };
+                    ~plonkUpdateMixerRouting.();
+                });
+
+                panValueLabels[i] = StaticText(v, Rect(controlX + 118, panY, 48, 18));
+                panValueLabels[i].string_("C");
+
+                // buttons
+                muteButtons[i] = Button(v, Rect(controlX, buttonY, 72, 24))
+                .states_([
+                    ["Mute", Color.black, Color.grey(0.85)],
+                    ["Muted", Color.white, Color.red(0.75)]
+                ])
+                .action_({ |bt|
+                    ~plonkMixer[\tracks][i][\mute] = bt.value.asInteger;
+                    ~plonkUpdateMixerRouting.();
+                    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                });
+
+                soloButtons[i] = Button(v, Rect(controlX + 82, buttonY, 72, 24))
+                .states_([
+                    ["Solo", Color.black, Color.grey(0.85)],
+                    ["Solo", Color.white, Color(0.20, 0.55, 0.90)]
+                ])
+                .action_({ |bt|
+                    ~plonkMixer[\tracks][i][\solo] = bt.value.asInteger;
+                    ~plonkUpdateMixerRouting.();
+                    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                });
+
+                Button(v, Rect(controlX, selectY, 154, 24))
+                .states_([["Select Track"]])
+                .action_({
+                    ~plonkSetSelectedTrack.(i);
+                    refreshControls.();
+                    refreshPatternUI.();
+                    refreshLockEditor.();
+                    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                });
+            };
+
+            Button(v, Rect(20, 610, 120, 26))
+            .states_([["Reset Mixer"]])
+            .action_({
+                ~plonkTrackCount.do { |i|
+                    ~plonkMixer[\tracks][i][\level] = 1.0;
+                    ~plonkMixer[\tracks][i][\pan] = 0.0;
+                    ~plonkMixer[\tracks][i][\mute] = 0;
+                    ~plonkMixer[\tracks][i][\solo] = 0;
+                };
+                ~plonkUpdateMixerRouting.();
+                if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+            });
+
+            Button(v, Rect(150, 610, 140, 26))
+            .states_([["Reset Track Amps"]])
+            .action_({
+                ~plonkTrackStates[0][\amp] = 0.17;
+                ~plonkTrackStates[1][\amp] = 0.15;
+                ~plonkTrackStates[2][\amp] = 0.08;
+                ~plonkTrackStates[3][\amp] = 0.11;
+
+                if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                refreshControls.();
+            });
+
+            ~plonkStopMixerMeters = {
+                meterRoutines.do { |r|
+                    if(r.notNil) {
+                        r.stop;
+                    };
+                };
+            };
+
+            ~plonkStartMixerMeters = {
+                ~plonkStopMixerMeters.();
+
+                ~plonkTrackCount.do { |i|
+                    meterRoutines[i] = Routine({
+                        loop {
+                            var ch = ~plonkMixer[\tracks][i];
+                            var val = 0.0;
+
+                            if(ch[\meterBus].notNil) {
+                                val = ch[\meterBus].getSynchronous ? 0.0;
+                            };
+
+                            {
+                                if(meterViews[i].notNil) {
+                                    meterViews[i].setProperty(\meterVal, val.clip(0, 1));
+                                    meterViews[i].refresh;
+                                };
+                            }.defer;
+
+                            0.04.wait;
+                        }
+                    }).play(AppClock);
+                };
+            };
+
+            ~plonkStartMixerMeters.();
+
+            if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+        }.value;
+
+
         // pattern page
         {
             var v = makePage.(\pattern);
@@ -2988,16 +3930,19 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
             var indicatorOffset = 12;
             var gridStartX = leftPad;
             var mutateEveryBox, mutateAmtBox;
-            var y1 = 22;
-            var y2 = 54;
-            var y3 = 86;
-            var y4 = 118;
-            var topY1 = 172;
-            var topY2 = 352;
+var chainSlotStartX = 226;
+var chainSlotSpacing = 220;
 
-            StaticText(v, Rect(20, 0, 420, 20)).string_("Pattern + playhead (selected track lane)");
-            condSummaryLabel = StaticText(v, Rect(460, 0, 420, 20));
-            chainSummaryLabel = StaticText(v, Rect(900, 0, 520, 20));
+var y1 = 24;
+var y2 = 68;
+var y3 = 112;
+var y4 = 156;
+var topY1 = 232;
+var topY2 = 432;
+
+StaticText(v, Rect(20, 0, 360, 20)).string_("Pattern + playhead (selected track lane)");
+condSummaryLabel = StaticText(v, Rect(392, 0, 360, 20));
+chainSummaryLabel = StaticText(v, Rect(764, 0, 620, 20));
 
             StaticText(v, Rect(20, y1, 42, 20)).string_("Tempo");
             makeBoundedBox.(v, Rect(64, y1, 56, 20), ~plonkSeq[\tempo], 20, 300, 1, 0, { |nb, val|
@@ -3168,21 +4113,24 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             });
 
             4.do { |i|
-                var x = 212 + (i * 120);
-                StaticText(v, Rect(x, y3, 18, 20)).string_(("S" ++ (i + 1).asString));
-                chainVarMenus[i] = PopUpMenu(v, Rect(x + 18, y3, 44, 20));
-                chainVarMenus[i].items_(~plonkVariationNames);
-                chainVarMenus[i].action_({
-                    ~plonkSeq[\chainSlots][i][\var] = chainVarMenus[i].value.clip(0, 3);
-                    refreshPatternUI.();
-                });
+    var x = chainSlotStartX + (i * chainSlotSpacing);
 
-                StaticText(v, Rect(x + 68, y3, 24, 20)).string_("Cy");
-                chainBarBoxes[i] = makeBoundedBox.(v, Rect(x + 92, y3, 26, 20), (~plonkSeq[\chainSlots][i][\bars] ? 1), 1, 8, 1, 0, { |nb, val|
-                    ~plonkSeq[\chainSlots][i][\bars] = val.asInteger.max(1);
-                    refreshPatternUI.();
-                });
-            };
+    StaticText(v, Rect(x, y3, 24, 20)).string_(("S" ++ (i + 1).asString));
+
+    chainVarMenus[i] = PopUpMenu(v, Rect(x + 26, y3, 62, 20));
+    chainVarMenus[i].items_(~plonkVariationNames);
+    chainVarMenus[i].action_({
+        ~plonkSeq[\chainSlots][i][\var] = chainVarMenus[i].value.clip(0, 3);
+        refreshPatternUI.();
+    });
+
+    StaticText(v, Rect(x + 100, y3, 24, 20)).string_("Cy");
+
+    chainBarBoxes[i] = makeBoundedBox.(v, Rect(x + 128, y3, 38, 20), (~plonkSeq[\chainSlots][i][\bars] ? 1), 1, 8, 1, 0, { |nb, val|
+        ~plonkSeq[\chainSlots][i][\bars] = val.asInteger.max(1);
+        refreshPatternUI.();
+    });
+};
 
             StaticText(v, Rect(20, y4, 50, 20)).string_("Utils");
 
@@ -3345,17 +4293,18 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     var yRow5 = 260;
 
     var yLocksHdr = 320;
-    var yLocks = 350;
-    var yBottom = 700;
+var yLocks = 350;
+var yBottom = 634;
 
-    var col1X = 22;
-    var col2X = 492;
-    var col3X = 962;
+var col1X = 22;
+var col2X = 318;
+var col3X = 614;
+var col4X = 910;
 
-    var labelW = 112;
-    var toggleW = 48;
-    var valueW = 96;
-    var valueGap = 10;
+var labelW = 78;
+var toggleW = 46;
+var valueW = 82;
+var valueGap = 6;
 
     pageTitle = StaticText(v, Rect(20, yTitle, 420, 30));
     pageTitle.string_("Per-step Editor");
@@ -3668,7 +4617,7 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
         });
     };
 
-    // column 1
+        // column 1
     addLockRow.(col1X, yLocks + (0 * rowGap), "Semi", \semi, -36, 36, 1, 0, true);
     addLockRow.(col1X, yLocks + (1 * rowGap), "Velocity", \velocity, 0, 1, 0.01, 2, false);
     addLockRow.(col1X, yLocks + (2 * rowGap), "Decay", \decay, 0.03, 6.0, 0.01, 2, false);
@@ -3678,35 +4627,37 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
     addLockRow.(col1X, yLocks + (6 * rowGap), "Position", \position, 0.01, 0.49, 0.01, 2, false);
     addLockRow.(col1X, yLocks + (7 * rowGap), "Body", \body, 0, 1, 0.01, 2, false);
     addLockRow.(col1X, yLocks + (8 * rowGap), "Damp", \damp, 0, 1, 0.01, 2, false);
-    addLockRow.(col1X, yLocks + (9 * rowGap), "Drive", \drive, 0.7, 2.0, 0.01, 2, false);
 
     // column 2
-    addLockRow.(col2X, yLocks + (0 * rowGap), "Tone", \tone, 0, 1, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (1 * rowGap), "NoiseAmt", \noiseAmt, 0, 1.2, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (2 * rowGap), "ClickAmt", \clickAmt, 0, 2.0, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (3 * rowGap), "ExciterType", \exciterType, 0, 5, 1, 0, true);
-    addLockRow.(col2X, yLocks + (4 * rowGap), "Model", \model, 0, 3, 1, 0, true);
-    addLockRow.(col2X, yLocks + (5 * rowGap), "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (6 * rowGap), "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, 0.001, 3, false);
-    addLockRow.(col2X, yLocks + (7 * rowGap), "Detune", \detune, 0, 0.02, 0.001, 3, false);
-    addLockRow.(col2X, yLocks + (8 * rowGap), "Spread", \spread, 0.2, 4.5, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (9 * rowGap), "Pan", \pan, -1, 1, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (0 * rowGap), "Drive", \drive, 0.7, 2.0, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (1 * rowGap), "Tone", \tone, 0, 1, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (2 * rowGap), "NoiseAmt", \noiseAmt, 0, 1.2, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (3 * rowGap), "ClickAmt", \clickAmt, 0, 2.0, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (4 * rowGap), "ExciterType", \exciterType, 0, 5, 1, 0, true);
+    addLockRow.(col2X, yLocks + (5 * rowGap), "Model", \model, 0, 3, 1, 0, true);
+    addLockRow.(col2X, yLocks + (6 * rowGap), "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, 0.01, 2, false);
+    addLockRow.(col2X, yLocks + (7 * rowGap), "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, 0.001, 3, false);
+    addLockRow.(col2X, yLocks + (8 * rowGap), "Detune", \detune, 0, 0.02, 0.001, 3, false);
 
     // column 3
-    addLockRow.(col3X, yLocks + (0 * rowGap), "FiltCut", \filterCutoff, 0, 1, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (1 * rowGap), "FiltRes", \filterRes, 0.01, 0.98, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (2 * rowGap), "FiltEnvAmt", \filterEnvAmt, 0, 4, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (3 * rowGap), "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, 0.001, 3, false);
-    addLockRow.(col3X, yLocks + (4 * rowGap), "CombAmt", \combAmt, 0, 1, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (5 * rowGap), "CombTime", \combTime, 0.0007, 0.03, 0.0005, 4, false);
-    addLockRow.(col3X, yLocks + (6 * rowGap), "CombDecay", \combDecay, 0.02, 2.0, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (7 * rowGap), "EdgeDrive", \edgeDrive, 0.5, 8.0, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (8 * rowGap), "FoldAmt", \foldAmt, 0, 1, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (9 * rowGap), "Presence", \presence, -1, 1, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (10 * rowGap), "CrushMix", \crushMix, 0, 1, 0.01, 2, false);
-    addLockRow.(col3X, yLocks + (11 * rowGap), "BitDepth", \bitDepth, 2, 16, 1, 0, true);
-    addLockRow.(col3X, yLocks + (12 * rowGap), "Downsample", \downsample, 1, 24, 1, 0, true);
-    addLockRow.(col3X, yLocks + (13 * rowGap), "FilterMode", \filterMode, 0, 3, 1, 0, true);
+    addLockRow.(col3X, yLocks + (0 * rowGap), "Spread", \spread, 0.2, 4.5, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (1 * rowGap), "Pan", \pan, -1, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (2 * rowGap), "FiltCut", \filterCutoff, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (3 * rowGap), "FiltRes", \filterRes, 0.01, 0.98, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (4 * rowGap), "FiltEnvAmt", \filterEnvAmt, 0, 4, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (5 * rowGap), "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, 0.001, 3, false);
+    addLockRow.(col3X, yLocks + (6 * rowGap), "CombAmt", \combAmt, 0, 1, 0.01, 2, false);
+    addLockRow.(col3X, yLocks + (7 * rowGap), "CombTime", \combTime, 0.0007, 0.03, 0.0005, 4, false);
+
+    // column 4
+    addLockRow.(col4X, yLocks + (0 * rowGap), "CombDecay", \combDecay, 0.02, 2.0, 0.01, 2, false);
+    addLockRow.(col4X, yLocks + (1 * rowGap), "EdgeDrive", \edgeDrive, 0.5, 8.0, 0.01, 2, false);
+    addLockRow.(col4X, yLocks + (2 * rowGap), "FoldAmt", \foldAmt, 0, 1, 0.01, 2, false);
+    addLockRow.(col4X, yLocks + (3 * rowGap), "Presence", \presence, -1, 1, 0.01, 2, false);
+    addLockRow.(col4X, yLocks + (4 * rowGap), "CrushMix", \crushMix, 0, 1, 0.01, 2, false);
+    addLockRow.(col4X, yLocks + (5 * rowGap), "BitDepth", \bitDepth, 2, 16, 1, 0, true);
+    addLockRow.(col4X, yLocks + (6 * rowGap), "Downsample", \downsample, 1, 24, 1, 0, true);
+    addLockRow.(col4X, yLocks + (7 * rowGap), "FilterMode", \filterMode, 0, 3, 1, 0, true);
 
     // --------------------------------------------------
     // bottom actions
@@ -3746,12 +4697,84 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 }.value;
 
 
+		        // master page
+        {
+            var v = makePage.(\master);
+
+            StaticText(v, Rect(20, 10, 1000, 20)).string_(
+                "Master bus controls. These update the running master synth immediately."
+            );
+
+            StaticText(v, Rect(20, 50, 120, 20)).string_("Trim (dB)");
+            masterTrimBox = makeBoundedBox.(v, Rect(150, 50, 100, 20), ~plonkMaster[\trimDb], -24.0, 12.0, 0.1, 1, { |nb, val|
+                ~plonkMaster[\trimDb] = val;
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(\trimDb, val);
+                };
+            });
+
+            StaticText(v, Rect(20, 84, 120, 20)).string_("Limiter Level");
+            masterLimiterLevelBox = makeBoundedBox.(v, Rect(150, 84, 100, 20), ~plonkMaster[\limiterLevel], 0.10, 1.00, 0.01, 2, { |nb, val|
+                ~plonkMaster[\limiterLevel] = val;
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(\limiterLevel, val);
+                };
+            });
+
+            StaticText(v, Rect(20, 118, 120, 20)).string_("Limiter Dur");
+            masterLimiterDurBox = makeBoundedBox.(v, Rect(150, 118, 100, 20), ~plonkMaster[\limiterDur], 0.001, 0.10, 0.001, 3, { |nb, val|
+                ~plonkMaster[\limiterDur] = val;
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(\limiterDur, val);
+                };
+            });
+
+            StaticText(v, Rect(20, 152, 120, 20)).string_("Soft Clip Amt");
+            masterSoftClipAmtBox = makeBoundedBox.(v, Rect(150, 152, 100, 20), ~plonkMaster[\softClipAmt], 0.00, 1.00, 0.01, 2, { |nb, val|
+                ~plonkMaster[\softClipAmt] = val;
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(\softClipAmt, val);
+                };
+            });
+
+            makeButton.(v, Rect(20, 210, 140, 26), "Rebuild Master Bus", {
+                ~plonkInitMasterOut.();
+                if(refreshMasterUI.notNil) { refreshMasterUI.() };
+            });
+
+            makeButton.(v, Rect(170, 210, 140, 26), "Reset Defaults", {
+                ~plonkMaster[\trimDb] = -12.0;
+                ~plonkMaster[\limiterLevel] = 0.85;
+                ~plonkMaster[\limiterDur] = 0.01;
+                ~plonkMaster[\softClipAmt] = 0.15;
+
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(
+                        \trimDb, ~plonkMaster[\trimDb],
+                        \limiterLevel, ~plonkMaster[\limiterLevel],
+                        \limiterDur, ~plonkMaster[\limiterDur],
+                        \softClipAmt, ~plonkMaster[\softClipAmt]
+                    );
+                };
+
+                if(refreshMasterUI.notNil) { refreshMasterUI.() };
+            });
+
+            StaticText(v, Rect(20, 270, 1000, 80)).string_(
+                "Recommended starting point:\n"
+                ++ "Trim = -12 dB | Limiter Level = 0.85 | Limiter Dur = 0.01 | Soft Clip Amt = 0.15"
+            );
+
+            if(refreshMasterUI.notNil) { refreshMasterUI.() };
+        }.value;
+
+
         // audio page
         {
             var v = makePage.(\audio);
             var srBox, outChBox, inChBox;
 
-            StaticText(v, Rect(20, 10, 900, 20)).string_("Audio device setup. Changing device reboots the SC server.");
+            StaticText(v, Rect(20, 10, 900, 20)).string_("Audio/Midi setup. Changing audio device settings reboots the SC server.");
 
             StaticText(v, Rect(20, 50, 100, 20)).string_("Output Device");
             ~plonkAudioOutMenu = PopUpMenu(v, Rect(130, 50, 420, 22));
@@ -3892,19 +4915,25 @@ if(~plonkMidiSourceMenu.notNil) {
             ~plonkRefreshAudioMenus.();
         }.value;
 
-        ~plonkSetSelectedTrack.(0);
-		~plonkSetEditVariation.(0);
-		refreshControls.();
-		refreshPatternUI.();
-		refreshLockEditor.();
-        ~plonkRefreshAudioMenus.();
-        showPage.(\main);
+~plonkSetSelectedTrack.(0);
+~plonkSetEditVariation.(0);
+refreshControls.();
+refreshPatternUI.();
+refreshLockEditor.();
+if(refreshMasterUI.notNil) { refreshMasterUI.() };
+if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+~plonkRefreshAudioMenus.();
+showPage.(\main);
 
 		win.front;
 
         win.onClose_({
     ~plonkSeqStop.();
     ~plonkFreeMidiDefs.();
+
+    if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
+    if(~plonkFreeMixer.notNil) { ~plonkFreeMixer.() };
+
     ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
     ~plonkVoices.clear;
 });
