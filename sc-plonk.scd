@@ -213,7 +213,8 @@ s.waitForBoot({
         [0, 3, 5, 7, 10]
     ];
 
-    ~plonkLayerModeNames = ["Single", "Layer", "Alt", "Random"];
+    ~plonkDebug = false;
+    ~plonkLayerModeNames = ["Single", "Assist", "Assist Alt", "Assist Rand"];
 	~plonkRandSelModeNames = ["Full", "Selection", "Timing", "Pitch", "Accent", "Layer"];
 	~plonkSynth2TypeNames = ["FM Burst", "PWM Buzz", "Ring Metal", "Vowel Noise"];
 		~plonkSynth2VariantNames = ["Soft", "Bright", "Wide", "Hollow", "Nasal", "Harsh"];
@@ -321,6 +322,7 @@ s.waitForBoot({
 	~plonkMaster = (
     outBus: 0,
     mixBus: nil,
+    meterBus: nil,
     trimDb: -12.0,
     limiterLevel: 0.85,
     limiterDur: 0.01,
@@ -336,11 +338,17 @@ s.waitForBoot({
         try { ~plonkMaster[\synth].free } { };
     };
 
+    if(~plonkMaster[\meterBus].notNil) {
+        try { ~plonkMaster[\meterBus].free } { };
+    };
+
     ~plonkMaster[\mixBus] = Bus.audio(s, 2);
+    ~plonkMaster[\meterBus] = Bus.control(s, 2);
 
     ~plonkMaster[\synth] = Synth(\plonkV520MasterOut, [
         \inBus, ~plonkMaster[\mixBus].index,
         \out, ~plonkMaster[\outBus],
+        \meterBus, ~plonkMaster[\meterBus].index,
         \trimDb, ~plonkMaster[\trimDb],
         \limiterLevel, ~plonkMaster[\limiterLevel],
         \limiterDur, ~plonkMaster[\limiterDur],
@@ -414,9 +422,11 @@ s.waitForBoot({
     // synth definition
     // --------------------------------------------------------
     ~plonkDefineSynth = {
+        var plonkBuildVoiceDef;
 
 
-		SynthDef(\plonkV520, {
+		plonkBuildVoiceDef = { |defName, assistKind=(-1)|
+		SynthDef(defName, {
     |out=0, amp=0.22, pan=0,
     freq=220, gate=1, velocity=0.9,
     model=0,
@@ -457,8 +467,8 @@ s.waitForBoot({
     downsample=1,
 
     // internal synth2 branch
-    layerMode=0,          // 0=main only, 1=layered, 2=synth2 only
-    layerLevel=0.60,
+    layerMode=0,          // kept for saved-pattern compatibility; routing chooses the SynthDef
+    layerLevel=0.35,
     synth2Freq=220,
     synth2Type=0,
     synth2Color=0.5,
@@ -666,6 +676,7 @@ s.waitForBoot({
     mainSig = (mainSigA + (mainSigB * 0.82)) * 0.78;
 
 
+	if(assistKind >= 0) {
 	synth2SharedBright = effBright.clip(0, 1);
     synth2SharedBody = body.clip(0, 1);
     synth2SharedColor = ((synth2Color * 0.62) + (synth2SharedBright * 0.38)).clip(0, 1);
@@ -773,98 +784,103 @@ s.waitForBoot({
         baseRatio2 = (2.0.blend(borrow3 / borrow2.max(0.0001), synth2BorrowMix * 0.9)).clip(0.5, 10.0);
         baseRatio3 = (1.5.blend(borrow4 / borrow2.max(0.0001), synth2BorrowMix * 0.8)).clip(0.5, 10.0);
 
-        modFreq = baseFreq2 * (
-            synth2FmRatio.clip(0.25, 10).blend(baseRatio1, synth2BorrowMix)
-            + (synth2Motion * 1.2)
-            + (synth2SharedBright * 0.35)
+        voiceSig = switch(assistKind,
+            0, {
+                modFreq = baseFreq2 * (
+                    synth2FmRatio.clip(0.25, 10).blend(baseRatio1, synth2BorrowMix)
+                    + (synth2Motion * 1.2)
+                    + (synth2SharedBright * 0.35)
+                );
+
+                modAmt = baseFreq2 * synth2FmIndex.clip(0.1, 8) * (
+                    0.12 + (sharedColor * 0.75) + (synth2SharedBody * 0.25)
+                );
+
+                mod = SinOsc.ar(modFreq, 0, modAmt);
+                fmSig = SinOsc.ar(baseFreq2 + mod);
+
+                fmSig = (fmSig * 0.6)
+                    + BPF.ar(
+                        fmSig,
+                        (baseFreq2 * (baseRatio2 + sharedColor * 4.5)).clip(80, 16000),
+                        0.4
+                    );
+                fmSig;
+            },
+            1, {
+                widthMod = LFNoise2.kr(3 + (synth2Motion * 22) + (i * 0.07)).range(
+                    (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03)).neg,
+                    (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03))
+                );
+
+                pwmRatios = [
+                    1,
+                    (1.0015 + (synth2Motion * 0.01)).blend(baseRatio1, synth2BorrowMix * 0.45),
+                    1.997.blend(baseRatio2, synth2BorrowMix * 0.65)
+                ];
+
+                pwmSig = Mix(Pulse.ar(
+                    baseFreq2 * pwmRatios,
+                    (synth2PwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
+                )) * 0.33;
+
+                pwmSig = HPF.ar(
+                    RLPF.ar(
+                        pwmSig,
+                        (baseFreq2 * (synth2ModelToneMul.blend(baseRatio3 + 1.6, synth2BorrowMix * 0.7) + (sharedColor * 5.5))).clip(120, 18000),
+                        0.2
+                    ),
+                    50
+                );
+                pwmSig;
+            },
+            2, {
+                ringRatioA = (1 + (synth2Motion * 0.015)).blend(baseRatio1, synth2BorrowMix * 0.35);
+                ringRatioB = (1.5 + (sharedColor * 5.8) + (synth2Noise.abs * 1.5)).blend(
+                    baseRatio3 + (sharedColor * 1.6),
+                    synth2BorrowMix * 0.75
+                );
+
+                oscA = Saw.ar(baseFreq2 * ringRatioA);
+                oscB = SinOsc.ar(baseFreq2 * ringRatioB);
+                ringSig = oscA * oscB;
+
+                ringSig = BPF.ar(
+                    ringSig,
+                    (baseFreq2 * ((2.2 + (sharedColor * 9.5)).blend(baseRatio2 + 1.5, synth2BorrowMix * 0.7))).clip(100, 18000),
+                    0.25 + (synth2Motion * 0.2)
+                );
+                ringSig;
+            },
+            3, {
+                noiseSrc = PinkNoise.ar(0.7 + (synth2Noise.abs * 0.6));
+
+                formModel1 = Select.kr(model.clip(0, 3), [0.95, 1.15, 1.30, 0.85]);
+                formModel2 = Select.kr(model.clip(0, 3), [0.95, 1.12, 1.25, 0.90]);
+
+                form1 = (
+                    synth2FormantMorph.clip(0, 1).linexp(0, 1, 350, 1100)
+                    * formModel1
+                    * (1 + (synth2SharedBody * 0.15))
+                    * (1.0.blend(baseRatio1.clip(0.7, 2.5), synth2BorrowMix * 0.30))
+                ).clip(180, 4000);
+
+                form2 = (
+                    synth2FormantMorph.clip(0, 1).linexp(0, 1, 900, 3200)
+                    * formModel2
+                    * (1 + (sharedColor * 0.12))
+                    * (1.0.blend(baseRatio2.clip(0.8, 3.5), synth2BorrowMix * 0.20))
+                ).clip(400, 9000);
+
+                vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
+                    + BPF.ar(noiseSrc, form2, 0.12, 0.75);
+
+                vowelSig = vowelSig + (SinOsc.ar(baseFreq2 * baseRatio1, 0, 0.15) * synth2RingMix.clip(0, 1));
+                vowelSig = HPF.ar(vowelSig, 100);
+                vowelSig;
+            },
+            { Silent.ar(1) }
         );
-
-        modAmt = baseFreq2 * synth2FmIndex.clip(0.1, 8) * (
-            0.12 + (sharedColor * 0.75) + (synth2SharedBody * 0.25)
-        );
-
-        mod = SinOsc.ar(modFreq, 0, modAmt);
-        fmSig = SinOsc.ar(baseFreq2 + mod);
-
-        fmSig = (fmSig * 0.6)
-            + BPF.ar(
-                fmSig,
-                (baseFreq2 * (baseRatio2 + sharedColor * 4.5)).clip(80, 16000),
-                0.4
-            );
-
-        widthMod = LFNoise2.kr(3 + (synth2Motion * 22) + (i * 0.07)).range(
-            (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03)).neg,
-            (0.04 + (sharedColor * 0.10) + (synth2SharedBody * 0.03))
-        );
-
-        pwmRatios = [
-            1,
-            (1.0015 + (synth2Motion * 0.01)).blend(baseRatio1, synth2BorrowMix * 0.45),
-            1.997.blend(baseRatio2, synth2BorrowMix * 0.65)
-        ];
-
-        pwmSig = Mix(Pulse.ar(
-            baseFreq2 * pwmRatios,
-            (synth2PwmWidth.clip(0.08, 0.92) + widthMod).clip(0.05, 0.95)
-        )) * 0.33;
-
-        pwmSig = HPF.ar(
-            RLPF.ar(
-                pwmSig,
-                (baseFreq2 * (synth2ModelToneMul.blend(baseRatio3 + 1.6, synth2BorrowMix * 0.7) + (sharedColor * 5.5))).clip(120, 18000),
-                0.2
-            ),
-            50
-        );
-
-        ringRatioA = (1 + (synth2Motion * 0.015)).blend(baseRatio1, synth2BorrowMix * 0.35);
-        ringRatioB = (1.5 + (sharedColor * 5.8) + (synth2Noise.abs * 1.5)).blend(
-            baseRatio3 + (sharedColor * 1.6),
-            synth2BorrowMix * 0.75
-        );
-
-        oscA = Saw.ar(baseFreq2 * ringRatioA);
-        oscB = SinOsc.ar(baseFreq2 * ringRatioB);
-        ringSig = oscA * oscB;
-
-        ringSig = BPF.ar(
-            ringSig,
-            (baseFreq2 * ((2.2 + (sharedColor * 9.5)).blend(baseRatio2 + 1.5, synth2BorrowMix * 0.7))).clip(100, 18000),
-            0.25 + (synth2Motion * 0.2)
-        );
-
-        noiseSrc = PinkNoise.ar(0.7 + (synth2Noise.abs * 0.6));
-
-        formModel1 = Select.kr(model.clip(0, 3), [0.95, 1.15, 1.30, 0.85]);
-        formModel2 = Select.kr(model.clip(0, 3), [0.95, 1.12, 1.25, 0.90]);
-
-        form1 = (
-            synth2FormantMorph.clip(0, 1).linexp(0, 1, 350, 1100)
-            * formModel1
-            * (1 + (synth2SharedBody * 0.15))
-            * (1.0.blend(baseRatio1.clip(0.7, 2.5), synth2BorrowMix * 0.30))
-        ).clip(180, 4000);
-
-        form2 = (
-            synth2FormantMorph.clip(0, 1).linexp(0, 1, 900, 3200)
-            * formModel2
-            * (1 + (sharedColor * 0.12))
-            * (1.0.blend(baseRatio2.clip(0.8, 3.5), synth2BorrowMix * 0.20))
-        ).clip(400, 9000);
-
-        vowelSig = BPF.ar(noiseSrc, form1, 0.18, 0.9)
-            + BPF.ar(noiseSrc, form2, 0.12, 0.75);
-
-        vowelSig = vowelSig + (SinOsc.ar(baseFreq2 * baseRatio1, 0, 0.15) * synth2RingMix.clip(0, 1));
-        vowelSig = HPF.ar(vowelSig, 100);
-
-        voiceSig = SelectX.ar(synth2Type.clip(0, 3), [
-            fmSig,
-            pwmSig,
-            ringSig,
-            vowelSig
-        ]);
 
         voiceSig = voiceSig + (synth2Attack * (0.6 + (synth2Click.abs.clip(0, 1) * 0.8)));
 
@@ -1115,19 +1131,15 @@ s.waitForBoot({
     synth2Sig = HPF.ar(synth2Sig, modelHPF.clip(30, 400));
     synth2Sig = synth2Sig * layerLevel.clip(0, 1) * velocity.linlin(0, 1, 0.35, 1.0);
 
-    synth2Mode = layerMode.clip(0, 2);
-
-    sig = SelectX.ar(synth2Mode, [
-    mainSig * 0.95,
-    (mainSig + synth2Sig) * 0.68,
-    synth2Sig * 0.90
-]);
-
-    bodyBaseFreq = SelectX.kr(synth2Mode, [
-        baseFreq,
-        ((baseFreq + (synth2Freq * synth2PitchEnv)) * 0.5),
-        (synth2Freq * synth2PitchEnv)
-    ]);
+    synth2Mode = 1;
+    sig = (mainSig * (0.92 + (bodyGlueAmt * 0.05))) + (synth2Sig * (0.28 + (glueAmt * 0.16)));
+    sig = sig * (0.88 + (layerLevel.clip(0, 1) * 0.12));
+    bodyBaseFreq = baseFreq.blend(synth2Freq * synth2PitchEnv, layerLevel.clip(0, 1) * 0.18);
+    }{
+    synth2Mode = 0;
+    sig = mainSig * 0.95;
+    bodyBaseFreq = baseFreq;
+    };
 
     bodySig = SelectX.ar(model.clip(0, 3), [
         BPF.ar(sig, bodyBaseFreq * 1.15, 0.22, body * 0.24) + BPF.ar(sig, bodyBaseFreq * 0.78, 0.18, body * 0.12),
@@ -1189,11 +1201,19 @@ s.waitForBoot({
 
     Out.ar(out, Pan2.ar(sig, pan));
 }).add;
+};
+
+        plonkBuildVoiceDef.(\plonkV520Main, -1);
+        plonkBuildVoiceDef.(\plonkV520AssistFM, 0);
+        plonkBuildVoiceDef.(\plonkV520AssistPWM, 1);
+        plonkBuildVoiceDef.(\plonkV520AssistRing, 2);
+        plonkBuildVoiceDef.(\plonkV520AssistVowel, 3);
+        plonkBuildVoiceDef.(\plonkV520, -1);
 
 
 		SynthDef(\plonkV520MasterOut, {
-    |inBus=0, out=0, trimDb=(-10), limiterLevel=0.92, limiterDur=0.01, softClipAmt=0.20|
-    var sig, trim, limited, clipped;
+    |inBus=0, out=0, meterBus=0, trimDb=(-10), limiterLevel=0.92, limiterDur=0.01, softClipAmt=0.20|
+    var sig, trim, limited, clipped, meter;
 
     sig = In.ar(inBus, 2);
     sig = LeakDC.ar(sig);
@@ -1209,6 +1229,9 @@ s.waitForBoot({
         clipped,
         softClipAmt.clip(0, 1).linlin(0, 1, -1, 1)
     );
+
+    meter = Amplitude.kr(sig.abs, 0.01, 0.08);
+    Out.kr(meterBus, meter);
 
     Out.ar(out, sig);
 }).add;
@@ -1247,7 +1270,7 @@ AppClock.sched(0.1, {
     if(~plonkInitMixer.notNil) {
         ~plonkInitMixer.();
     };
-    "Loaded \\plonkV520".postln;
+    "Loaded Plonk voice variants.".postln;
     nil
 });
 
@@ -1359,6 +1382,10 @@ AppClock.sched(0.1, {
         outDevice: "", inDevice: "", sampleRate: 48000, numOutChannels: 2, numInChannels: 0
     );
 
+    ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+    ~plonkAudioApplyInProgress = false;
+    ~plonkAudioBootTimeout = 8.0;
+
 
 
 
@@ -1367,12 +1394,85 @@ AppClock.sched(0.1, {
     ~plonkAudioInMenu = nil;
     ~plonkAudioStatus = nil;
 
+    ~plonkNormalizeAudioState = { |state|
+        var outName, inName, sr, outCh, inCh;
+
+        outName = (state[\outDevice] ? "").asString;
+        inName = (state[\inDevice] ? "").asString;
+        sr = (state[\sampleRate] ? 48000).asInteger.clip(8000, 192000);
+        outCh = (state[\numOutChannels] ? 2).asInteger.clip(2, 128);
+        inCh = (state[\numInChannels] ? 0).asInteger.clip(0, 128);
+
+        (
+            outDevice: outName,
+            inDevice: inName,
+            sampleRate: sr,
+            numOutChannels: outCh,
+            numInChannels: inCh
+        )
+    };
+
+    ~plonkAudioStateFromServer = {
+        ~plonkNormalizeAudioState.((
+            outDevice: (s.options.outDevice ? "").asString,
+            inDevice: (s.options.inDevice ? "").asString,
+            sampleRate: (s.options.sampleRate ? 48000).asInteger,
+            numOutChannels: (s.options.numOutputBusChannels ? 2).asInteger,
+            numInChannels: (s.options.numInputBusChannels ? 0).asInteger
+        ));
+    };
+
+    ~plonkAudioStateEquals = { |a, b|
+        var aa = ~plonkNormalizeAudioState.(a);
+        var bb = ~plonkNormalizeAudioState.(b);
+
+        (aa[\outDevice] == bb[\outDevice]) and:
+        { aa[\inDevice] == bb[\inDevice] } and:
+        { aa[\sampleRate] == bb[\sampleRate] } and:
+        { aa[\numOutChannels] == bb[\numOutChannels] } and:
+        { aa[\numInChannels] == bb[\numInChannels] }
+    };
+
+    ~plonkAudioDeviceLabel = { |name|
+        name = (name ? "").asString;
+        if(name == "") { "System Default" } { name };
+    };
+
+    ~plonkSetServerAudioOptions = { |state|
+        var normalized = ~plonkNormalizeAudioState.(state);
+        var outName = normalized[\outDevice];
+        var inName = normalized[\inDevice];
+
+        s.options.memSize = 2097152;
+        s.options.numWireBufs = 512;
+        s.options.sampleRate = normalized[\sampleRate];
+        s.options.numOutputBusChannels = normalized[\numOutChannels];
+        s.options.numInputBusChannels = normalized[\numInChannels];
+        s.options.outDevice = if(outName == "") { nil } { outName };
+        s.options.inDevice = if(inName == "") { nil } { inName };
+    };
+
+    ~plonkValidateAudioState = { |state|
+        var normalized = ~plonkNormalizeAudioState.(state);
+        var outName = normalized[\outDevice];
+        var inName = normalized[\inDevice];
+        var err = nil;
+
+        ~plonkRefreshAudioDevices.();
+
+        if((outName != "") and: { ~plonkAudioDevices.includes(outName).not }) {
+            err = "Output device not found: " ++ outName;
+        };
+
+        if(err.isNil and: { (inName != "") and: { ~plonkAudioDevices.includes(inName).not } }) {
+            err = "Input device not found: " ++ inName;
+        };
+
+        err;
+    };
+
     ~plonkSyncAudioStateFromServer = {
-        ~plonkAudioState[\outDevice] = (s.options.outDevice ? "").asString;
-        ~plonkAudioState[\inDevice] = (s.options.inDevice ? "").asString;
-        ~plonkAudioState[\sampleRate] = (s.options.sampleRate ? 48000).asInteger;
-        ~plonkAudioState[\numOutChannels] = (s.options.numOutputBusChannels ? 2).asInteger;
-        ~plonkAudioState[\numInChannels] = (s.options.numInputBusChannels ? 0).asInteger;
+        ~plonkAudioState = ~plonkAudioStateFromServer.();
     };
 
     ~plonkRefreshAudioDevices = {
@@ -1384,31 +1484,38 @@ AppClock.sched(0.1, {
     ~plonkRefreshAudioMenus = {
         var outIdx, inIdx;
 
-        ~plonkSyncAudioStateFromServer.();
-        ~plonkRefreshAudioDevices.();
+        if(~plonkAudioApplyInProgress) {
+            if(~plonkAudioStatus.notNil) {
+                ~plonkAudioStatus.string_("Audio reboot in progress...");
+            };
+        }{
+	    ~plonkSyncAudioStateFromServer.();
+        ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+	    ~plonkRefreshAudioDevices.();
 
-        if(~plonkAudioOutMenu.notNil) {
-            ~plonkAudioOutMenu.items_(["Current / unchanged"] ++ ~plonkAudioDevices);
-            outIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\outDevice]);
-            if(outIdx.isNil) { outIdx = -1 };
-            ~plonkAudioOutMenu.value_(outIdx + 1);
-        };
+            if(~plonkAudioOutMenu.notNil) {
+                ~plonkAudioOutMenu.items_(["System Default"] ++ ~plonkAudioDevices);
+                outIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\outDevice]);
+                if(outIdx.isNil) { outIdx = -1 };
+                ~plonkAudioOutMenu.value_(outIdx + 1);
+            };
 
-        if(~plonkAudioInMenu.notNil) {
-            ~plonkAudioInMenu.items_(["Current / unchanged"] ++ ~plonkAudioDevices);
-            inIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\inDevice]);
-            if(inIdx.isNil) { inIdx = -1 };
-            ~plonkAudioInMenu.value_(inIdx + 1);
-        };
+            if(~plonkAudioInMenu.notNil) {
+                ~plonkAudioInMenu.items_(["System Default"] ++ ~plonkAudioDevices);
+                inIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\inDevice]);
+                if(inIdx.isNil) { inIdx = -1 };
+                ~plonkAudioInMenu.value_(inIdx + 1);
+            };
 
-        if(~plonkAudioStatus.notNil) {
-            ~plonkAudioStatus.string_(
-                "Out: " ++ (~plonkAudioState[\outDevice] ? "default")
-                ++ " | In: " ++ (~plonkAudioState[\inDevice] ? "default")
-                ++ " | SR: " ++ ~plonkAudioState[\sampleRate].asString
-                ++ " | OutCh: " ++ ~plonkAudioState[\numOutChannels].asString
-                ++ " | InCh: " ++ ~plonkAudioState[\numInChannels].asString
-            );
+            if(~plonkAudioStatus.notNil) {
+                ~plonkAudioStatus.string_(
+                    "Out: " ++ ~plonkAudioDeviceLabel.(~plonkAudioState[\outDevice])
+                    ++ " | In: " ++ ~plonkAudioDeviceLabel.(~plonkAudioState[\inDevice])
+                    ++ " | SR: " ++ ~plonkAudioState[\sampleRate].asString
+                    ++ " | OutCh: " ++ ~plonkAudioState[\numOutChannels].asString
+                    ++ " | InCh: " ++ ~plonkAudioState[\numInChannels].asString
+                );
+            };
         };
     };
 
@@ -1417,59 +1524,113 @@ AppClock.sched(0.1, {
     ~plonkInitMasterOut.();
     ~plonkInitMixer.();
     ~plonkInstallMidi.();
+    ~plonkSyncAudioStateFromServer.();
+    ~plonkAudioLastGoodState = ~plonkAudioState.copy;
     ~plonkRefreshAudioMenus.();
     ~plonkUpdateMidiSyncStatus.();
 
-    if(~plonkAudioStatus.notNil) {
-        ~plonkAudioStatus.string_("Audio ready.");
-    };
-};
+	    if(~plonkAudioStatus.notNil) {
+	        ~plonkAudioStatus.string_("Audio ready.");
+	    };
+	};
 
-    ~plonkApplyAudioState = {
-        var outName, inName, sr, outCh, inCh;
-
-        outName = (~plonkAudioState[\outDevice] ? "").asString;
-        inName = (~plonkAudioState[\inDevice] ? "").asString;
-        sr = (~plonkAudioState[\sampleRate] ? 48000).asInteger;
-        outCh = (~plonkAudioState[\numOutChannels] ? 2).asInteger.clip(2, 128);
-        inCh = (~plonkAudioState[\numInChannels] ? 0).asInteger.clip(0, 128);
-
-        ~plonkSeqStop.();
-        ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
-        ~plonkVoices.clear;
-        ~plonkFreeMidiDefs.();
-
-        s.options.memSize = 2097152;
-        s.options.sampleRate = sr;
-        s.options.numOutputBusChannels = outCh;
-        s.options.numInputBusChannels = inCh;
-        if(outName != "") { s.options.outDevice = outName };
-        if(inName != "") { s.options.inDevice = inName };
+    ~plonkFinishAudioApplyFailure = { |reason|
+        ~plonkAudioApplyInProgress = false;
+        ~plonkAudioState = ~plonkAudioLastGoodState.copy;
+        ~plonkSetServerAudioOptions.(~plonkAudioLastGoodState);
+        ~plonkRefreshAudioMenus.();
 
         if(~plonkAudioStatus.notNil) {
-            ~plonkAudioStatus.string_("Rebooting audio server...");
+            ~plonkAudioStatus.string_(reason);
         };
+    };
 
-        Routine({
-    s.reboot;
-    0.8.wait;
-
-    if(s.serverRunning) {
+    ~plonkFinishAudioApplySuccess = {
+        ~plonkAudioApplyInProgress = false;
         ~plonkRebuildAfterAudioChange.();
-    }{
-        {
-            if(~plonkAudioStatus.notNil) {
-                ~plonkAudioStatus.string_("Audio reboot failed. Check device/sample-rate settings.");
+    };
+
+	    ~plonkApplyAudioState = {
+	        var desired, current, validation;
+
+            if(~plonkAudioApplyInProgress) {
+                if(~plonkAudioStatus.notNil) {
+                    ~plonkAudioStatus.string_("Audio reboot already in progress.");
+                };
+            }{
+                desired = ~plonkNormalizeAudioState.(~plonkAudioState);
+                validation = ~plonkValidateAudioState.(desired);
+
+                if(validation.notNil) {
+                    if(~plonkAudioStatus.notNil) {
+                        ~plonkAudioStatus.string_(validation);
+                    };
+                }{
+                    current = ~plonkAudioStateFromServer.();
+
+                    if(~plonkAudioStateEquals.(desired, current)) {
+                        ~plonkAudioState = current.copy;
+                        ~plonkAudioLastGoodState = current.copy;
+                        ~plonkRefreshAudioMenus.();
+                        if(~plonkAudioStatus.notNil) {
+                            ~plonkAudioStatus.string_("Audio settings unchanged.");
+                        };
+                    }{
+                        ~plonkAudioLastGoodState = current.copy;
+                        ~plonkAudioApplyInProgress = true;
+
+                        ~plonkSeqStop.();
+                        if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
+                        ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
+                        ~plonkVoices.clear;
+                        ~plonkFreeMidiDefs.();
+
+                        ~plonkSetServerAudioOptions.(desired);
+
+                        if(~plonkAudioStatus.notNil) {
+                            ~plonkAudioStatus.string_("Rebooting audio server...");
+                        };
+
+                        Routine({
+                            var completed = false;
+                            var startedAt = Main.elapsedTime;
+                            var timeout = (~plonkAudioBootTimeout ? 8.0).asFloat;
+
+                            s.reboot;
+                            0.25.wait;
+
+                            s.waitForBoot({
+                                if(completed.not) {
+                                    completed = true;
+                                    { ~plonkFinishAudioApplySuccess.() }.defer;
+                                };
+                            });
+
+                            while({
+                                completed.not and: { (Main.elapsedTime - startedAt) < timeout }
+                            }, {
+                                0.1.wait;
+                            });
+
+                            if(completed.not) {
+                                completed = true;
+                                {
+                                    ~plonkFinishAudioApplyFailure.(
+                                        "Audio reboot failed. Restored last known settings."
+                                    );
+                                }.defer;
+                            };
+
+                            nil
+                        }).play(AppClock);
+                    };
+                };
             };
-        }.defer;
-    };
+	    };
 
-    nil
-}).play(AppClock);
-    };
-
-    ~plonkSyncAudioStateFromServer.();
-    ~plonkRefreshAudioDevices.();
+	    ~plonkSyncAudioStateFromServer.();
+        ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+	    ~plonkRefreshAudioDevices.();
 
 
 
@@ -1613,8 +1774,19 @@ args[\out] = outBus;
 };
 
 
-~plonkTrigger = { |overrides|
-    ~plonkTriggerWithDef.(\plonkV520, overrides);
+	~plonkTrigger = { |overrides|
+	    ~plonkTriggerWithDef.(\plonkV520Main, overrides);
+	};
+
+~plonkAssistDefNames = [
+    \plonkV520AssistFM,
+    \plonkV520AssistPWM,
+    \plonkV520AssistRing,
+    \plonkV520AssistVowel
+];
+
+~plonkAssistDefForStep = { |step|
+    ~plonkAssistDefNames.wrapAt((step[\engine2Model] ? 0).asInteger.clip(0, 3));
 };
 
 
@@ -1649,7 +1821,7 @@ args[\out] = outBus;
             layerMode: 0,
             engine2Model: 0,
             engine2Exciter: 0,
-            layerLevel: 0.60,
+            layerLevel: 0.35,
             engine2PitchMode: 0,
             engine2SemiOffset: 0,
             engine2DegreeOffset: 0,
@@ -1986,16 +2158,16 @@ args[\out] = outBus;
             layerMidi = mainMidi;
         },
         1, {
-            layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-7, 7)));
+            layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-2, 2)));
         },
         2, {
             if(useDegree == 1) {
                 layerMidi = ~plonkDegreeToMidi.(
-                    ((mainLocks[\degree] ? 0) + (step[\engine2DegreeOffset] ? 0).clip(-2, 2)),
-                    ((mainLocks[\degreeOct] ? 0) + (step[\engine2DegreeOctOffset] ? 0).clip(-1, 1))
+                    ((mainLocks[\degree] ? 0) + (step[\engine2DegreeOffset] ? 0).clip(-1, 1)),
+                    (mainLocks[\degreeOct] ? 0)
                 );
             }{
-                layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-7, 7)));
+                layerMidi = ~plonkQuantizeMidi.(mainMidi + ((step[\engine2SemiOffset] ? 0).clip(-2, 2)));
             };
         }
     );
@@ -2016,7 +2188,7 @@ args[\out] = outBus;
     inferredDrive = (
         0.9
         + ((baseArgs[\drive] ? 1.0) * 0.45)
-        + ((step[\layerLevel] ? 0.60) * 0.25)
+        + ((step[\layerLevel] ? 0.35) * 0.25)
     ).clip(0.6, 2.4);
 
     inferredGlue = (
@@ -2039,7 +2211,7 @@ args[\out] = outBus;
     ).clip(0.15, 1.00);
 
     args[\synth2Freq] = layerMidi.clip(0, 127).midicps;
-    args[\layerLevel] = (step[\layerLevel] ? 0.60).clip(0.0, 1.0);
+    args[\layerLevel] = (step[\layerLevel] ? 0.35).clip(0.0, 1.0);
 
     args[\synth2Type] = synthType;
     args[\synth2Color] = (step[\synth2Color] ? inferredColor).clip(0, 1);
@@ -2058,7 +2230,7 @@ args[\out] = outBus;
     ).clip(0.1, 8.0);
 
     args[\synth2FormantMorph] = excIdx.linlin(0, 5, 0.0, 1.0).clip(0, 1);
-    args[\synth2RingMix] = (0.2 + ((step[\layerLevel] ? 0.60) * 0.7)).clip(0, 1);
+    args[\synth2RingMix] = (0.2 + ((step[\layerLevel] ? 0.35) * 0.7)).clip(0, 1);
 
     args[\synth2UnisonVoices] = (step[\synth2UnisonVoices] ? 1).asInteger.clip(1, 4);
     args[\synth2UnisonDetune] = ((step[\synth2UnisonDetune] ? 0.0) * 0.45).clip(0.0, 0.12);
@@ -2069,9 +2241,9 @@ args[\out] = outBus;
     args[\synth2PitchEnvDecay] = (step[\synth2PitchEnvDecay] ? 0.03);
     args[\synth2PitchEnvCurve] = (step[\synth2PitchEnvCurve] ? -6.0);
 
-		args[\pan] = (
+    args[\pan] = (
     (baseArgs[\pan] ? 0.0)
-    + (step[\engine2PanOffset] ? 0.0)
+    + (step[\engine2PanOffset] ? 0.0).clip(-0.25, 0.25)
 ).clip(-1.0, 1.0);
 
     args[\synth2Glue] = inferredGlue;
@@ -2107,32 +2279,42 @@ args[\out] = outBus;
   ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
     var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
     var args = ~plonkBuildStepArgs.(trackIdx, step).copy;
-    var layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
-    var effectiveMode;
+    var layerArgs;
+    var useAssist = false;
+    var defName = \plonkV520Main;
     var synth;
 
-    effectiveMode = switch(mode,
-        0, { 0 },   // main only
-        1, { 1 },   // layered
-        2, {         // alternating: main only / synth2 only
+    useAssist = switch(mode,
+        0, { false },   // main only
+        1, { true },    // modal voice with assist shaping
+        2, {            // alternating: main only / assisted
             if(~plonkAltState[trackIdx][stepIndex] == 0) {
                 ~plonkAltState[trackIdx][stepIndex] = 1;
-                0
+                false
             }{
                 ~plonkAltState[trackIdx][stepIndex] = 0;
-                2
+                true
             }
         },
-        3, {         // random: main only / synth2 only
-            if(1.0.rand < 0.5) { 0 } { 2 }
+        3, {            // random: main only / assisted
+            1.0.rand < 0.58
         },
-        { 0 }
+        { false }
     );
 
-    args.putAll(layerArgs);
-    args[\layerMode] = effectiveMode;
+    if(useAssist) {
+        layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
+        args.putAll(layerArgs);
+        args[\layerMode] = 1;
+        if(mode == 3) {
+            args[\layerLevel] = ((args[\layerLevel] ? 0.35) * rrand(0.65, 1.0)).clip(0.12, 0.55);
+        };
+        defName = ~plonkAssistDefForStep.(step);
+    }{
+        args[\layerMode] = 0;
+    };
 
-    synth = ~plonkTrigger.(args);
+    synth = ~plonkTriggerWithDef.(defName, args);
 
     SystemClock.sched(gateDurSecs, {
         if(synth.notNil) { synth.set(\gate, 0) };
@@ -2229,29 +2411,29 @@ args[\out] = outBus;
             };
 
             if((amt * 0.18).coin) {
-                st[\layerMode] = [0, 0, 1, 2, 3].choose;
+                st[\layerMode] = [0, 0, 0, 1, 1, 1, 2, 3].choose;
                 st[\engine2Model] = rrand(0, 3);
                 st[\engine2Exciter] = rrand(0, 5);
-                st[\layerLevel] = rrand(0.35, 0.90);
-                st[\engine2PitchMode] = [0, 0, 1, 2].choose;
-                st[\engine2SemiOffset] = [-12, -7, -5, 0, 7, 12].choose;
-                st[\engine2DegreeOffset] = [-4, -2, 0, 2, 4].choose;
-                st[\engine2DegreeOctOffset] = [-1, 0, 0, 0, 1].choose;
+                st[\layerLevel] = rrand(0.15, 0.55);
+                st[\engine2PitchMode] = [0, 0, 0, 0, 1, 2].choose;
+                st[\engine2SemiOffset] = [-2, -1, 0, 0, 0, 1, 2].choose;
+                st[\engine2DegreeOffset] = [-1, 0, 0, 0, 1].choose;
+                st[\engine2DegreeOctOffset] = 0;
                 st[\engine2DecayMul] = rrand(0.50, 1.80);
                 st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                 st[\engine2ClickOffset] = rrand(-0.40, 0.40);
-                st[\engine2PanOffset] = rrand(-0.70, 0.70);
+                st[\engine2PanOffset] = rrand(-0.25, 0.25);
 
 				st[\synth2Drive] = rrand(0.9, 3.8);
 				st[\synth2Color] = rrand(0.0, 1.0);
 				st[\synth2Motion] = rrand(0.0, 1.0);
-				st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
-				st[\synth2UnisonDetune] = rrand(0.0, 0.18);
-				st[\synth2UnisonStereo] = rrand(0.0, 0.95);
-				st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+				st[\synth2UnisonVoices] = [1, 1, 1, 1, 2, 2].choose;
+				st[\synth2UnisonDetune] = rrand(0.0, 0.12);
+				st[\synth2UnisonStereo] = rrand(0.0, 0.45);
+				st[\synth2UnisonDrift] = rrand(0.0, 0.25);
 
-				st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
-				st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+				st[\synth2PitchEnvAmt] = rrand(-0.12, 0.18);
+				st[\synth2PitchEnvDecay] = exprand(0.006, 0.09);
 				st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
 
 
@@ -2510,29 +2692,29 @@ args[\out] = outBus;
             st[\condType] = [0, 0, 0, 1, 2, 3, 4, 9, 10, 11].choose;
             st[\condA] = rrand(1, 4);
             st[\condB] = [2, 3, 4, 5, 6, 8].choose;
-            st[\layerMode] = [0, 0, 1, 2, 3].choose;
+            st[\layerMode] = [0, 0, 0, 1, 1, 1, 2, 3].choose;
             st[\engine2Model] = rrand(0, 3);
             st[\engine2Exciter] = rrand(0, 5);
-            st[\layerLevel] = rrand(0.35, 0.90);
-            st[\engine2PitchMode] = [0, 0, 1, 2].choose;
-            st[\engine2SemiOffset] = [-12, -7, -5, 0, 7, 12].choose;
-            st[\engine2DegreeOffset] = [-4, -2, 0, 2, 4].choose;
-            st[\engine2DegreeOctOffset] = [-1, 0, 0, 0, 1].choose;
+            st[\layerLevel] = rrand(0.15, 0.55);
+            st[\engine2PitchMode] = [0, 0, 0, 0, 1, 2].choose;
+            st[\engine2SemiOffset] = [-2, -1, 0, 0, 0, 1, 2].choose;
+            st[\engine2DegreeOffset] = [-1, 0, 0, 0, 1].choose;
+            st[\engine2DegreeOctOffset] = 0;
             st[\engine2DecayMul] = rrand(0.50, 1.80);
             st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
             st[\engine2ClickOffset] = rrand(-0.40, 0.40);
-            st[\engine2PanOffset] = rrand(-0.70, 0.70);
+            st[\engine2PanOffset] = rrand(-0.25, 0.25);
 
 			st[\synth2Drive] = rrand(0.9, 3.8);
 			st[\synth2Color] = rrand(0.0, 1.0);
 			st[\synth2Motion] = rrand(0.0, 1.0);
-			st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
-			st[\synth2UnisonDetune] = rrand(0.0, 0.18);
-			st[\synth2UnisonStereo] = rrand(0.0, 0.95);
-			st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+			st[\synth2UnisonVoices] = [1, 1, 1, 1, 2, 2].choose;
+			st[\synth2UnisonDetune] = rrand(0.0, 0.12);
+			st[\synth2UnisonStereo] = rrand(0.0, 0.45);
+			st[\synth2UnisonDrift] = rrand(0.0, 0.25);
 
-			st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
-            st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+			st[\synth2PitchEnvAmt] = rrand(-0.12, 0.18);
+            st[\synth2PitchEnvDecay] = exprand(0.006, 0.09);
             st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
 
             if((~plonkPitch[\scaleType] ? 0).asInteger == 0) {
@@ -2652,29 +2834,29 @@ args[\out] = outBus;
 
             \layer, {
                 if((amount * 0.85).coin) {
-                    st[\layerMode] = [0, 0, 1, 2, 3].choose;
+                    st[\layerMode] = [0, 0, 0, 1, 1, 1, 2, 3].choose;
                     st[\engine2Model] = rrand(0, 3);
                     st[\engine2Exciter] = rrand(0, 5);
-                    st[\layerLevel] = rrand(0.35, 0.90);
-                    st[\engine2PitchMode] = [0, 0, 1, 2].choose;
-                    st[\engine2SemiOffset] = [-12, -7, -5, 0, 7, 12].choose;
-                    st[\engine2DegreeOffset] = [-4, -2, 0, 2, 4].choose;
-                    st[\engine2DegreeOctOffset] = [-1, 0, 0, 0, 1].choose;
+                    st[\layerLevel] = rrand(0.15, 0.55);
+                    st[\engine2PitchMode] = [0, 0, 0, 0, 1, 2].choose;
+                    st[\engine2SemiOffset] = [-2, -1, 0, 0, 0, 1, 2].choose;
+                    st[\engine2DegreeOffset] = [-1, 0, 0, 0, 1].choose;
+                    st[\engine2DegreeOctOffset] = 0;
                     st[\engine2DecayMul] = rrand(0.50, 1.80);
                     st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                     st[\engine2ClickOffset] = rrand(-0.40, 0.40);
-                    st[\engine2PanOffset] = rrand(-0.70, 0.70);
+                    st[\engine2PanOffset] = rrand(-0.25, 0.25);
 
 					st[\synth2Drive] = rrand(0.9, 3.8);
 					st[\synth2Color] = rrand(0.0, 1.0);
 					st[\synth2Motion] = rrand(0.0, 1.0);
-					st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
-					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
-					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
-					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+					st[\synth2UnisonVoices] = [1, 1, 1, 1, 2, 2].choose;
+					st[\synth2UnisonDetune] = rrand(0.0, 0.12);
+					st[\synth2UnisonStereo] = rrand(0.0, 0.45);
+					st[\synth2UnisonDrift] = rrand(0.0, 0.25);
 
-					st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
-					st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+					st[\synth2PitchEnvAmt] = rrand(-0.12, 0.18);
+					st[\synth2PitchEnvDecay] = exprand(0.006, 0.09);
 					st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
                 };
             },
@@ -2731,29 +2913,29 @@ args[\out] = outBus;
                 };
 
                 if((amount * 0.45).coin) {
-                    st[\layerMode] = [0, 0, 1, 2, 3].choose;
+                    st[\layerMode] = [0, 0, 0, 1, 1, 1, 2, 3].choose;
                     st[\engine2Model] = rrand(0, 3);
                     st[\engine2Exciter] = rrand(0, 5);
-                    st[\layerLevel] = rrand(0.35, 0.90);
-                    st[\engine2PitchMode] = [0, 0, 1, 2].choose;
-                    st[\engine2SemiOffset] = [-12, -7, -5, 0, 7, 12].choose;
-                    st[\engine2DegreeOffset] = [-4, -2, 0, 2, 4].choose;
-                    st[\engine2DegreeOctOffset] = [-1, 0, 0, 0, 1].choose;
+                    st[\layerLevel] = rrand(0.15, 0.55);
+                    st[\engine2PitchMode] = [0, 0, 0, 0, 1, 2].choose;
+                    st[\engine2SemiOffset] = [-2, -1, 0, 0, 0, 1, 2].choose;
+                    st[\engine2DegreeOffset] = [-1, 0, 0, 0, 1].choose;
+                    st[\engine2DegreeOctOffset] = 0;
                     st[\engine2DecayMul] = rrand(0.50, 1.80);
                     st[\engine2NoiseOffset] = rrand(-0.30, 0.30);
                     st[\engine2ClickOffset] = rrand(-0.40, 0.40);
-                    st[\engine2PanOffset] = rrand(-0.70, 0.70);
+                    st[\engine2PanOffset] = rrand(-0.25, 0.25);
 
 					st[\synth2Drive] = rrand(0.9, 3.8);
 					st[\synth2Color] = rrand(0.0, 1.0);
 					st[\synth2Motion] = rrand(0.0, 1.0);
-					st[\synth2UnisonVoices] = [1, 1, 2, 2, 3, 4].choose;
-					st[\synth2UnisonDetune] = rrand(0.0, 0.18);
-					st[\synth2UnisonStereo] = rrand(0.0, 0.95);
-					st[\synth2UnisonDrift] = rrand(0.0, 0.45);
+					st[\synth2UnisonVoices] = [1, 1, 1, 1, 2, 2].choose;
+					st[\synth2UnisonDetune] = rrand(0.0, 0.12);
+					st[\synth2UnisonStereo] = rrand(0.0, 0.45);
+					st[\synth2UnisonDrift] = rrand(0.0, 0.25);
 
-					st[\synth2PitchEnvAmt] = rrand(-0.35, 0.45);
-					st[\synth2PitchEnvDecay] = exprand(0.005, 0.18);
+					st[\synth2PitchEnvAmt] = rrand(-0.12, 0.18);
+					st[\synth2PitchEnvDecay] = exprand(0.006, 0.09);
 					st[\synth2PitchEnvCurve] = rrand(-8.0, -2.0);
                 };
 
@@ -2910,7 +3092,9 @@ if((amount * 0.12).coin) {
 
         accept = wantedUID.isNil or: { src == wantedUID };
 
-        ["NOTEON RAW", "src:", src, "wanted:", wantedUID, "chan:", chan, "note:", note, "vel:", vel].postln;
+        if(~plonkDebug) {
+            ["NOTEON RAW", "src:", src, "wanted:", wantedUID, "chan:", chan, "note:", note, "vel:", vel].postln;
+        };
 
         if(accept) {
             trackIdx = ~plonkSelectedTrack;
@@ -2925,7 +3109,9 @@ if((amount * 0.12).coin) {
     MIDIdef.start(\plonkStartIn, { |src|
         var accept = wantedUID.isNil or: { src == wantedUID };
 
-        ["START RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        if(~plonkDebug) {
+            ["START RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        };
 
         if(accept and: { ~plonkMidiSync[\enabled] }) {
             if(~plonkSeq[\task].notNil) {
@@ -2944,7 +3130,9 @@ if((amount * 0.12).coin) {
             ~plonkMidiSync[\stepIndex] = 0;
             ~plonkMidiSync[\lastClockTime] = nil;
 
-            ["START ACCEPTED", "src:", src].postln;
+            if(~plonkDebug) {
+                ["START ACCEPTED", "src:", src].postln;
+            };
 
             {
                 ~plonkRefreshPlayhead.();
@@ -2956,7 +3144,9 @@ if((amount * 0.12).coin) {
     MIDIdef.continue(\plonkContinueIn, { |src|
         var accept = wantedUID.isNil or: { src == wantedUID };
 
-        ["CONTINUE RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        if(~plonkDebug) {
+            ["CONTINUE RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        };
 
         if(accept and: { ~plonkMidiSync[\enabled] }) {
             if(~plonkSeq[\task].notNil) {
@@ -2968,7 +3158,9 @@ if((amount * 0.12).coin) {
             ~plonkMidiSync[\isPlaying] = true;
             ~plonkMidiSync[\lastClockTime] = nil;
 
-            ["CONTINUE ACCEPTED", "src:", src].postln;
+            if(~plonkDebug) {
+                ["CONTINUE ACCEPTED", "src:", src].postln;
+            };
 
             {
                 ~plonkUpdateMidiSyncStatus.();
@@ -2979,7 +3171,9 @@ if((amount * 0.12).coin) {
     MIDIdef.stop(\plonkStopIn, { |src|
         var accept = wantedUID.isNil or: { src == wantedUID };
 
-        ["STOP RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        if(~plonkDebug) {
+            ["STOP RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        };
 
         if(accept and: { ~plonkMidiSync[\enabled] }) {
             ~plonkMidiSync[\isPlaying] = false;
@@ -2988,7 +3182,9 @@ if((amount * 0.12).coin) {
             ~plonkMidiSync[\lastClockTime] = nil;
             ~plonkMidiSync[\clockCount] = 0;
 
-            ["STOP ACCEPTED", "src:", src].postln;
+            if(~plonkDebug) {
+                ["STOP ACCEPTED", "src:", src].postln;
+            };
 
             {
                 ~plonkRefreshPlayhead.();
@@ -3002,7 +3198,7 @@ if((amount * 0.12).coin) {
 
         accept = wantedUID.isNil or: { src == wantedUID };
 
-        if(accept) {
+        if(accept and: { ~plonkDebug }) {
             ["CLOCK RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled], "playing:", ~plonkMidiSync[\isPlaying]].postln;
         };
 
@@ -3019,7 +3215,7 @@ if((amount * 0.12).coin) {
             ~plonkMidiSync[\lastClockTime] = now;
             ~plonkMidiSync[\clockCount] = (~plonkMidiSync[\clockCount] ? 0) + 1;
 
-            if((~plonkMidiSync[\clockCount] % 24) == 0) {
+            if(((~plonkMidiSync[\clockCount] % 24) == 0) and: { ~plonkDebug }) {
                 ["CLOCK ACCEPTED", "src:", src, "count:", ~plonkMidiSync[\clockCount]].postln;
             };
 
@@ -3029,10 +3225,12 @@ if((amount * 0.12).coin) {
         };
     });
 
-    "Installed MIDI transport defs.".postln;
-    "Available MIDI sources:".postln;
-    ~plonkMidiSources.do { |ep|
-        [ep.uid, ep.device, ep.name].postln;
+    if(~plonkDebug) {
+        "Installed MIDI transport defs.".postln;
+        "Available MIDI sources:".postln;
+        ~plonkMidiSources.do { |ep|
+            [ep.uid, ep.device, ep.name].postln;
+        };
     };
 
     {
@@ -3049,6 +3247,18 @@ if((amount * 0.12).coin) {
         var win, header, content;
         var uiW = 1500;
         var uiH = 940;
+        var uiBg = Color.grey(0.93);
+        var pageBg = Color.grey(0.965);
+        var headerBg = Color.grey(0.985);
+        var panelBg = Color.grey(0.985);
+        var textColor = Color.grey(0.12);
+        var accentBlue = Color(0.14, 0.34, 0.56);
+        var buttonBg = Color.grey(0.88);
+        var titleFont = Font.default.boldVariant.size_(18);
+        var sectionFont = Font.default.boldVariant.size_(13);
+        var labelFont = Font.default.size_(12);
+        var controlFont = Font.default.size_(11);
+        var smallFont = Font.default.size_(10);
         var pages = IdentityDictionary.new;
         var controls = IdentityDictionary.new;
         var stepButtons = Array.newClear(32);
@@ -3062,8 +3272,8 @@ if((amount * 0.12).coin) {
         var lockStep = 0;
         var lockBoxes = IdentityDictionary.new;
         var lockEnableButtons = IdentityDictionary.new;
-        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI, refreshMasterUI;
-var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox;
+        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI;
+	var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox, makePageTitle, makeSectionLabel, polishControls;
         var modelNames = ["Bar", "Plate", "Bell", "Drum"];
         var exciterNames = ["Mallet", "HardPick", "Brush", "Scrape", "Burst", "ImpulseCluster"];
 
@@ -3075,15 +3285,13 @@ var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox;
 		var rangeSrcABox, rangeSrcBBox, rangeDstBox;
 		var randSelButton, randModeMenu, randAmtBox;
 		var rootMenu, scaleMenu, layerModeMenu, eng2ModelMenu, eng2ExcMenu;
-var masterTrimBox, masterLimiterLevelBox, masterLimiterDurBox, masterSoftClipAmtBox;
-
         ~plonkStepIndicators = stepIndicators;
         ~plonkStepButtons = stepButtons;
 
-win = Window("Plonk-ish v5.20", Rect(40, 60, 1450, 900));
+	win = Window("Plonk-ish v5.20", Rect(20, 40, 1400, 840));
 win.alwaysOnTop_(false);
 win.userCanClose_(true);
-win.view.background_(Color.white);
+win.view.background_(uiBg);
 
 uiW = win.view.bounds.width.asInteger;
 uiH = win.view.bounds.height.asInteger;
@@ -3094,12 +3302,13 @@ content = View(win, Rect(0, 66, uiW, uiH - 66));
 header.resize_(2);
 content.resize_(5);
 
-header.background_(Color.white);
-content.background_(Color.white);
+header.background_(headerBg);
+content.background_(uiBg);
 
         makeButton = { |parent, bounds, label, action|
             var b = Button(parent, bounds);
-            b.states_([[label]]);
+            b.states_([[label, textColor, buttonBg]]);
+            b.font_(labelFont);
             b.action_({ action.value });
             b;
         };
@@ -3108,10 +3317,32 @@ makePage = { |key|
     var v = View(content, Rect(0, 0, content.bounds.width, content.bounds.height));
     v.visible_(false);
     v.resize_(5);
-    v.background_(Color.white);
-    pages[key] = v;
-    v;
-};
+    v.background_(pageBg);
+	    pages[key] = v;
+	    v;
+	};
+
+	makePageTitle = { |parent, title, subtitle=""|
+	    var titleText, subtitleText;
+	    titleText = StaticText(parent, Rect(24, 12, 420, 24));
+	    titleText.string_(title);
+	    titleText.font_(titleFont);
+
+	    if(subtitle.notNil and: { subtitle.size > 0 }) {
+	        subtitleText = StaticText(parent, Rect(24, 36, 860, 18));
+	        subtitleText.string_(subtitle);
+	        subtitleText.font_(controlFont);
+	    };
+
+	    titleText;
+	};
+
+	makeSectionLabel = { |parent, bounds, label|
+	    var st = StaticText(parent, bounds);
+	    st.string_(label);
+	    st.font_(sectionFont);
+	    st;
+	};
 
         makeBoundedBox = { |parent, bounds, init=0, lo=0, hi=1, step=0.01, decimals=2, action|
             var nb = NumberBox(parent, bounds);
@@ -3121,6 +3352,7 @@ makePage = { |key|
             nb.step_(step);
             nb.scroll_step_(step);
             nb.decimals_(decimals);
+            nb.font_(controlFont);
             nb.action_({ |box|
                 var val = box.value.clip(lo, hi);
                 if(decimals == 0) { val = val.asInteger };
@@ -3142,7 +3374,11 @@ showPage = { |key|
     if(refreshControls.notNil) { refreshControls.() };
     if(refreshPatternUI.notNil) { refreshPatternUI.() };
     if(refreshLockEditor.notNil) { refreshLockEditor.() };
-    if(refreshMasterUI.notNil and: { key == \master }) { refreshMasterUI.() };
+    if(key == \mixer) {
+        if(~plonkStartMixerMeters.notNil) { ~plonkStartMixerMeters.() };
+    }{
+        if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
+    };
 	if(~plonkRefreshMixerUI.notNil and: { key == \mixer }) { ~plonkRefreshMixerUI.() };
     if(~plonkRefreshAudioMenus.notNil and: { key == \audio }) { ~plonkRefreshAudioMenus.() };
 
@@ -3156,7 +3392,10 @@ showPage = { |key|
     var nb = NumberBox(parent, Rect(x + 338, y, 70, 20));
     var entry;
 
-    st.string_(label);
+	    st.string_(label);
+	    st.align_(\right);
+	    st.font_(labelFont);
+	    nb.font_(controlFont);
 
     sl.action_({
         var v;
@@ -3206,7 +3445,10 @@ makeMenu = { |parent, x, y, label, key, items|
     var pm = PopUpMenu(parent, Rect(x + 110, y, 220, 20));
     var entry;
 
-    st.string_(label);
+	    st.string_(label);
+	    st.align_(\right);
+	    st.font_(labelFont);
+	    pm.font_(controlFont);
     pm.items_(items);
     pm.action_({
         ~plonkTrackStates[~plonkSelectedTrack][key] = pm.value;
@@ -3221,9 +3463,19 @@ makeMenu = { |parent, x, y, label, key, items|
     }{
         controls[key].add(entry);
     };
-};
+	};
 
-refreshControls = {
+	polishControls = { |view|
+	    view.children.do { |child|
+	        if(child.isKindOf(Button)) { child.font_(labelFont) };
+	        if(child.isKindOf(PopUpMenu)) { child.font_(controlFont) };
+	        if(child.isKindOf(NumberBox)) { child.font_(controlFont) };
+	        if(child.isKindOf(TextField)) { child.font_(controlFont) };
+	        if(child.respondsTo(\children)) { polishControls.(child) };
+	    };
+	};
+
+	refreshControls = {
     var state = ~plonkTrackStates[~plonkSelectedTrack];
 
     controls.keysValuesDo { |k, controlList|
@@ -3338,13 +3590,13 @@ refreshControls = {
 var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
     1, {
         switch((stEdit[\engine2PitchMode] ? 0).asInteger,
-            1, { "S2:S" },
-            2, { "S2:D" },
-            { "S2" }
+            1, { "AST:S" },
+            2, { "AST:D" },
+            { "AST" }
         )
     },
-    2, { "ALT" },
-    3, { "RND" },
+    2, { "A-ALT" },
+    3, { "A-RND" },
     { "" }
 );
 
@@ -3456,15 +3708,15 @@ var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
    if(layerModeMenu.notNil) { layerModeMenu.value_((st[\layerMode] ? 0).asInteger.clip(0, ~plonkLayerModeNames.size - 1)) };
 if(eng2ModelMenu.notNil) { eng2ModelMenu.value_((st[\engine2Model] ? 0).asInteger.clip(0, ~plonkSynth2TypeNames.size - 1)) };
 if(eng2ExcMenu.notNil) { eng2ExcMenu.value_((st[\engine2Exciter] ? 0).asInteger.clip(0, ~plonkSynth2VariantNames.size - 1)) };
-if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.60) };
+if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.35) };
 if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((st[\engine2PitchMode] ? 0).asInteger.clip(0, ~plonkSynth2PitchModeNames.size - 1)) };
-    if(lockBoxes[\engine2SemiOffset].notNil) { lockBoxes[\engine2SemiOffset].value_(st[\engine2SemiOffset] ? 0) };
-    if(lockBoxes[\engine2DegreeOffset].notNil) { lockBoxes[\engine2DegreeOffset].value_(st[\engine2DegreeOffset] ? 0) };
-    if(lockBoxes[\engine2DegreeOctOffset].notNil) { lockBoxes[\engine2DegreeOctOffset].value_(st[\engine2DegreeOctOffset] ? 0) };
+    if(lockBoxes[\engine2SemiOffset].notNil) { lockBoxes[\engine2SemiOffset].value_((st[\engine2SemiOffset] ? 0).clip(-2, 2)) };
+    if(lockBoxes[\engine2DegreeOffset].notNil) { lockBoxes[\engine2DegreeOffset].value_((st[\engine2DegreeOffset] ? 0).clip(-1, 1)) };
+    if(lockBoxes[\engine2DegreeOctOffset].notNil) { lockBoxes[\engine2DegreeOctOffset].value_(0) };
     if(lockBoxes[\engine2DecayMul].notNil) { lockBoxes[\engine2DecayMul].value_(st[\engine2DecayMul] ? 1.00) };
     if(lockBoxes[\engine2NoiseOffset].notNil) { lockBoxes[\engine2NoiseOffset].value_(st[\engine2NoiseOffset] ? 0.00) };
     if(lockBoxes[\engine2ClickOffset].notNil) { lockBoxes[\engine2ClickOffset].value_(st[\engine2ClickOffset] ? 0.00) };
-    if(lockBoxes[\engine2PanOffset].notNil) { lockBoxes[\engine2PanOffset].value_(st[\engine2PanOffset] ? 0.00) };
+    if(lockBoxes[\engine2PanOffset].notNil) { lockBoxes[\engine2PanOffset].value_((st[\engine2PanOffset] ? 0.00).clip(-0.25, 0.25)) };
 
     if(lockBoxes[\synth2Drive].notNil) { lockBoxes[\synth2Drive].value_(st[\synth2Drive] ? 1.40) };
     if(lockBoxes[\synth2Color].notNil) { lockBoxes[\synth2Color].value_(st[\synth2Color] ? 0.50) };
@@ -3530,55 +3782,56 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 ~plonkRefreshLockEditor = refreshLockEditor;
 ~plonkRefreshVarButtons = refreshVarButtons;
 
-refreshMasterUI = {
-    if(masterTrimBox.notNil) { masterTrimBox.value_(~plonkMaster[\trimDb] ? -12.0) };
-    if(masterLimiterLevelBox.notNil) { masterLimiterLevelBox.value_(~plonkMaster[\limiterLevel] ? 0.85) };
-    if(masterLimiterDurBox.notNil) { masterLimiterDurBox.value_(~plonkMaster[\limiterDur] ? 0.01) };
-    if(masterSoftClipAmtBox.notNil) { masterSoftClipAmtBox.value_(~plonkMaster[\softClipAmt] ? 0.15) };
-};
+	      // header
+	StaticText(header, Rect(18, 10, 92, 24))
+	.string_("Plonk")
+	.font_(Font.default.boldVariant.size_(19));
 
-      // header
-makeButton.(header, Rect(10, 16, 70, 28), "Main", { showPage.(\main) });
-makeButton.(header, Rect(90, 16, 70, 28), "Exciter", { showPage.(\exciter) });
-makeButton.(header, Rect(170, 16, 90, 28), "Resonator", { showPage.(\res) });
-makeButton.(header, Rect(270, 16, 100, 28), "Performance", { showPage.(\perf) });
-makeButton.(header, Rect(380, 16, 100, 28), "Pattern", { showPage.(\pattern) });
-makeButton.(header, Rect(490, 16, 80, 28), "Step", { showPage.(\step) });
-makeButton.(header, Rect(580, 16, 90, 28), "Mixer", { showPage.(\mixer) });
-makeButton.(header, Rect(680, 16, 110, 28), "Audio/Midi", { showPage.(\audio) });
-makeButton.(header, Rect(800, 16, 90, 28), "Master", { showPage.(\master) });
+	StaticText(header, Rect(20, 36, 92, 16))
+	.string_("v5.20")
+	.font_(smallFont);
 
-Button(header, Rect(910, 16, 90, 28))
-.states_([["Trigger", Color.white, Color(0.9, 0.7, 0.0)]])
-.action_({
-    var args = ~plonkTrackStates[~plonkSelectedTrack].copy;
-    args[\trackIndex] = ~plonkSelectedTrack;
-    ~plonkTrigger.(args);
+	makeButton.(header, Rect(118, 16, 70, 28), "Main", { showPage.(\main) });
+	makeButton.(header, Rect(198, 16, 70, 28), "Exciter", { showPage.(\exciter) });
+	makeButton.(header, Rect(278, 16, 90, 28), "Resonator", { showPage.(\res) });
+	makeButton.(header, Rect(378, 16, 100, 28), "Performance", { showPage.(\perf) });
+	makeButton.(header, Rect(488, 16, 100, 28), "Pattern", { showPage.(\pattern) });
+	makeButton.(header, Rect(598, 16, 80, 28), "Step", { showPage.(\step) });
+	makeButton.(header, Rect(688, 16, 90, 28), "Mixer", { showPage.(\mixer) });
+	makeButton.(header, Rect(798, 16, 110, 28), "Audio/Midi", { showPage.(\audio) });
+
+	Button(header, Rect(928, 16, 90, 28))
+	.states_([["Trigger", Color.white, Color(0.9, 0.7, 0.0)]])
+	.font_(labelFont)
+	.action_({
+	    var args = ~plonkTrackStates[~plonkSelectedTrack].copy;
+	    args[\trackIndex] = ~plonkSelectedTrack;
+	    ~plonkTrigger.(args);
+	});
+
+	makeButton.(header, Rect(1038, 16, 90, 28), "RandPat", {
+	    ~plonkRandomizePatternAndRefresh.();
+	    refreshPatternUI.();
+	    refreshLockEditor.();
 });
 
-makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
-    ~plonkRandomizePatternAndRefresh.();
-    refreshPatternUI.();
-    refreshLockEditor.();
-});
+	        // main page
+	        {
+	            var v = makePage.(\main), y = 64;
+	            makePageTitle.(v, "Main", "Selected track sound, tuning, gain, and preset recall.");
 
-        // main page
-        {
-            var v = makePage.(\main), y = 20;
-            StaticText(v, Rect(20, 0, 500, 20)).string_("Main controls — selected track only");
-
-            makeMenu.(v, 20, y, "Model", \model, modelNames); y = y + 28;
-            makeMenu.(v, 20, y, "Exciter", \exciterType, exciterNames); y = y + 28;
+	            makeMenu.(v, 20, y, "Model", \model, modelNames); y = y + 28;
+	            makeMenu.(v, 20, y, "Exciter", \exciterType, exciterNames); y = y + 28;
             makeSlider.(v, 20, y, "Freq", \freq, 40, 4000, \exp); y = y + 28;
             makeSlider.(v, 20, y, "Amp", \amp, 0.01, 0.6, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Pan", \pan, -1.0, 1.0, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "Velocity", \velocity, 0.0, 1.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Velocity", \velocity, 0.0, 1.0, \lin); y = y + 28;
 
-            y = y + 20;
-            StaticText(v, Rect(20, y, 120, 20)).string_("Pattern Preset");
-            patternField = TextField(v, Rect(140, y, 140, 20)).string_("pattern1");
-            makeButton.(v, Rect(290, y - 1, 60, 22), "Save", {
-                ~plonkSavePattern.(patternField.string);
+	            y = y + 20;
+	            makeSectionLabel.(v, Rect(20, y, 120, 20), "Pattern Preset");
+	            patternField = TextField(v, Rect(140, y, 140, 20)).string_("pattern1");
+	            makeButton.(v, Rect(290, y - 1, 60, 22), "Save", {
+	                ~plonkSavePattern.(patternField.string);
             });
             makeButton.(v, Rect(356, y - 1, 60, 22), "Load", {
                 ~plonkLoadPattern.(patternField.string);
@@ -3589,23 +3842,23 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
         }.value;
 
         // exciter page, resonator page, performance page
-        // keep same structure as before, but now they operate on selected track
-        {
-            var v = makePage.(\exciter), y = 20;
-            StaticText(v, Rect(20, 0, 500, 20)).string_("Exciter — selected track");
-            makeMenu.(v, 20, y, "Exciter", \exciterType, exciterNames); y = y + 28;
-            makeSlider.(v, 20, y, "Tone", \tone, 0, 1, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "NoiseAmt", \noiseAmt, 0, 1.2, \lin); y = y + 28;
+	        // keep same structure as before, but now they operate on selected track
+	        {
+	            var v = makePage.(\exciter), y = 64;
+	            makePageTitle.(v, "Exciter", "Controls the transient, scrape, noise, and strike color for the selected track.");
+	            makeMenu.(v, 20, y, "Exciter", \exciterType, exciterNames); y = y + 28;
+	            makeSlider.(v, 20, y, "Tone", \tone, 0, 1, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "NoiseAmt", \noiseAmt, 0, 1.2, \lin); y = y + 28;
             makeSlider.(v, 20, y, "ClickAmt", \clickAmt, 0, 2.0, \lin); y = y + 28;
             makeSlider.(v, 20, y, "ExcDecay", \excDecay, 0.001, 0.12, \exp); y = y + 28;
-        }.value;
+	        }.value;
 
-        {
-            var v = makePage.(\res), y = 20;
-            StaticText(v, Rect(20, 0, 500, 20)).string_("Resonator — selected track");
-            makeMenu.(v, 20, y, "Model", \model, modelNames); y = y + 28;
-            makeSlider.(v, 20, y, "Brightness", \brightness, 0, 1, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "Material", \material, 0, 1, \lin); y = y + 28;
+	        {
+	            var v = makePage.(\res), y = 64;
+	            makePageTitle.(v, "Resonator", "Modal body, material, decay, and stereo spread for the selected track.");
+	            makeMenu.(v, 20, y, "Model", \model, modelNames); y = y + 28;
+	            makeSlider.(v, 20, y, "Brightness", \brightness, 0, 1, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Material", \material, 0, 1, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Inharm", \inharm, 0, 0.8, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Position", \position, 0.01, 0.49, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Decay", \decay, 0.03, 6.0, \exp); y = y + 28;
@@ -3613,37 +3866,37 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
             makeSlider.(v, 20, y, "Damp", \damp, 0, 1, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Detune", \detune, 0, 0.02, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Spread", \spread, 0.2, 4.5, \lin); y = y + 28;
-        }.value;
+	        }.value;
 
-        {
-            var v = makePage.(\perf), y = 20;
-            StaticText(v, Rect(20, 0, 500, 20)).string_("Performance — selected track");
-            makeSlider.(v, 20, y, "Drive", \drive, 0.7, 2.0, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, \exp); y = y + 28;
+	        {
+	            var v = makePage.(\perf), y = 64;
+	            makePageTitle.(v, "Performance", "Drive, envelopes, filtering, comb, edge, and bit treatment for the selected track.");
+	            makeSlider.(v, 20, y, "Drive", \drive, 0.7, 2.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, \exp); y = y + 28;
             makeSlider.(v, 20, y, "Vel->Bright", \velToBright, 0, 0.6, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Vel->Decay", \velToDecay, 0, 0.5, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "Vel->Noise", \velToNoise, 0, 0.5, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "Vel->Click", \velToClick, 0, 0.5, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Vel->Noise", \velToNoise, 0, 0.5, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Vel->Click", \velToClick, 0, 0.5, \lin); y = y + 28;
 
-			makeMenu.(v, 460, 20, "FilterMode", \filterMode, ["LP", "HP", "BP", "Notch"]);
-			makeSlider.(v, 460, 48, "FiltCut", \filterCutoff, 0, 1, \lin);
-			makeSlider.(v, 460, 76, "FiltRes", \filterRes, 0.01, 0.98, \lin);
-			makeSlider.(v, 460, 104, "FiltEnvAmt", \filterEnvAmt, 0, 4, \lin);
-			makeSlider.(v, 460, 132, "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, \exp);
+				makeMenu.(v, 460, 64, "FilterMode", \filterMode, ["LP", "HP", "BP", "Notch"]);
+				makeSlider.(v, 460, 92, "FiltCut", \filterCutoff, 0, 1, \lin);
+				makeSlider.(v, 460, 120, "FiltRes", \filterRes, 0.01, 0.98, \lin);
+				makeSlider.(v, 460, 148, "FiltEnvAmt", \filterEnvAmt, 0, 4, \lin);
+				makeSlider.(v, 460, 176, "FiltEnvDec", \filterEnvDecay, 0.005, 1.5, \exp);
 
-			makeSlider.(v, 460, 188, "CombAmt", \combAmt, 0, 1, \lin);
-			makeSlider.(v, 460, 216, "CombTime", \combTime, 0.0007, 0.03, \exp);
-			makeSlider.(v, 460, 244, "CombDecay", \combDecay, 0.02, 2.0, \exp);
+				makeSlider.(v, 460, 232, "CombAmt", \combAmt, 0, 1, \lin);
+				makeSlider.(v, 460, 260, "CombTime", \combTime, 0.0007, 0.03, \exp);
+				makeSlider.(v, 460, 288, "CombDecay", \combDecay, 0.02, 2.0, \exp);
 
-			makeSlider.(v, 460, 300, "EdgeDrive", \edgeDrive, 0.5, 8.0, \exp);
-			makeSlider.(v, 460, 328, "FoldAmt", \foldAmt, 0, 1, \lin);
-			makeSlider.(v, 460, 356, "Presence", \presence, -1, 1, \lin);
+				makeSlider.(v, 460, 344, "EdgeDrive", \edgeDrive, 0.5, 8.0, \exp);
+				makeSlider.(v, 460, 372, "FoldAmt", \foldAmt, 0, 1, \lin);
+				makeSlider.(v, 460, 400, "Presence", \presence, -1, 1, \lin);
 
-			makeSlider.(v, 460, 412, "CrushMix", \crushMix, 0, 1, \lin);
-			makeSlider.(v, 460, 440, "BitDepth", \bitDepth, 2, 16, \lin);
-			makeSlider.(v, 460, 468, "Downsample", \downsample, 1, 24, \lin);
-        }.value;
+				makeSlider.(v, 460, 456, "CrushMix", \crushMix, 0, 1, \lin);
+				makeSlider.(v, 460, 484, "BitDepth", \bitDepth, 2, 16, \lin);
+				makeSlider.(v, 460, 512, "Downsample", \downsample, 1, 24, \lin);
+	        }.value;
 
 
 		              //MIXER PAGE
@@ -3653,31 +3906,112 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
             var panBoxes = Array.newClear(~plonkTrackCount);
             var muteButtons = Array.newClear(~plonkTrackCount);
             var soloButtons = Array.newClear(~plonkTrackCount);
+            var selectButtons = Array.newClear(~plonkTrackCount);
             var ampBoxes = Array.newClear(~plonkTrackCount);
             var meterViews = Array.newClear(~plonkTrackCount);
-            var meterRoutines = Array.newClear(~plonkTrackCount);
+            var meterRoutines = Array.newClear(~plonkTrackCount + 1);
             var levelValueLabels = Array.newClear(~plonkTrackCount);
             var panValueLabels = Array.newClear(~plonkTrackCount);
+            var stripViews = Array.newClear(~plonkTrackCount);
+            var masterMeterViews = Array.newClear(2);
+            var masterFaderSlider, masterFaderLabel;
+            var masterLimiterLevelBox, masterLimiterDurBox, masterSoftClipAmtBox;
 
-            var x0 = 36;
-            var colW = 350;
-            var rowH = 270;
+            var mixerMinDb = -60.0;
+            var mixerMaxDb = 6.0;
+	            var mixerTicks = [6.0, 0.0, -6.0, -12.0, -24.0, -36.0, -60.0];
+	            var x0 = 20;
+	            var stripTop = 64;
+            var stripW = 214;
+            var stripGap = 16;
+            var stripH = 586;
+            var meterTop = 72;
+            var meterH = 304;
+            var meterW = 26;
+            var faderW = 24;
+            var faderX = 126;
+            var masterX = 962;
+            var masterW = 318;
+            var dbToNorm, gainToDb, dbToGain, dbLabel, dbTickLabel, panLabel, setMasterParam;
 
-            StaticText(v, Rect(20, 10, 900, 20)).string_("Mixer — per-track mix controls");
+            dbToNorm = { |db|
+                db.clip(mixerMinDb, mixerMaxDb).linlin(mixerMinDb, mixerMaxDb, 0.0, 1.0);
+            };
+
+            gainToDb = { |gain|
+                var g = (gain ? 1.0).asFloat.max(0.000001);
+                (20.0 * (g.log / 10.0.log)).clip(mixerMinDb, mixerMaxDb);
+            };
+
+            dbToGain = { |db|
+                var d = db.clip(mixerMinDb, mixerMaxDb);
+                if(d <= (mixerMinDb + 0.05)) {
+                    0.0
+                }{
+                    (10.0 ** (d / 20.0)).clip(0.0, 2.0)
+                }
+            };
+
+            dbLabel = { |db|
+                var d = db.clip(mixerMinDb, mixerMaxDb);
+                if(d <= (mixerMinDb + 0.1)) {
+                    "-inf dB"
+                }{
+                    if(d >= 0.0) {
+                        "+" ++ d.round(0.1).asString ++ " dB"
+                    }{
+                        d.round(0.1).asString ++ " dB"
+                    }
+                }
+            };
+
+            dbTickLabel = { |db|
+                if(db == 0.0) {
+                    "0"
+                }{
+                    if(db > 0.0) {
+                        "+" ++ db.asInteger.asString
+                    }{
+                        db.asInteger.asString
+                    }
+                }
+            };
+
+            panLabel = { |pan|
+                if(pan > 0.001) {
+                    "R " ++ pan.abs.round(0.01).asString
+                }{
+                    if(pan < -0.001) {
+                        "L " ++ pan.abs.round(0.01).asString
+                    }{
+                        "C"
+                    }
+                }
+            };
+
+            setMasterParam = { |key, val|
+                ~plonkMaster[key] = val;
+                if(~plonkMaster[\synth].notNil) {
+                    ~plonkMaster[\synth].set(key, val);
+                };
+            };
+
+	            makePageTitle.(v, "Mixer", "Track and master faders are dB-scaled. 0 dB is unity gain; meter red begins above nominal.");
 
             ~plonkRefreshMixerUI = {
                 ~plonkTrackCount.do { |i|
                     var ch = ~plonkMixer[\tracks][i];
-                    var lvl = (ch[\level] ? 1.0).clip(0.0, 1.5);
+                    var lvl = (ch[\level] ? 1.0).clip(0.0, 2.0);
+                    var db = gainToDb.(lvl);
                     var pan = (ch[\pan] ? 0.0).clip(-1.0, 1.0);
                     var amp = (~plonkTrackStates[i][\amp] ? 0.0).clip(0.0, 0.6);
 
                     if(levelSliders[i].notNil) {
-                        levelSliders[i].value_(lvl.linlin(0.0, 1.5, 0.0, 1.0));
+                        levelSliders[i].value_(dbToNorm.(db));
                     };
 
                     if(levelValueLabels[i].notNil) {
-                        levelValueLabels[i].string_(lvl.round(0.01).asString);
+                        levelValueLabels[i].string_(dbLabel.(db));
                     };
 
                     if(panBoxes[i].notNil) {
@@ -3685,17 +4019,7 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                     };
 
                     if(panValueLabels[i].notNil) {
-                        panValueLabels[i].string_(
-                            if(pan > 0.001) {
-                                "R " ++ pan.abs.round(0.01).asString
-                            }{
-                                if(pan < -0.001) {
-                                    "L " ++ pan.abs.round(0.01).asString
-                                }{
-                                    "C"
-                                }
-                            }
-                        );
+                        panValueLabels[i].string_(panLabel.(pan));
                     };
 
                     if(ampBoxes[i].notNil) {
@@ -3704,123 +4028,178 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
 
                     if(muteButtons[i].notNil) {
                         muteButtons[i].states_([
-                            ["Mute", Color.black, Color.grey(0.85)],
-                            ["Muted", Color.white, Color.red(0.75)]
+                            ["Mute", Color.black, Color.grey(0.86)],
+                            ["Muted", Color.white, Color.red(0.72)]
                         ]);
                         muteButtons[i].value_((ch[\mute] ? 0).asInteger);
                     };
 
                     if(soloButtons[i].notNil) {
                         soloButtons[i].states_([
-                            ["Solo", Color.black, Color.grey(0.85)],
-                            ["Solo", Color.white, Color(0.20, 0.55, 0.90)]
+                            ["Solo", Color.black, Color.grey(0.86)],
+                            ["Solo", Color.white, Color(0.14, 0.42, 0.72)]
                         ]);
                         soloButtons[i].value_((ch[\solo] ? 0).asInteger);
                     };
+
+                    if(selectButtons[i].notNil) {
+                        if(i == ~plonkSelectedTrack) {
+                            selectButtons[i].states_([["Selected", Color.white, accentBlue]]);
+                        }{
+                            selectButtons[i].states_([["Select", Color.black, Color.grey(0.86)]]);
+                        };
+                    };
+
+                    if(stripViews[i].notNil) {
+                        stripViews[i].background_(
+                            if(i == ~plonkSelectedTrack) {
+                                Color(0.94, 0.965, 0.985)
+                            }{
+                                panelBg
+                            }
+                        );
+                    };
+                };
+
+                if(masterFaderSlider.notNil) {
+                    masterFaderSlider.value_(dbToNorm.((~plonkMaster[\trimDb] ? -12.0).clip(mixerMinDb, mixerMaxDb)));
+                };
+
+                if(masterFaderLabel.notNil) {
+                    masterFaderLabel.string_(dbLabel.((~plonkMaster[\trimDb] ? -12.0).clip(mixerMinDb, mixerMaxDb)));
+                };
+
+                if(masterLimiterLevelBox.notNil) {
+                    masterLimiterLevelBox.value_(~plonkMaster[\limiterLevel] ? 0.85);
+                };
+
+                if(masterLimiterDurBox.notNil) {
+                    masterLimiterDurBox.value_(~plonkMaster[\limiterDur] ? 0.01);
+                };
+
+                if(masterSoftClipAmtBox.notNil) {
+                    masterSoftClipAmtBox.value_(~plonkMaster[\softClipAmt] ? 0.15);
                 };
             };
 
             ~plonkTrackCount.do { |i|
-                var x = x0 + ((i % 2) * colW);
-                var y = 52 + ((i div: 2) * rowH);
+                var x = x0 + (i * (stripW + stripGap));
+                var strip = View(v, Rect(x, stripTop, stripW, stripH));
+                var title = StaticText(strip, Rect(14, 12, stripW - 28, 24));
+                var meterX = 24;
+                var tickX = meterX + meterW + 8;
+                var zeroY = meterTop + ((1.0 - dbToNorm.(0.0)) * meterH);
+                var controlTop = meterTop + meterH + 24;
+                var panControlY = controlTop + 36;
+                var buttonY = controlTop + 82;
+                var selectY = controlTop + 118;
 
-                var stripX = x + 18;
-                var stripTopY = y + 56;
-                var faderH = 126;
+                stripViews[i] = strip;
+                strip.background_(panelBg);
 
-                var levelSliderX = stripX + 6;
-                var meterX = levelSliderX + 40;
+                title.string_(~plonkTrackNames[i]);
+                title.align_(\center);
+                title.font_(Font.default.boldVariant.size_(15));
 
-                var controlX = x + 130;
-                var ampLabelY = y + 28;
-                var ampBoxY = y + 24;
-                var panY = y + 88;
-                var buttonY = y + 136;
-                var selectY = y + 174;
+                StaticText(strip, Rect(meterX, 46, 70, 18))
+                .string_("Meter")
+                .font_(Font.default.size_(11));
 
-                StaticText(v, Rect(x, y, 220, 22))
-                .string_(~plonkTrackNames[i])
-                .font_(Font.default.boldVariant.size_(14));
+                StaticText(strip, Rect(faderX - 8, 46, 70, 18))
+                .string_("Fader")
+                .font_(Font.default.size_(11));
 
-                // track amp row
-                StaticText(v, Rect(controlX, ampLabelY, 72, 18)).string_("Track Amp");
-                ampBoxes[i] = makeBoundedBox.(v, Rect(controlX + 82, ampBoxY, 72, 20), ~plonkTrackStates[i][\amp], 0.0, 0.6, 0.01, 2, { |nb, val|
+                meterViews[i] = UserView(strip, Rect(meterX, meterTop, meterW, meterH));
+                meterViews[i].background_(Color.grey(0.18));
+                meterViews[i].drawFunc = {
+                    var val = meterViews[i].getProperty(\meterVal) ? 0.0;
+                    var db = gainToDb.(val.clip(0.0, 2.0));
+                    var fullH = meterViews[i].bounds.height.asInteger;
+                    var fullW = meterViews[i].bounds.width.asInteger;
+                    var norm = dbToNorm.(db);
+                    var zeroLine = (fullH * (1.0 - dbToNorm.(0.0))).asInteger;
+                    var yStart = (fullH * (1.0 - norm)).asInteger.clip(0, fullH);
+
+                    Pen.fillColor = Color.grey(0.16);
+                    Pen.fillRect(Rect(0, 0, fullW, fullH));
+
+                    mixerTicks.do { |tickDb|
+                        var yTick = (fullH * (1.0 - dbToNorm.(tickDb))).asInteger.clip(0, fullH);
+                        Pen.strokeColor = if(tickDb == 0.0) { Color.grey(0.78) } { Color.grey(0.32) };
+                        Pen.width = if(tickDb == 0.0) { 1.5 } { 1.0 };
+                        Pen.moveTo(Point(0, yTick));
+                        Pen.lineTo(Point(fullW, yTick));
+                        Pen.stroke;
+                    };
+
+                    Pen.fillColor = if(db > 0.0) {
+                        Color.red(0.82)
+                    }{
+                        if(db > -6.0) {
+                            Color(0.95, 0.72, 0.20)
+                        }{
+                            Color(0.20, 0.72, 0.34)
+                        }
+                    };
+
+                    Pen.fillRect(Rect(0, yStart, fullW, fullH - yStart));
+
+                    if(db > 0.0) {
+                        Pen.fillColor = Color.red(0.96);
+                        Pen.fillRect(Rect(0, yStart, fullW, zeroLine - yStart));
+                    };
+                };
+
+                mixerTicks.do { |tickDb|
+                    var tickY = meterTop + ((1.0 - dbToNorm.(tickDb)) * meterH) - 7;
+                    var tickLabel = StaticText(strip, Rect(tickX, tickY, 42, 14));
+                    tickLabel.string_(dbTickLabel.(tickDb));
+                    tickLabel.font_(Font.default.size_(9));
+                };
+
+                levelSliders[i] = Slider(strip, Rect(faderX, meterTop, faderW, meterH));
+                levelSliders[i].value_(dbToNorm.(gainToDb.((~plonkMixer[\tracks][i][\level] ? 1.0).clip(0.0, 2.0))));
+                levelSliders[i].action_({ |sl|
+                    var db = sl.value.clip(0.0, 1.0).linlin(0.0, 1.0, mixerMinDb, mixerMaxDb);
+                    var gain = dbToGain.(db);
+                    ~plonkMixer[\tracks][i][\level] = gain;
+                    if(levelValueLabels[i].notNil) {
+                        levelValueLabels[i].string_(dbLabel.(db));
+                    };
+                    ~plonkUpdateMixerRouting.();
+                });
+
+                StaticText(strip, Rect(faderX + 38, zeroY - 8, 48, 16))
+                .string_("0 dB")
+                .font_(Font.default.boldVariant.size_(10));
+
+                levelValueLabels[i] = StaticText(strip, Rect(faderX - 36, meterTop + meterH + 6, 96, 18));
+                levelValueLabels[i].align_(\center);
+                levelValueLabels[i].font_(Font.default.boldVariant.size_(11));
+
+                StaticText(strip, Rect(18, controlTop, 76, 18)).string_("Input Amp");
+                ampBoxes[i] = makeBoundedBox.(strip, Rect(98, controlTop - 2, 66, 22), ~plonkTrackStates[i][\amp], 0.0, 0.6, 0.01, 2, { |nb, val|
                     ~plonkTrackStates[i][\amp] = val;
                     if(i == ~plonkSelectedTrack) { refreshControls.() };
                 });
 
-                // level
-                StaticText(v, Rect(levelSliderX - 8, stripTopY - 24, 42, 16)).string_("Level");
-                levelSliders[i] = Slider(v, Rect(levelSliderX, stripTopY, 20, faderH));
-                levelSliders[i].value_((~plonkMixer[\tracks][i][\level] ? 1.0).clip(0.0, 1.5).linlin(0.0, 1.5, 0.0, 1.0));
-                levelSliders[i].action_({ |sl|
-                    var val = sl.value.linlin(0.0, 1.0, 0.0, 1.5).clip(0.0, 1.5);
-                    ~plonkMixer[\tracks][i][\level] = val;
-                    if(levelValueLabels[i].notNil) {
-                        levelValueLabels[i].string_(val.round(0.01).asString);
-                    };
-                    ~plonkUpdateMixerRouting.();
-                });
-
-                levelValueLabels[i] = StaticText(v, Rect(levelSliderX - 12, stripTopY + faderH + 6, 52, 16));
-                levelValueLabels[i].align_(\center);
-
-                // meter
-                StaticText(v, Rect(meterX - 6, stripTopY - 24, 42, 16)).string_("Meter");
-                meterViews[i] = UserView(v, Rect(meterX, stripTopY, 16, faderH))
-                .background_(Color.grey(0.90));
-
-                meterViews[i].drawFunc = {
-                    var val = meterViews[i].getProperty(\meterVal) ? 0.0;
-                    var h = (meterViews[i].bounds.height * val.clip(0, 1)).asInteger;
-                    var fullH = meterViews[i].bounds.height.asInteger;
-                    var fullW = meterViews[i].bounds.width.asInteger;
-                    var yStart = fullH - h;
-
-                    Pen.fillColor = Color.grey(0.82);
-                    Pen.fillRect(Rect(0, 0, fullW, fullH));
-
-                    Pen.fillColor = if(val > 0.85) {
-                        Color.red(0.85)
-                    }{
-                        if(val > 0.55) {
-                            Color.yellow(0.85)
-                        }{
-                            Color(0.20, 0.75, 0.30)
-                        }
-                    };
-
-                    Pen.fillRect(Rect(0, yStart, fullW, h));
-                };
-
-                // pan row
-                StaticText(v, Rect(controlX, panY, 34, 18)).string_("Pan");
-                panBoxes[i] = makeBoundedBox.(v, Rect(controlX + 46, panY - 2, 64, 20), (~plonkMixer[\tracks][i][\pan] ? 0.0), -1.0, 1.0, 0.01, 2, { |nb, val|
+                StaticText(strip, Rect(18, panControlY, 36, 18)).string_("Pan");
+                panBoxes[i] = makeBoundedBox.(strip, Rect(68, panControlY - 2, 66, 22), (~plonkMixer[\tracks][i][\pan] ? 0.0), -1.0, 1.0, 0.01, 2, { |nb, val|
                     ~plonkMixer[\tracks][i][\pan] = val;
                     if(panValueLabels[i].notNil) {
-                        panValueLabels[i].string_(
-                            if(val > 0.001) {
-                                "R " ++ val.abs.round(0.01).asString
-                            }{
-                                if(val < -0.001) {
-                                    "L " ++ val.abs.round(0.01).asString
-                                }{
-                                    "C"
-                                }
-                            }
-                        );
+                        panValueLabels[i].string_(panLabel.(val));
                     };
                     ~plonkUpdateMixerRouting.();
                 });
 
-                panValueLabels[i] = StaticText(v, Rect(controlX + 118, panY, 48, 18));
+                panValueLabels[i] = StaticText(strip, Rect(142, panControlY, 48, 18));
                 panValueLabels[i].string_("C");
+                panValueLabels[i].align_(\center);
 
-                // buttons
-                muteButtons[i] = Button(v, Rect(controlX, buttonY, 72, 24))
+                muteButtons[i] = Button(strip, Rect(18, buttonY, 78, 28))
                 .states_([
-                    ["Mute", Color.black, Color.grey(0.85)],
-                    ["Muted", Color.white, Color.red(0.75)]
+                    ["Mute", Color.black, Color.grey(0.86)],
+                    ["Muted", Color.white, Color.red(0.72)]
                 ])
                 .action_({ |bt|
                     ~plonkMixer[\tracks][i][\mute] = bt.value.asInteger;
@@ -3828,10 +4207,10 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                     if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
                 });
 
-                soloButtons[i] = Button(v, Rect(controlX + 82, buttonY, 72, 24))
+                soloButtons[i] = Button(strip, Rect(104, buttonY, 78, 28))
                 .states_([
-                    ["Solo", Color.black, Color.grey(0.85)],
-                    ["Solo", Color.white, Color(0.20, 0.55, 0.90)]
+                    ["Solo", Color.black, Color.grey(0.86)],
+                    ["Solo", Color.white, Color(0.14, 0.42, 0.72)]
                 ])
                 .action_({ |bt|
                     ~plonkMixer[\tracks][i][\solo] = bt.value.asInteger;
@@ -3839,8 +4218,8 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                     if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
                 });
 
-                Button(v, Rect(controlX, selectY, 154, 24))
-                .states_([["Select Track"]])
+                selectButtons[i] = Button(strip, Rect(18, selectY, 166, 28))
+                .states_([["Select", Color.black, Color.grey(0.86)]])
                 .action_({
                     ~plonkSetSelectedTrack.(i);
                     refreshControls.();
@@ -3850,8 +4229,132 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                 });
             };
 
-            Button(v, Rect(20, 610, 120, 26))
-            .states_([["Reset Mixer"]])
+            {
+                var strip = View(v, Rect(masterX, stripTop, masterW, stripH));
+                var title = StaticText(strip, Rect(14, 12, masterW - 28, 24));
+                var leftMeterX = 28;
+                var rightMeterX = 58;
+                var tickX = 92;
+                var masterFaderX = 158;
+                var zeroY = meterTop + ((1.0 - dbToNorm.(0.0)) * meterH);
+                var controlTop = meterTop + meterH + 24;
+                var buttonY = controlTop + 118;
+
+                strip.background_(Color.grey(0.975));
+
+                title.string_("Master Bus");
+                title.align_(\center);
+                title.font_(Font.default.boldVariant.size_(15));
+
+                StaticText(strip, Rect(leftMeterX, 46, 70, 18))
+                .string_("L  R")
+                .font_(Font.default.size_(11));
+
+                StaticText(strip, Rect(masterFaderX - 12, 46, 94, 18))
+                .string_("Stereo Fader")
+                .font_(Font.default.size_(11));
+
+                2.do { |j|
+                    var mx = if(j == 0) { leftMeterX } { rightMeterX };
+                    masterMeterViews[j] = UserView(strip, Rect(mx, meterTop, 22, meterH));
+                    masterMeterViews[j].background_(Color.grey(0.18));
+                    masterMeterViews[j].drawFunc = {
+                        var val = masterMeterViews[j].getProperty(\meterVal) ? 0.0;
+                        var db = gainToDb.(val.clip(0.0, 2.0));
+                        var fullH = masterMeterViews[j].bounds.height.asInteger;
+                        var fullW = masterMeterViews[j].bounds.width.asInteger;
+                        var norm = dbToNorm.(db);
+                        var zeroLine = (fullH * (1.0 - dbToNorm.(0.0))).asInteger;
+                        var yStart = (fullH * (1.0 - norm)).asInteger.clip(0, fullH);
+
+                        Pen.fillColor = Color.grey(0.16);
+                        Pen.fillRect(Rect(0, 0, fullW, fullH));
+
+                        mixerTicks.do { |tickDb|
+                            var yTick = (fullH * (1.0 - dbToNorm.(tickDb))).asInteger.clip(0, fullH);
+                            Pen.strokeColor = if(tickDb == 0.0) { Color.grey(0.78) } { Color.grey(0.32) };
+                            Pen.width = if(tickDb == 0.0) { 1.5 } { 1.0 };
+                            Pen.moveTo(Point(0, yTick));
+                            Pen.lineTo(Point(fullW, yTick));
+                            Pen.stroke;
+                        };
+
+                        Pen.fillColor = if(db > 0.0) {
+                            Color.red(0.82)
+                        }{
+                            if(db > -6.0) {
+                                Color(0.95, 0.72, 0.20)
+                            }{
+                                Color(0.20, 0.72, 0.34)
+                            }
+                        };
+
+                        Pen.fillRect(Rect(0, yStart, fullW, fullH - yStart));
+
+                        if(db > 0.0) {
+                            Pen.fillColor = Color.red(0.96);
+                            Pen.fillRect(Rect(0, yStart, fullW, zeroLine - yStart));
+                        };
+                    };
+                };
+
+                mixerTicks.do { |tickDb|
+                    var tickY = meterTop + ((1.0 - dbToNorm.(tickDb)) * meterH) - 7;
+                    var tickLabel = StaticText(strip, Rect(tickX, tickY, 42, 14));
+                    tickLabel.string_(dbTickLabel.(tickDb));
+                    tickLabel.font_(Font.default.size_(9));
+                };
+
+                masterFaderSlider = Slider(strip, Rect(masterFaderX, meterTop, faderW, meterH));
+                masterFaderSlider.value_(dbToNorm.((~plonkMaster[\trimDb] ? -12.0).clip(mixerMinDb, mixerMaxDb)));
+                masterFaderSlider.action_({ |sl|
+                    var db = sl.value.clip(0.0, 1.0).linlin(0.0, 1.0, mixerMinDb, mixerMaxDb);
+                    setMasterParam.(\trimDb, db);
+                    if(masterFaderLabel.notNil) {
+                        masterFaderLabel.string_(dbLabel.(db));
+                    };
+                });
+
+                StaticText(strip, Rect(masterFaderX + 38, zeroY - 8, 48, 16))
+                .string_("0 dB")
+                .font_(Font.default.boldVariant.size_(10));
+
+                masterFaderLabel = StaticText(strip, Rect(masterFaderX - 36, meterTop + meterH + 6, 96, 18));
+                masterFaderLabel.align_(\center);
+                masterFaderLabel.font_(Font.default.boldVariant.size_(11));
+
+                StaticText(strip, Rect(20, controlTop, 90, 18)).string_("Limiter");
+                masterLimiterLevelBox = makeBoundedBox.(strip, Rect(122, controlTop - 2, 74, 22), ~plonkMaster[\limiterLevel], 0.10, 1.00, 0.01, 2, { |nb, val|
+                    setMasterParam.(\limiterLevel, val);
+                });
+
+                StaticText(strip, Rect(20, controlTop + 32, 90, 18)).string_("Release");
+                masterLimiterDurBox = makeBoundedBox.(strip, Rect(122, controlTop + 30, 74, 22), ~plonkMaster[\limiterDur], 0.001, 0.10, 0.001, 3, { |nb, val|
+                    setMasterParam.(\limiterDur, val);
+                });
+
+                StaticText(strip, Rect(20, controlTop + 64, 90, 18)).string_("Soft Clip");
+                masterSoftClipAmtBox = makeBoundedBox.(strip, Rect(122, controlTop + 62, 74, 22), ~plonkMaster[\softClipAmt], 0.00, 1.00, 0.01, 2, { |nb, val|
+                    setMasterParam.(\softClipAmt, val);
+                });
+
+                makeButton.(strip, Rect(20, buttonY, 126, 28), "Rebuild Bus", {
+                    ~plonkInitMasterOut.();
+                    ~plonkInitMixer.();
+                    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                });
+
+                makeButton.(strip, Rect(158, buttonY, 126, 28), "Reset Master", {
+                    setMasterParam.(\trimDb, -12.0);
+                    setMasterParam.(\limiterLevel, 0.85);
+                    setMasterParam.(\limiterDur, 0.01);
+                    setMasterParam.(\softClipAmt, 0.15);
+                    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+                });
+            }.value;
+
+            Button(v, Rect(20, 660, 116, 28))
+            .states_([["Reset Mixer", Color.black, Color.grey(0.88)]])
             .action_({
                 ~plonkTrackCount.do { |i|
                     ~plonkMixer[\tracks][i][\level] = 1.0;
@@ -3863,8 +4366,8 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                 if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
             });
 
-            Button(v, Rect(150, 610, 140, 26))
-            .states_([["Reset Track Amps"]])
+            Button(v, Rect(148, 660, 142, 28))
+            .states_([["Reset Track Amps", Color.black, Color.grey(0.88)]])
             .action_({
                 ~plonkTrackStates[0][\amp] = 0.17;
                 ~plonkTrackStates[1][\amp] = 0.15;
@@ -3874,6 +4377,10 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
                 if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
                 refreshControls.();
             });
+
+            StaticText(v, Rect(310, 665, 560, 18))
+            .string_("Reset Mixer returns track faders to 0 dB unity gain. Reset Master returns the master trim to -12 dB.")
+            .font_(Font.default.size_(11));
 
             ~plonkStopMixerMeters = {
                 meterRoutines.do { |r|
@@ -3898,18 +4405,39 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
 
                             {
                                 if(meterViews[i].notNil) {
-                                    meterViews[i].setProperty(\meterVal, val.clip(0, 1));
+                                    meterViews[i].setProperty(\meterVal, val.clip(0.0, 2.0));
                                     meterViews[i].refresh;
                                 };
                             }.defer;
 
-                            0.04.wait;
+                            0.10.wait;
                         }
                     }).play(AppClock);
                 };
+
+                meterRoutines[~plonkTrackCount] = Routine({
+                    loop {
+                        var vals = [0.0, 0.0];
+
+                        if(~plonkMaster[\meterBus].notNil) {
+                            vals = ~plonkMaster[\meterBus].getnSynchronous(2) ? [0.0, 0.0];
+                        };
+
+                        {
+                            2.do { |j|
+                                if(masterMeterViews[j].notNil) {
+                                    masterMeterViews[j].setProperty(\meterVal, (vals[j] ? 0.0).clip(0.0, 2.0));
+                                    masterMeterViews[j].refresh;
+                                };
+                            };
+                        }.defer;
+
+                        0.10.wait;
+                    }
+                }).play(AppClock);
             };
 
-            ~plonkStartMixerMeters.();
+            if(v.visible) { ~plonkStartMixerMeters.() };
 
             if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
         }.value;
@@ -3933,16 +4461,18 @@ makeButton.(header, Rect(1020, 16, 90, 28), "RandPat", {
 var chainSlotStartX = 226;
 var chainSlotSpacing = 220;
 
-var y1 = 24;
-var y2 = 68;
-var y3 = 112;
-var y4 = 156;
-var topY1 = 232;
-var topY2 = 432;
+	var y1 = 64;
+	var y2 = 108;
+	var y3 = 152;
+	var y4 = 196;
+	var topY1 = 272;
+	var topY2 = 472;
 
-StaticText(v, Rect(20, 0, 360, 20)).string_("Pattern + playhead (selected track lane)");
-condSummaryLabel = StaticText(v, Rect(392, 0, 360, 20));
-chainSummaryLabel = StaticText(v, Rect(764, 0, 620, 20));
+	makePageTitle.(v, "Pattern");
+	condSummaryLabel = StaticText(v, Rect(460, 14, 430, 20));
+	condSummaryLabel.font_(controlFont);
+	chainSummaryLabel = StaticText(v, Rect(460, 36, 820, 18));
+	chainSummaryLabel.font_(controlFont);
 
             StaticText(v, Rect(20, y1, 42, 20)).string_("Tempo");
             makeBoundedBox.(v, Rect(64, y1, 56, 20), ~plonkSeq[\tempo], 20, 300, 1, 0, { |nb, val|
@@ -4279,22 +4809,21 @@ randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, {
 {
     var v = makePage.(\step);
     var rowGap = 27;
-    var addLockRow;
-    var condMenu;
-    var pageTitle;
+	    var addLockRow;
+	    var condMenu;
 
-    var yTitle = 8;
-    var yRow1 = 54;
-    var yRow2 = 98;
+	    var yTitle = 8;
+	    var yRow1 = 66;
+	    var yRow2 = 110;
 
-    var ySynthHdr = 146;
-    var yRow3 = 176;
-    var yRow4 = 218;
-    var yRow5 = 260;
+	    var ySynthHdr = 158;
+	    var yRow3 = 188;
+	    var yRow4 = 230;
+	    var yRow5 = 272;
 
-    var yLocksHdr = 320;
-var yLocks = 350;
-var yBottom = 634;
+	    var yLocksHdr = 332;
+	var yLocks = 362;
+	var yBottom = 646;
 
 var col1X = 22;
 var col2X = 318;
@@ -4306,16 +4835,12 @@ var toggleW = 46;
 var valueW = 82;
 var valueGap = 6;
 
-    pageTitle = StaticText(v, Rect(20, yTitle, 420, 30));
-    pageTitle.string_("Per-step Editor");
-    pageTitle.font_(Font.default.boldVariant.size_(18));
+	    makePageTitle.(v, "Per-step Editor");
 
-    // --------------------------------------------------
-    // TIMING + CONDITIONS
-    // --------------------------------------------------
-    StaticText(v, Rect(20, 32, 260, 20))
-    .string_("Timing + Conditions")
-    .font_(Font.default.boldVariant.size_(13));
+	    // --------------------------------------------------
+	    // TIMING + CONDITIONS
+	    // --------------------------------------------------
+	    makeSectionLabel.(v, Rect(20, 42, 260, 20), "Timing + Conditions");
 
     StaticText(v, Rect(20, yRow1, 80, 20)).string_("Step");
     lockBoxes[\stepNum] = makeBoundedBox.(v, Rect(102, yRow1, 52, 20), 1, 1, 32, 1, 0, { |nb, val|
@@ -4417,9 +4942,7 @@ var valueGap = 6;
     // --------------------------------------------------
     // SYNTH2 PARALLEL ENGINE
     // --------------------------------------------------
-    StaticText(v, Rect(20, ySynthHdr, 260, 20))
-    .string_("Synth2 Parallel Engine")
-    .font_(Font.default.boldVariant.size_(13));
+	    makeSectionLabel.(v, Rect(20, ySynthHdr, 260, 20), "Assist Layer");
 
     StaticText(v, Rect(20, yRow3, 40, 20)).string_("Mode");
     layerModeMenu = PopUpMenu(v, Rect(64, yRow3, 110, 20));
@@ -4429,7 +4952,7 @@ var valueGap = 6;
         refreshPatternUI.();
     });
 
-    StaticText(v, Rect(192, yRow3, 50, 20)).string_("Synth2");
+    StaticText(v, Rect(192, yRow3, 50, 20)).string_("Assist");
     eng2ModelMenu = PopUpMenu(v, Rect(246, yRow3, 120, 20));
     eng2ModelMenu.items_(~plonkSynth2TypeNames);
     eng2ModelMenu.action_({
@@ -4446,7 +4969,7 @@ var valueGap = 6;
     });
 
     StaticText(v, Rect(574, yRow3, 38, 20)).string_("Level");
-    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(616, yRow3, 60, 20), 0.60, 0.05, 1.0, 0.01, 2, { |nb, val|
+    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(616, yRow3, 60, 20), 0.35, 0.05, 1.0, 0.01, 2, { |nb, val|
         ~plonkSteps[lockStep][\layerLevel] = val;
     });
 
@@ -4459,20 +4982,20 @@ var valueGap = 6;
     });
 
     StaticText(v, Rect(844, yRow3, 32, 20)).string_("Semi");
-    lockBoxes[\engine2SemiOffset] = makeBoundedBox.(v, Rect(880, yRow3, 54, 20), 0, -24, 24, 1, 0, { |nb, val|
-        ~plonkSteps[lockStep][\engine2SemiOffset] = val.asInteger;
+    lockBoxes[\engine2SemiOffset] = makeBoundedBox.(v, Rect(880, yRow3, 54, 20), 0, -2, 2, 1, 0, { |nb, val|
+        ~plonkSteps[lockStep][\engine2SemiOffset] = val.asInteger.clip(-2, 2);
         refreshPatternUI.();
     });
 
     StaticText(v, Rect(950, yRow3, 24, 20)).string_("Deg");
-    lockBoxes[\engine2DegreeOffset] = makeBoundedBox.(v, Rect(978, yRow3, 54, 20), 0, -14, 14, 1, 0, { |nb, val|
-        ~plonkSteps[lockStep][\engine2DegreeOffset] = val.asInteger;
+    lockBoxes[\engine2DegreeOffset] = makeBoundedBox.(v, Rect(978, yRow3, 54, 20), 0, -1, 1, 1, 0, { |nb, val|
+        ~plonkSteps[lockStep][\engine2DegreeOffset] = val.asInteger.clip(-1, 1);
         refreshPatternUI.();
     });
 
     StaticText(v, Rect(1048, yRow3, 24, 20)).string_("Oct");
-    lockBoxes[\engine2DegreeOctOffset] = makeBoundedBox.(v, Rect(1076, yRow3, 54, 20), 0, -3, 3, 1, 0, { |nb, val|
-        ~plonkSteps[lockStep][\engine2DegreeOctOffset] = val.asInteger;
+    lockBoxes[\engine2DegreeOctOffset] = makeBoundedBox.(v, Rect(1076, yRow3, 54, 20), 0, 0, 0, 1, 0, { |nb, val|
+        ~plonkSteps[lockStep][\engine2DegreeOctOffset] = 0;
         refreshPatternUI.();
     });
 
@@ -4495,8 +5018,8 @@ var valueGap = 6;
     });
 
     StaticText(v, Rect(448, yRow4, 46, 20)).string_("PanOff");
-    lockBoxes[\engine2PanOffset] = makeBoundedBox.(v, Rect(498, yRow4, 62, 20), 0.00, -1.0, 1.0, 0.01, 2, { |nb, val|
-        ~plonkSteps[lockStep][\engine2PanOffset] = val;
+    lockBoxes[\engine2PanOffset] = makeBoundedBox.(v, Rect(498, yRow4, 62, 20), 0.00, -0.25, 0.25, 0.01, 2, { |nb, val|
+        ~plonkSteps[lockStep][\engine2PanOffset] = val.clip(-0.25, 0.25);
         refreshPatternUI.();
     });
 
@@ -4564,9 +5087,7 @@ var valueGap = 6;
     // --------------------------------------------------
     // PER-STEP LOCKS
     // --------------------------------------------------
-    StaticText(v, Rect(20, yLocksHdr, 260, 20))
-    .string_("Per-step Locks")
-    .font_(Font.default.boldVariant.size_(13));
+	    makeSectionLabel.(v, Rect(20, yLocksHdr, 260, 20), "Per-step Locks");
 
     addLockRow = { |x, y, label, key, min, max, step=0.01, decimals=2, isInt=false|
         var toggleX = x + labelW;
@@ -4696,147 +5217,76 @@ var valueGap = 6;
     });
 }.value;
 
-
-		        // master page
-        {
-            var v = makePage.(\master);
-
-            StaticText(v, Rect(20, 10, 1000, 20)).string_(
-                "Master bus controls. These update the running master synth immediately."
-            );
-
-            StaticText(v, Rect(20, 50, 120, 20)).string_("Trim (dB)");
-            masterTrimBox = makeBoundedBox.(v, Rect(150, 50, 100, 20), ~plonkMaster[\trimDb], -24.0, 12.0, 0.1, 1, { |nb, val|
-                ~plonkMaster[\trimDb] = val;
-                if(~plonkMaster[\synth].notNil) {
-                    ~plonkMaster[\synth].set(\trimDb, val);
-                };
-            });
-
-            StaticText(v, Rect(20, 84, 120, 20)).string_("Limiter Level");
-            masterLimiterLevelBox = makeBoundedBox.(v, Rect(150, 84, 100, 20), ~plonkMaster[\limiterLevel], 0.10, 1.00, 0.01, 2, { |nb, val|
-                ~plonkMaster[\limiterLevel] = val;
-                if(~plonkMaster[\synth].notNil) {
-                    ~plonkMaster[\synth].set(\limiterLevel, val);
-                };
-            });
-
-            StaticText(v, Rect(20, 118, 120, 20)).string_("Limiter Dur");
-            masterLimiterDurBox = makeBoundedBox.(v, Rect(150, 118, 100, 20), ~plonkMaster[\limiterDur], 0.001, 0.10, 0.001, 3, { |nb, val|
-                ~plonkMaster[\limiterDur] = val;
-                if(~plonkMaster[\synth].notNil) {
-                    ~plonkMaster[\synth].set(\limiterDur, val);
-                };
-            });
-
-            StaticText(v, Rect(20, 152, 120, 20)).string_("Soft Clip Amt");
-            masterSoftClipAmtBox = makeBoundedBox.(v, Rect(150, 152, 100, 20), ~plonkMaster[\softClipAmt], 0.00, 1.00, 0.01, 2, { |nb, val|
-                ~plonkMaster[\softClipAmt] = val;
-                if(~plonkMaster[\synth].notNil) {
-                    ~plonkMaster[\synth].set(\softClipAmt, val);
-                };
-            });
-
-            makeButton.(v, Rect(20, 210, 140, 26), "Rebuild Master Bus", {
-                ~plonkInitMasterOut.();
-                if(refreshMasterUI.notNil) { refreshMasterUI.() };
-            });
-
-            makeButton.(v, Rect(170, 210, 140, 26), "Reset Defaults", {
-                ~plonkMaster[\trimDb] = -12.0;
-                ~plonkMaster[\limiterLevel] = 0.85;
-                ~plonkMaster[\limiterDur] = 0.01;
-                ~plonkMaster[\softClipAmt] = 0.15;
-
-                if(~plonkMaster[\synth].notNil) {
-                    ~plonkMaster[\synth].set(
-                        \trimDb, ~plonkMaster[\trimDb],
-                        \limiterLevel, ~plonkMaster[\limiterLevel],
-                        \limiterDur, ~plonkMaster[\limiterDur],
-                        \softClipAmt, ~plonkMaster[\softClipAmt]
-                    );
-                };
-
-                if(refreshMasterUI.notNil) { refreshMasterUI.() };
-            });
-
-            StaticText(v, Rect(20, 270, 1000, 80)).string_(
-                "Recommended starting point:\n"
-                ++ "Trim = -12 dB | Limiter Level = 0.85 | Limiter Dur = 0.01 | Soft Clip Amt = 0.15"
-            );
-
-            if(refreshMasterUI.notNil) { refreshMasterUI.() };
-        }.value;
-
-
         // audio page
         {
-            var v = makePage.(\audio);
-            var srBox, outChBox, inChBox;
+	            var v = makePage.(\audio);
+	            var srBox, outChBox, inChBox;
 
-            StaticText(v, Rect(20, 10, 900, 20)).string_("Audio/Midi setup. Changing audio device settings reboots the SC server.");
+	            makePageTitle.(v, "Audio/MIDI", "Device changes reboot the SC server after validation; MIDI sync can follow an external clock.");
 
-            StaticText(v, Rect(20, 50, 100, 20)).string_("Output Device");
-            ~plonkAudioOutMenu = PopUpMenu(v, Rect(130, 50, 420, 22));
-            ~plonkAudioOutMenu.items_(["Current / unchanged"]);
+	            StaticText(v, Rect(20, 74, 100, 20)).string_("Output Device");
+	            ~plonkAudioOutMenu = PopUpMenu(v, Rect(130, 74, 420, 22));
+            ~plonkAudioOutMenu.items_(["System Default"]);
             ~plonkAudioOutMenu.action_({
                 var idx = ~plonkAudioOutMenu.value;
                 if(idx <= 0) {
-                    ~plonkAudioState[\outDevice] = (s.options.outDevice ? "").asString;
+                    ~plonkAudioState[\outDevice] = "";
                 }{
                     ~plonkAudioState[\outDevice] = ~plonkAudioDevices[idx - 1];
                 };
             });
 
-            StaticText(v, Rect(20, 84, 100, 20)).string_("Input Device");
-            ~plonkAudioInMenu = PopUpMenu(v, Rect(130, 84, 420, 22));
-            ~plonkAudioInMenu.items_(["Current / unchanged"]);
+	            StaticText(v, Rect(20, 108, 100, 20)).string_("Input Device");
+	            ~plonkAudioInMenu = PopUpMenu(v, Rect(130, 108, 420, 22));
+            ~plonkAudioInMenu.items_(["System Default"]);
             ~plonkAudioInMenu.action_({
                 var idx = ~plonkAudioInMenu.value;
                 if(idx <= 0) {
-                    ~plonkAudioState[\inDevice] = (s.options.inDevice ? "").asString;
+                    ~plonkAudioState[\inDevice] = "";
                 }{
                     ~plonkAudioState[\inDevice] = ~plonkAudioDevices[idx - 1];
                 };
             });
 
-            StaticText(v, Rect(20, 130, 100, 20)).string_("Sample Rate");
-            srBox = makeBoundedBox.(v, Rect(130, 130, 100, 20), ~plonkAudioState[\sampleRate], 8000, 192000, 1, 0, { |nb, val|
+	            StaticText(v, Rect(20, 154, 100, 20)).string_("Sample Rate");
+	            srBox = makeBoundedBox.(v, Rect(130, 154, 100, 20), ~plonkAudioState[\sampleRate], 8000, 192000, 1, 0, { |nb, val|
                 ~plonkAudioState[\sampleRate] = val.asInteger;
             });
 
-            StaticText(v, Rect(20, 164, 100, 20)).string_("Out Channels");
-            outChBox = makeBoundedBox.(v, Rect(130, 164, 100, 20), ~plonkAudioState[\numOutChannels], 2, 128, 1, 0, { |nb, val|
+	            StaticText(v, Rect(20, 188, 100, 20)).string_("Out Channels");
+	            outChBox = makeBoundedBox.(v, Rect(130, 188, 100, 20), ~plonkAudioState[\numOutChannels], 2, 128, 1, 0, { |nb, val|
                 ~plonkAudioState[\numOutChannels] = val.asInteger;
             });
 
-            StaticText(v, Rect(20, 198, 100, 20)).string_("In Channels");
-            inChBox = makeBoundedBox.(v, Rect(130, 198, 100, 20), ~plonkAudioState[\numInChannels], 0, 128, 1, 0, { |nb, val|
+	            StaticText(v, Rect(20, 222, 100, 20)).string_("In Channels");
+	            inChBox = makeBoundedBox.(v, Rect(130, 222, 100, 20), ~plonkAudioState[\numInChannels], 0, 128, 1, 0, { |nb, val|
                 ~plonkAudioState[\numInChannels] = val.asInteger;
             });
 
-            makeButton.(v, Rect(20, 250, 120, 26), "Refresh Devices", { ~plonkRefreshAudioMenus.() });
-            makeButton.(v, Rect(150, 250, 120, 26), "Apply / Reboot", { ~plonkApplyAudioState.() });
-            makeButton.(v, Rect(280, 250, 120, 26), "Use No Input", {
+	            makeButton.(v, Rect(20, 274, 120, 26), "Refresh Devices", { ~plonkRefreshAudioMenus.() });
+	            makeButton.(v, Rect(150, 274, 120, 26), "Apply / Reboot", { ~plonkApplyAudioState.() });
+	            makeButton.(v, Rect(280, 274, 120, 26), "Use No Input", {
                 ~plonkAudioState[\numInChannels] = 0;
                 inChBox.value_(0);
-                ~plonkRefreshAudioMenus.();
+                if(~plonkAudioStatus.notNil) {
+                    ~plonkAudioStatus.string_("Input channels set to 0. Apply / Reboot to use it.");
+                };
             });
 
-            ~plonkAudioStatus = StaticText(v, Rect(20, 300, 1200, 20));
+	            ~plonkAudioStatus = StaticText(v, Rect(20, 324, 1200, 20));
             ~plonkAudioStatus.string_("Audio status");
 
-            StaticText(v, Rect(20, 340, 1000, 80)).string_(
+	            StaticText(v, Rect(20, 364, 1000, 80)).string_(
                 "Tip: if you only need output routing, set In Channels to 0. " ++
                 "That helps avoid sample-rate mismatch errors with BlackHole, Aggregate Device, or Multi-Output Device."
             );
 
 
-			            StaticText(v, Rect(20, 450, 1000, 20)).string_(
+				            StaticText(v, Rect(20, 474, 1000, 20)).string_(
                 "External MIDI sync: slave sequencer transport to DAW MIDI clock/start/stop."
             );
 
-            Button(v, Rect(20, 480, 140, 24))
+	            Button(v, Rect(20, 504, 140, 24))
             .states_([
                 ["Internal Clock", Color.black, Color.grey(0.85)],
                 ["External MIDI", Color.white, Color(0.25, 0.55, 0.90)]
@@ -4855,8 +5305,8 @@ var valueGap = 6;
                 ~plonkUpdateMidiSyncStatus.();
             });
 
-            StaticText(v, Rect(180, 482, 80, 20)).string_("MIDI Source");
-            ~plonkMidiSourceMenu = PopUpMenu(v, Rect(264, 480, 420, 22));
+	            StaticText(v, Rect(180, 506, 80, 20)).string_("MIDI Source");
+	            ~plonkMidiSourceMenu = PopUpMenu(v, Rect(264, 504, 420, 22));
 
             ~plonkMidiSourceMenu.items_(
                 ["Any source"] ++ ~plonkMidiSources.collect { |ep|
@@ -4877,7 +5327,7 @@ var valueGap = 6;
                 ~plonkUpdateMidiSyncStatus.();
             });
 
-          makeButton.(v, Rect(700, 480, 120, 24), "Refresh MIDI", {
+	          makeButton.(v, Rect(700, 504, 120, 24), "Refresh MIDI", {
     ~plonkRefreshMidiSources.();
 
     if(~plonkMidiSourceMenu.notNil) {
@@ -4893,10 +5343,10 @@ var valueGap = 6;
     ~plonkUpdateMidiSyncStatus.();
 });
 
-            ~plonkMidiSyncStatus = StaticText(v, Rect(20, 516, 1200, 20));
+	            ~plonkMidiSyncStatus = StaticText(v, Rect(20, 540, 1200, 20));
             ~plonkMidiSyncStatus.string_("Clock: Internal");
 
-            StaticText(v, Rect(20, 548, 1100, 60)).string_(
+	            StaticText(v, Rect(20, 572, 1100, 60)).string_(
                 "In Ableton, enable Sync on the MIDI output port going to SuperCollider "
                 ++ "(for example an IAC bus on macOS), then press play in Ableton."
             );
@@ -4910,17 +5360,19 @@ if(~plonkMidiSourceMenu.notNil) {
     );
     ~plonkRefreshMidiSourceMenuSelection.();
 };
-~plonkUpdateMidiSyncStatus.();
+	~plonkUpdateMidiSyncStatus.();
 
-            ~plonkRefreshAudioMenus.();
-        }.value;
+	            ~plonkRefreshAudioMenus.();
+	        }.value;
 
-~plonkSetSelectedTrack.(0);
-~plonkSetEditVariation.(0);
+	polishControls.(header);
+	pages.keysValuesDo { |k, v| polishControls.(v) };
+
+	~plonkSetSelectedTrack.(0);
+	~plonkSetEditVariation.(0);
 refreshControls.();
 refreshPatternUI.();
 refreshLockEditor.();
-if(refreshMasterUI.notNil) { refreshMasterUI.() };
 if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
 ~plonkRefreshAudioMenus.();
 showPage.(\main);
