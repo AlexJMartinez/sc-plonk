@@ -14,6 +14,38 @@
 s.options.memSize = 2097152;
 s.options.numWireBufs = 512;
 
+~plonkStandaloneMode = (("PLONKISH_STANDALONE".getenv ? "0").asString == "1");
+~plonkIsShuttingDown = false;
+~plonkBundledScsynthPath = Platform.resourceDir +/+ "../Resources/scsynth";
+~plonkHardExitStandalone = { |delay = 0.08, serverPid = nil|
+    var langPid = thisProcess.pid.asInteger;
+    var fallbackServerPid = serverPid ? if(s.notNil) { s.pid } { nil };
+    var scsynthPath = ~plonkBundledScsynthPath ? (Platform.resourceDir +/+ "../Resources/scsynth");
+    var script = "sleep " ++ delay.asFloat.asString ++ "; /bin/kill -9 " ++ langPid.asString ++ " 2>/dev/null";
+
+    if(fallbackServerPid.notNil) {
+        script = script ++ "; sleep 0.25; /bin/kill -9 " ++ fallbackServerPid.asInteger.asString ++ " 2>/dev/null";
+    };
+
+    script = script ++ "; sleep 0.50; /usr/bin/pkill -9 -f " ++ scsynthPath.shellQuote ++ " 2>/dev/null";
+    ("/bin/sh -c " ++ script.shellQuote).unixCmd(nil, false);
+};
+
+ShutDown.add({
+    var serverPid;
+    if(~plonkStandaloneMode and: { ~plonkIsShuttingDown.not }) {
+        ~plonkIsShuttingDown = true;
+        serverPid = if(s.notNil) { s.pid } { nil };
+
+        if(~plonkCleanupForShutdown.notNil) { ~plonkCleanupForShutdown.() };
+        if(s.notNil and: { s.serverRunning }) {
+            s.quit(watchShutDown: false);
+        };
+
+        ~plonkHardExitStandalone.(0.01, serverPid);
+    };
+});
+
 s.waitForBoot({
 
     // --------------------------------------------------------
@@ -21,12 +53,66 @@ s.waitForBoot({
     // --------------------------------------------------------
     ~plonkEnsureDir = { |p|
         if(File.exists(p).not) {
-            ("mkdir -p " ++ p.quote).unixCmd;
+            ["/bin/mkdir", "-p", p].unixCmdGetStdOut;
         };
     };
+    ~plonkCopyFile = { |src, dst|
+        ["/bin/cp", "-p", src, dst].unixCmdGetStdOut;
+    };
 
-    ~plonkPatternDir = Platform.userHomeDir +/+ "PlonkPatterns";
+    ~plonkAppName = "Plonk-ish";
+    ~plonkAppSupportRoot = Platform.userHomeDir +/+ "Library" +/+ "Application Support";
+    ~plonkAppSupportDir = ~plonkAppSupportRoot +/+ ~plonkAppName;
+    ~plonkLegacyPatternDir = Platform.userHomeDir +/+ "PlonkPatterns";
+    ~plonkArchiveFilesIn = { |dir|
+        if(File.exists(dir)) {
+            PathName(dir).files.select { |pn|
+                ((pn.extension ? "").asString.toLower == "archive")
+            }
+        }{
+            []
+        }
+    };
+    ~plonkPatternDir = ~plonkAppSupportDir +/+ "Patterns";
+    ~plonkSoundRootDir = ~plonkAppSupportDir +/+ "Sounds";
+    ~plonkTrackDefaultsPath = ~plonkAppSupportDir +/+ "TrackDefaults.archive";
+    ~plonkEnsureDir.(~plonkAppSupportRoot);
+    ~plonkEnsureDir.(~plonkAppSupportDir);
     ~plonkEnsureDir.(~plonkPatternDir);
+    ~plonkEnsureDir.(~plonkSoundRootDir);
+
+    ~plonkMigrateLegacyPatterns = {
+        var legacyFiles = ~plonkArchiveFilesIn.(~plonkLegacyPatternDir);
+        var currentFiles = ~plonkArchiveFilesIn.(~plonkPatternDir);
+        var migrated = 0;
+
+        if((legacyFiles.size > 0) and: { currentFiles.isEmpty }) {
+            legacyFiles.do { |pn|
+                var src = pn.fullPath;
+                var dst = ~plonkPatternDir +/+ pn.fileName;
+
+                if(File.exists(dst).not) {
+                    ~plonkCopyFile.(src, dst);
+                    if(File.exists(dst)) {
+                        migrated = migrated + 1;
+                    } {
+                        ("Failed to migrate legacy pattern: " ++ src).warn;
+                    };
+                };
+            };
+
+            if(migrated > 0 and: { ~plonkDebug }) {
+                (
+                    "Migrated " ++ migrated.asString
+                    ++ " legacy pattern(s) from "
+                    ++ ~plonkLegacyPatternDir
+                    ++ " to "
+                    ++ ~plonkPatternDir
+                ).postln;
+            };
+        };
+    };
+    ~plonkMigrateLegacyPatterns.();
 
     // --------------------------------------------------------
     // helpers
@@ -191,6 +277,18 @@ s.waitForBoot({
     noteName ++ octave.asString
 };
 
+~plonkFreqNoteString = { |freq|
+    var midi, nearest, cents, sign;
+
+    midi = freq.asFloat.max(1.0).cpsmidi;
+    nearest = midi.round.asInteger.clip(0, 127);
+    cents = ((midi - nearest) * 100.0);
+    cents = (cents * 10.0).round / 10.0;
+    sign = if(cents >= 0.0) { "+" } { "" };
+
+    ~plonkMidiToName.(nearest) ++ " " ++ sign ++ cents.asString ++ "c"
+};
+
     ~plonkNoteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
     ~plonkScaleNames = [
@@ -215,7 +313,10 @@ s.waitForBoot({
 
     ~plonkDebug = false;
     ~plonkLayerModeNames = ["Single", "Assist", "Assist Alt", "Assist Rand"];
-	~plonkRandSelModeNames = ["Full", "Selection", "Timing", "Pitch", "Accent", "Layer"];
+	~plonkRandSelModeNames = ["Full", "Selection", "Timing", "Pitch", "Accent", "Condition", "Layer"];
+	~plonkPasteModeNames = ["Overwrite", "Merge", "Timing", "Pitch", "Conditions", "Layer"];
+	~plonkMutateTargetNames = ["Active", "Edit", "Temp"];
+	~plonkMutatePresetNames = ["Subtle", "Medium", "Wild"];
 	~plonkSynth2TypeNames = ["FM Burst", "PWM Buzz", "Ring Metal", "Vowel Noise"];
 		~plonkSynth2VariantNames = ["Soft", "Bright", "Wide", "Hollow", "Nasal", "Harsh"];
 		~plonkSynth2PitchModeNames = ["Follow", "Semi", "Degree"];
@@ -438,7 +539,7 @@ s.waitForBoot({
     decay=1.2,
     body=0.45,
     damp=0.25,
-    drive=1.15,
+    drive=1.0,
     tone=0.58,
     noiseAmt=0.32,
     clickAmt=0.82,
@@ -447,14 +548,14 @@ s.waitForBoot({
     spread=1.0,
     pitchEnvAmt=0.0,
     pitchEnvDecay=0.03,
-    velToBright=0.35,
-    velToDecay=0.2,
-    velToNoise=0.2,
-    velToClick=0.2,
+    velToBright=0.0,
+    velToDecay=0.0,
+    velToNoise=0.0,
+    velToClick=0.0,
     filterMode=0,
-    filterCutoff=0.65,
-    filterRes=0.25,
-    filterEnvAmt=0.35,
+    filterCutoff=1.0,
+    filterRes=0.01,
+    filterEnvAmt=0.0,
     filterEnvDecay=0.08,
     combAmt=0.0,
     combTime=0.008,
@@ -463,17 +564,22 @@ s.waitForBoot({
     foldAmt=0.0,
     presence=0.0,
     crushMix=0.0,
-    bitDepth=12,
+    bitDepth=16,
     downsample=1,
+    kickSubAmt=0.0,
+    kickSubDecay=0.8,
+    kickPunch=0.0,
+    kickDrive=0.0,
+    kickClick=0.0,
 
     // internal synth2 branch
     layerMode=0,          // kept for saved-pattern compatibility; routing chooses the SynthDef
-    layerLevel=0.35,
+    layerLevel=0.0,
     synth2Freq=220,
     synth2Type=0,
-    synth2Color=0.5,
-    synth2Motion=0.25,
-    synth2Drive=1.4,
+    synth2Color=0.0,
+    synth2Motion=0.0,
+    synth2Drive=0.6,
     synth2Noise=0.0,
     synth2Click=0.0,
     synth2PwmWidth=0.35,
@@ -504,6 +610,7 @@ s.waitForBoot({
     var ampShapeA, ampShapeB, ringShapeA, ringShapeB;
     var mkBank, bankA, bankB;
     var filterEnv, filtFreq, filtRq, filtered, comb, folded, crushed, ds, bits, step;
+    var kickSubEnv, kickSubPitchEnv, kickSubSig, kickTransient;
 
     // synth2 internals
     var synth2PitchEnv, synth2Sig, synth2Attack;
@@ -587,18 +694,22 @@ s.waitForBoot({
     exciter = HPF.ar(exciter * excEnv * velocity, 25);
     exciter = tanh(exciter * drive);
 
-    modelPartialsA = Select.kr(model.clip(0, 3), [
+    modelPartialsA = Select.kr(model.clip(0, 5), [
         [1.00, 2.76, 5.40, 8.93, 13.34, 18.64, 24.83, 31.92, 39.91, 48.80, 58.59, 69.28],
+        [1.00, 3.98, 9.18, 16.55, 25.90, 37.25, 50.55, 65.80, 83.00, 102.20, 123.30, 146.40],
+        [1.00, 1.59, 2.14, 2.30, 2.92, 3.45, 3.92, 4.50, 5.10, 5.76, 6.35, 6.98],
         [1.00, 1.63, 2.31, 2.92, 3.58, 4.21, 4.86, 5.53, 6.19, 6.88, 7.56, 8.24],
         [1.00, 2.01, 2.97, 4.11, 5.43, 6.80, 8.21, 9.69, 11.20, 12.78, 14.40, 16.05],
-        [1.00, 1.59, 2.14, 2.30, 2.92, 3.45, 3.92, 4.50, 5.10, 5.76, 6.35, 6.98]
+        [1.00, 2.00, 3.00, 4.00, 5.00, 6.00, 7.00, 8.00, 9.00, 10.00, 11.00, 12.00]
     ]);
 
-    modelPartialsB = Select.kr(model.clip(0, 3), [
+    modelPartialsB = Select.kr(model.clip(0, 5), [
         [1.00, 3.99, 9.30, 16.71, 26.22, 37.83, 51.54, 67.35, 85.26, 105.27, 127.38, 151.59],
+        [1.00, 3.91, 8.86, 15.78, 24.62, 35.40, 48.10, 62.72, 79.28, 97.80, 118.30, 140.80],
+        [0.84, 1.28, 1.83, 2.41, 2.77, 3.18, 3.74, 4.12, 4.69, 5.31, 5.89, 6.42],
         [1.00, 1.41, 1.99, 2.58, 3.16, 3.73, 4.33, 4.91, 5.51, 6.11, 6.72, 7.34],
         [0.50, 1.34, 2.72, 3.88, 5.02, 6.17, 7.51, 8.93, 10.40, 11.94, 13.53, 15.18],
-        [0.84, 1.28, 1.83, 2.41, 2.77, 3.18, 3.74, 4.12, 4.69, 5.31, 5.89, 6.42]
+        [1.00, 2.01, 3.01, 4.02, 5.03, 6.03, 7.04, 8.05, 9.05, 10.06, 11.07, 12.08]
     ]);
 
     strikeShape = Array.fill(numModes, { |i|
@@ -616,32 +727,40 @@ s.waitForBoot({
         (1.0 - (norm * 0.35)).clip(0.25, 1.0)
     });
 
-    ampShapeA = Select.kr(model.clip(0, 3), [
+    ampShapeA = Select.kr(model.clip(0, 5), [
         [1.00, 0.80, 0.65, 0.52, 0.42, 0.34, 0.28, 0.23, 0.19, 0.16, 0.13, 0.11],
+        [1.00, 0.32, 0.20, 0.14, 0.10, 0.075, 0.055, 0.041, 0.031, 0.024, 0.019, 0.015],
+        [1.00, 0.52, 0.84, 0.46, 0.58, 0.36, 0.28, 0.23, 0.19, 0.16, 0.14, 0.12],
         [1.00, 0.94, 0.88, 0.80, 0.72, 0.66, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36],
         [1.00, 0.85, 0.76, 0.88, 0.70, 0.60, 0.52, 0.46, 0.40, 0.35, 0.31, 0.28],
-        [1.00, 0.52, 0.84, 0.46, 0.58, 0.36, 0.28, 0.23, 0.19, 0.16, 0.14, 0.12]
+        [1.00, 0.78, 0.54, 0.42, 0.34, 0.28, 0.22, 0.18, 0.15, 0.12, 0.10, 0.08]
     ]);
 
-    ampShapeB = Select.kr(model.clip(0, 3), [
+    ampShapeB = Select.kr(model.clip(0, 5), [
         [0.42, 0.34, 0.27, 0.22, 0.18, 0.15, 0.12, 0.10, 0.085, 0.072, 0.061, 0.052],
+        [0.22, 0.09, 0.055, 0.034, 0.022, 0.016, 0.012, 0.009, 0.007, 0.005, 0.004, 0.003],
+        [0.54, 0.38, 0.42, 0.28, 0.24, 0.20, 0.17, 0.145, 0.125, 0.108, 0.094, 0.082],
         [0.65, 0.60, 0.56, 0.52, 0.47, 0.43, 0.39, 0.35, 0.31, 0.28, 0.25, 0.22],
         [0.32, 0.44, 0.52, 0.46, 0.39, 0.34, 0.30, 0.26, 0.23, 0.20, 0.18, 0.16],
-        [0.54, 0.38, 0.42, 0.28, 0.24, 0.20, 0.17, 0.145, 0.125, 0.108, 0.094, 0.082]
+        [0.55, 0.40, 0.31, 0.24, 0.19, 0.15, 0.12, 0.095, 0.076, 0.060, 0.048, 0.038]
     ]);
 
-    ringShapeA = Select.kr(model.clip(0, 3), [
+    ringShapeA = Select.kr(model.clip(0, 5), [
         [1.00, 0.90, 0.82, 0.75, 0.69, 0.63, 0.58, 0.53, 0.49, 0.45, 0.41, 0.38],
+        [1.00, 0.50, 0.36, 0.28, 0.22, 0.18, 0.15, 0.13, 0.11, 0.095, 0.083, 0.072],
+        [1.00, 0.78, 0.68, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36, 0.33, 0.30, 0.27],
         [1.00, 0.97, 0.94, 0.91, 0.88, 0.84, 0.80, 0.76, 0.72, 0.68, 0.64, 0.60],
         [1.00, 1.00, 0.98, 0.97, 0.95, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82],
-        [1.00, 0.78, 0.68, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36, 0.33, 0.30, 0.27]
+        [1.00, 0.94, 0.88, 0.80, 0.73, 0.66, 0.60, 0.54, 0.49, 0.44, 0.40, 0.36]
     ]);
 
-    ringShapeB = Select.kr(model.clip(0, 3), [
+    ringShapeB = Select.kr(model.clip(0, 5), [
         [0.55, 0.48, 0.42, 0.37, 0.33, 0.29, 0.26, 0.23, 0.21, 0.19, 0.17, 0.15],
+        [0.30, 0.14, 0.08, 0.052, 0.036, 0.026, 0.020, 0.015, 0.012, 0.009, 0.007, 0.006],
+        [0.42, 0.39, 0.36, 0.33, 0.30, 0.27, 0.24, 0.22, 0.20, 0.18, 0.16, 0.145],
         [0.78, 0.76, 0.74, 0.72, 0.69, 0.66, 0.63, 0.60, 0.57, 0.54, 0.51, 0.48],
         [0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80, 0.78, 0.76, 0.74, 0.72, 0.70],
-        [0.42, 0.39, 0.36, 0.33, 0.30, 0.27, 0.24, 0.22, 0.20, 0.18, 0.16, 0.145]
+        [0.66, 0.55, 0.46, 0.38, 0.31, 0.26, 0.22, 0.18, 0.15, 0.12, 0.10, 0.08]
     ]);
 
     mkBank = { |partials, ampShape, ringShape, bankLevel=1.0, bankDetune=0.0|
@@ -681,14 +800,14 @@ s.waitForBoot({
     synth2SharedBody = body.clip(0, 1);
     synth2SharedColor = ((synth2Color * 0.62) + (synth2SharedBright * 0.38)).clip(0, 1);
 
-    synth2ModelBodyMul1 = Select.kr(model.clip(0, 3), [1.15, 1.80, 2.30, 0.94]);
-    synth2ModelBodyMul2 = Select.kr(model.clip(0, 3), [0.78, 3.40, 4.70, 1.65]);
-    synth2ModelBodyRq1  = Select.kr(model.clip(0, 3), [0.22, 0.34, 0.16, 0.42]);
-    synth2ModelBodyRq2  = Select.kr(model.clip(0, 3), [0.18, 0.42, 0.14, 0.36]);
+    synth2ModelBodyMul1 = Select.kr(model.clip(0, 5), [1.15, 3.95, 0.94, 1.80, 2.30, 1.00]);
+    synth2ModelBodyMul2 = Select.kr(model.clip(0, 5), [0.78, 8.95, 1.65, 3.40, 4.70, 2.00]);
+    synth2ModelBodyRq1  = Select.kr(model.clip(0, 5), [0.22, 0.18, 0.42, 0.34, 0.16, 0.12]);
+    synth2ModelBodyRq2  = Select.kr(model.clip(0, 5), [0.18, 0.14, 0.36, 0.42, 0.14, 0.10]);
 
-    synth2ModelAirMul = Select.kr(model.clip(0, 3), [4.6, 6.2, 7.8, 3.8]);
-    synth2ModelAirRq  = Select.kr(model.clip(0, 3), [0.34, 0.28, 0.22, 0.40]);
-    synth2ModelToneMul = Select.kr(model.clip(0, 3), [3.2, 4.4, 5.0, 2.9]);
+    synth2ModelAirMul = Select.kr(model.clip(0, 5), [4.6, 5.2, 3.8, 6.2, 7.8, 4.2]);
+    synth2ModelAirRq  = Select.kr(model.clip(0, 5), [0.34, 0.28, 0.40, 0.28, 0.22, 0.30]);
+    synth2ModelToneMul = Select.kr(model.clip(0, 5), [3.2, 4.0, 2.9, 4.4, 5.0, 3.6]);
 
 
 
@@ -700,18 +819,22 @@ s.waitForBoot({
     toneFollowAmt = synth2ToneFollow.clip(0, 1);
 
 
-	synth2BorrowPartialsA = Select.kr(model.clip(0, 3), [
+	synth2BorrowPartialsA = Select.kr(model.clip(0, 5), [
         [1.00, 2.76, 5.40, 8.93],
+        [1.00, 3.98, 9.18, 16.55],
+        [1.00, 1.59, 2.14, 2.30],
         [1.00, 1.63, 2.31, 2.92],
         [1.00, 2.01, 2.97, 4.11],
-        [1.00, 1.59, 2.14, 2.30]
+        [1.00, 2.00, 3.00, 4.00]
     ]);
 
-    synth2BorrowPartialsB = Select.kr(model.clip(0, 3), [
+    synth2BorrowPartialsB = Select.kr(model.clip(0, 5), [
         [1.00, 3.99, 9.30, 16.71],
+        [1.00, 3.91, 8.86, 15.78],
+        [0.84, 1.28, 1.83, 2.41],
         [1.00, 1.41, 1.99, 2.58],
         [0.50, 1.34, 2.72, 3.88],
-        [0.84, 1.28, 1.83, 2.41]
+        [1.00, 2.01, 3.01, 4.02]
     ]);
 
     synth2BorrowMix = glueAmt.linlin(0, 1, 0.08, 0.42).clip(0.05, 0.50);
@@ -855,8 +978,8 @@ s.waitForBoot({
             3, {
                 noiseSrc = PinkNoise.ar(0.7 + (synth2Noise.abs * 0.6));
 
-                formModel1 = Select.kr(model.clip(0, 3), [0.95, 1.15, 1.30, 0.85]);
-                formModel2 = Select.kr(model.clip(0, 3), [0.95, 1.12, 1.25, 0.90]);
+                formModel1 = Select.kr(model.clip(0, 5), [0.95, 1.05, 0.85, 1.15, 1.30, 1.00]);
+                formModel2 = Select.kr(model.clip(0, 5), [0.95, 1.08, 0.90, 1.12, 1.25, 1.05]);
 
                 form1 = (
                     synth2FormantMorph.clip(0, 1).linexp(0, 1, 350, 1100)
@@ -1050,7 +1173,7 @@ s.waitForBoot({
         synth2Tail = LPF.ar(
         synth2Tail,
         (
-            Select.kr(model.clip(0, 3), [9000, 12000, 15000, 7000])
+            Select.kr(model.clip(0, 5), [9000, 8500, 7000, 12000, 15000, 10000])
             * (0.65 + (effBright * 0.55))
             * synth2TailTypeBright.linlin(0.62, 1.30, 0.82, 1.18)
         ).clip(1200, 18000)
@@ -1059,7 +1182,7 @@ s.waitForBoot({
     synth2Tail = HPF.ar(
         synth2Tail,
         (
-            Select.kr(model.clip(0, 3), [80, 120, 150, 55])
+            Select.kr(model.clip(0, 5), [80, 60, 55, 120, 150, 70])
             + (damp * 60)
             + synth2TailTypeBright.linlin(0.62, 1.30, 20, -10)
         ).clip(30, 500)
@@ -1069,22 +1192,26 @@ s.waitForBoot({
 
     synth2Sig = (synth2Sig + (synth2Tail * 0.75)) * 0.88;
 
-    modelBase1 = Select.kr(model.clip(0, 3), [
-        synth2BodyFreq * 1.05,   // bar
-        synth2BodyFreq * 1.75,   // plate
-        synth2BodyFreq * 2.25,   // bell
-        synth2BodyFreq * 0.95    // drum
+    modelBase1 = Select.kr(model.clip(0, 5), [
+        synth2BodyFreq * 1.05,
+        synth2BodyFreq * 3.95,
+        synth2BodyFreq * 0.95,
+        synth2BodyFreq * 1.75,
+        synth2BodyFreq * 2.25,
+        synth2BodyFreq * 1.00
     ]);
 
-    modelBase2 = Select.kr(model.clip(0, 3), [
+    modelBase2 = Select.kr(model.clip(0, 5), [
         synth2BodyFreq * 2.20,
+        synth2BodyFreq * 8.95,
+        synth2BodyFreq * 1.55,
         synth2BodyFreq * 3.30,
         synth2BodyFreq * 4.60,
-        synth2BodyFreq * 1.55
+        synth2BodyFreq * 2.00
     ]);
 
-    modelRQ1 = Select.kr(model.clip(0, 3), [0.22, 0.30, 0.16, 0.38]);
-    modelRQ2 = Select.kr(model.clip(0, 3), [0.18, 0.36, 0.14, 0.30]);
+    modelRQ1 = Select.kr(model.clip(0, 5), [0.22, 0.18, 0.38, 0.30, 0.16, 0.12]);
+    modelRQ2 = Select.kr(model.clip(0, 5), [0.18, 0.14, 0.30, 0.36, 0.14, 0.10]);
 
     contour1 = BPF.ar(synth2Sig, modelBase1.clip(70, 14000), modelRQ1, 0.55 + (body * 0.55));
     contour2 = BPF.ar(synth2Sig, modelBase2.clip(120, 16000), modelRQ2, 0.30 + (effBright * 0.35));
@@ -1113,18 +1240,22 @@ s.waitForBoot({
         bodyGlueAmt.linlin(0, 1, -1, 1)
     );
 
-    modelLPF = Select.kr(model.clip(0, 3), [
-        9000,   // bar
-        12000,  // plate
-        15000,  // bell
-        7000    // drum
+    modelLPF = Select.kr(model.clip(0, 5), [
+        9000,
+        8500,
+        7000,
+        12000,
+        15000,
+        10000
     ]) * (0.65 + (effBright * 0.55));
 
-    modelHPF = Select.kr(model.clip(0, 3), [
-        80,   // bar
-        120,  // plate
-        150,  // bell
-        55    // drum
+    modelHPF = Select.kr(model.clip(0, 5), [
+        80,
+        60,
+        55,
+        120,
+        150,
+        70
     ]) + (damp * 60);
 
     synth2Sig = LPF.ar(synth2Contoured, modelLPF.clip(1200, 18000));
@@ -1141,14 +1272,38 @@ s.waitForBoot({
     bodyBaseFreq = baseFreq;
     };
 
-    bodySig = SelectX.ar(model.clip(0, 3), [
+    bodySig = SelectX.ar(model.clip(0, 5), [
         BPF.ar(sig, bodyBaseFreq * 1.15, 0.22, body * 0.24) + BPF.ar(sig, bodyBaseFreq * 0.78, 0.18, body * 0.12),
+        BPF.ar(sig, bodyBaseFreq * 3.95, 0.18, body * 0.16) + BPF.ar(sig, bodyBaseFreq * 8.95, 0.14, body * 0.08),
+        BPF.ar(sig, bodyBaseFreq * 0.94, 0.42, body * 0.34) + BPF.ar(sig, bodyBaseFreq * 1.65, 0.36, body * 0.18),
         BPF.ar(sig, bodyBaseFreq * 1.8, 0.34, body * 0.16) + BPF.ar(sig, bodyBaseFreq * 3.4, 0.42, body * 0.12),
         BPF.ar(sig, bodyBaseFreq * 2.3, 0.16, body * 0.14) + BPF.ar(sig, bodyBaseFreq * 4.7, 0.14, body * 0.10),
-        BPF.ar(sig, bodyBaseFreq * 0.94, 0.42, body * 0.34) + BPF.ar(sig, bodyBaseFreq * 1.65, 0.36, body * 0.18)
+        BPF.ar(sig, bodyBaseFreq * 1.00, 0.12, body * 0.20) + BPF.ar(sig, bodyBaseFreq * 2.00, 0.10, body * 0.12)
     ]);
 
     sig = (sig + (bodySig * 0.72)) * 0.90;
+
+    kickSubPitchEnv = EnvGen.kr(
+        Env(
+            [1 + kickPunch.clip(0, 4), 1],
+            [(kickSubDecay.clip(0.05, 4.0) * 0.08).clip(0.004, 0.32)],
+            curve: -7
+        )
+    );
+    kickSubEnv = EnvGen.kr(Env.perc(0.001, kickSubDecay.clip(0.05, 4.0), curve: -5));
+    kickSubSig = SinOsc.ar((freq * kickSubPitchEnv).clip(20, 180)) * kickSubEnv;
+    kickSubSig = kickSubSig + (
+        SinOsc.ar((freq * 2.0 * kickSubPitchEnv).clip(30, 360))
+        * kickSubEnv
+        * kickPunch.clip(0, 1)
+        * 0.18
+    );
+    kickSubSig = tanh(kickSubSig * (1 + (kickDrive.clip(0, 1) * 18)));
+    kickTransient = HPF.ar(
+        Decay2.ar(Impulse.ar(0), 0.0002, 0.004) * kickClick.clip(0, 1),
+        1500
+    );
+    sig = sig + ((kickSubSig + kickTransient) * kickSubAmt.clip(0, 1) * velocity.linlin(0, 1, 0.4, 1.0));
 
     filtFreq = (filterCutoff.clip(0, 1).linexp(0, 1, 120, 16000) * filterEnv).clip(40, 20000);
     filtRq = filterRes.clip(0.01, 0.98).linlin(0.01, 0.98, 0.95, 0.08);
@@ -1173,7 +1328,7 @@ s.waitForBoot({
 
     sig = LeakDC.ar(sig);
     sig = tanh(sig * (1 + (drive * 0.5)));
-    sig = tanh(sig * edgeDrive.clip(0.5, 8.0));
+    sig = tanh(sig * edgeDrive.clip(1.0, 8.0));
 
     folded = Fold.ar(sig * (1 + (foldAmt.clip(0, 1) * 6)), -1, 1);
     sig = SelectX.ar(foldAmt.clip(0, 1), [sig, folded]);
@@ -1208,7 +1363,6 @@ s.waitForBoot({
         plonkBuildVoiceDef.(\plonkV520AssistPWM, 1);
         plonkBuildVoiceDef.(\plonkV520AssistRing, 2);
         plonkBuildVoiceDef.(\plonkV520AssistVowel, 3);
-        plonkBuildVoiceDef.(\plonkV520, -1);
 
 
 		SynthDef(\plonkV520MasterOut, {
@@ -1270,7 +1424,9 @@ AppClock.sched(0.1, {
     if(~plonkInitMixer.notNil) {
         ~plonkInitMixer.();
     };
-    "Loaded Plonk voice variants.".postln;
+    if(~plonkDebug) {
+        "Loaded Plonk voice variants.".postln;
+    };
     nil
 });
 
@@ -1280,6 +1436,13 @@ AppClock.sched(0.1, {
     ~plonkTrackCount = 4;
     ~plonkTrackNames = ["Kick", "Snare", "Hat", "Perc"];
     ~plonkSelectedTrack = 0;
+    ~plonkTrackSoundDirFor = { |trackIdx|
+        ~plonkSoundRootDir +/+ ~plonkTrackNames[trackIdx.asInteger.clip(0, ~plonkTrackCount - 1)]
+    };
+    ~plonkTrackSoundDirs = Array.fill(~plonkTrackCount, { |i| ~plonkTrackSoundDirFor.(i) });
+    ~plonkTrackSoundDirs.do { |dir| ~plonkEnsureDir.(dir) };
+    ~plonkTrackDefaultNames = Array.fill(~plonkTrackCount, { nil });
+    ~plonkTrackDefaultStates = Array.fill(~plonkTrackCount, { nil });
 
     ~plonkMakeTrackState = { |which=0|
         var st;
@@ -1288,58 +1451,141 @@ AppClock.sched(0.1, {
             freq: 220, amp: 0.24, pan: 0, velocity: 0.90,
             model: 0, exciterType: 0,
             brightness: 0.65, material: 0.55, inharm: 0.22, position: 0.22,
-            decay: 1.2, body: 0.45, damp: 0.25, drive: 1.15, tone: 0.58,
+            decay: 1.2, body: 0.45, damp: 0.25, drive: 1.0, tone: 0.58,
             noiseAmt: 0.32, clickAmt: 0.82, excDecay: 0.025, detune: 0.0025, spread: 1.0,
             pitchEnvAmt: 0.0, pitchEnvDecay: 0.03,
-            velToBright: 0.35, velToDecay: 0.20, velToNoise: 0.20, velToClick: 0.20, filterMode: 0,
-			filterCutoff: 0.65, filterRes: 0.25, filterEnvAmt: 0.35, filterEnvDecay: 0.08, combAmt: 0.0,
-			combTime: 0.008, combDecay: 0.18, edgeDrive: 1.0, foldAmt: 0.0, presence: 0.0, crushMix: 0.0,
-			bitDepth: 12, downsample: 1
+            velToBright: 0.0, velToDecay: 0.0, velToNoise: 0.0, velToClick: 0.0, filterMode: 0,
+				filterCutoff: 1.0, filterRes: 0.01, filterEnvAmt: 0.0, filterEnvDecay: 0.08, combAmt: 0.0,
+				combTime: 0.008, combDecay: 0.18, edgeDrive: 1.0, foldAmt: 0.0, presence: 0.0, crushMix: 0.0,
+				bitDepth: 16, downsample: 1,
+            kickSubAmt: 0.0, kickSubDecay: 0.8, kickPunch: 0.0, kickDrive: 0.0, kickClick: 0.0
         );
 
         switch(which,
             0, {
-    st.putAll((
-        model: 3, exciterType: 1, amp: 0.17,
-        brightness: 0.22, material: 0.30, inharm: 0.08, position: 0.18,
-        decay: 0.95, body: 0.90, damp: 0.42, drive: 1.28, tone: 0.28,
-        noiseAmt: 0.12, clickAmt: 0.88, excDecay: 0.018, detune: 0.0012,
-        pitchEnvAmt: 0.18, pitchEnvDecay: 0.028
-    ));
-},
-1, {
-    st.putAll((
-        model: 1, exciterType: 4, amp: 0.15,
-        brightness: 0.78, material: 0.82, inharm: 0.24, position: 0.29,
-        decay: 0.78, body: 0.32, damp: 0.24, drive: 1.08, tone: 0.76,
-        noiseAmt: 0.34, clickAmt: 0.66, excDecay: 0.020, detune: 0.0020,
-        pitchEnvAmt: 0.02, pitchEnvDecay: 0.020
-    ));
-},
-2, {
-    st.putAll((
-        model: 2, exciterType: 5, amp: 0.08,
-        brightness: 0.95, material: 0.96, inharm: 0.36, position: 0.09,
-        decay: 0.22, body: 0.08, damp: 0.15, drive: 1.02, tone: 0.92,
-        noiseAmt: 0.22, clickAmt: 1.10, excDecay: 0.006, detune: 0.0008,
-        pitchEnvAmt: 0.0, pitchEnvDecay: 0.012
-    ));
-},
-3, {
-    st.putAll((
-        model: 0, exciterType: 2, amp: 0.11,
-        brightness: 0.58, material: 0.68, inharm: 0.18, position: 0.36,
-        decay: 0.55, body: 0.42, damp: 0.28, drive: 1.10, tone: 0.52,
-        noiseAmt: 0.26, clickAmt: 0.74, excDecay: 0.012, detune: 0.0015,
-        pitchEnvAmt: 0.05, pitchEnvDecay: 0.022
-    ));
-}
+	    st.putAll((
+	        model: 2, exciterType: 0, freq: 54, amp: 0.18,
+	        brightness: 0.24, material: 0.38, inharm: 0.08, position: 0.20,
+	        decay: 1.05, body: 0.92, damp: 0.48, drive: 1.0, tone: 0.30,
+	        noiseAmt: 0.06, clickAmt: 0.62, excDecay: 0.014, detune: 0.0006,
+	        pitchEnvAmt: 0.78, pitchEnvDecay: 0.070,
+	        filterCutoff: 0.82, filterRes: 0.08,
+	        kickSubAmt: 0.0, kickSubDecay: 0.8, kickPunch: 0.0, kickDrive: 0.0, kickClick: 0.0
+	    ));
+	},
+		1, {
+		    st.putAll((
+		        model: 3, exciterType: 4, freq: 180, amp: 0.16,
+		        brightness: 0.88, material: 0.35, inharm: 0.08, position: 0.18,
+		        decay: 0.22, body: 0.52, damp: 0.68, drive: 1.0, tone: 0.90,
+		        noiseAmt: 1.15, clickAmt: 1.20, excDecay: 0.040, detune: 0.0012,
+		        pitchEnvAmt: 0.28, pitchEnvDecay: 0.018,
+		        filterMode: 2, filterCutoff: 0.72, filterRes: 0.18
+		    ));
+		},
+			2, {
+			    st.putAll((
+			        model: 4, exciterType: 3, freq: 10000, amp: 0.065,
+			        brightness: 1.0, material: 0.92, inharm: 0.80, position: 0.035,
+			        decay: 0.075, body: 0.015, damp: 0.88, drive: 1.0, tone: 1.0,
+			        noiseAmt: 1.20, clickAmt: 0.52, excDecay: 0.006, detune: 0.0005,
+		        pitchEnvAmt: 0.0, pitchEnvDecay: 0.012,
+		        filterMode: 1, filterCutoff: 0.82, filterRes: 0.06,
+		        edgeDrive: 1.0, presence: 0.0
+		    ));
+		},
+	3, {
+	    st.putAll((
+	        model: 1, exciterType: 0, freq: 260, amp: 0.11,
+	        brightness: 0.46, material: 0.42, inharm: 0.18, position: 0.34,
+	        decay: 0.46, body: 0.56, damp: 0.30, drive: 1.0, tone: 0.46,
+	        noiseAmt: 0.14, clickAmt: 0.54, excDecay: 0.012, detune: 0.0010,
+	        pitchEnvAmt: 0.12, pitchEnvDecay: 0.035,
+	        filterCutoff: 0.92, filterRes: 0.06
+	    ));
+	}
         );
 
         st;
     };
 
-    ~plonkTrackStates = Array.fill(~plonkTrackCount, { |i| ~plonkMakeTrackState.(i) });
+    ~plonkFactoryTrackSoundName = { |trackIdx|
+        ~plonkTrackNames[trackIdx.asInteger.clip(0, ~plonkTrackCount - 1)] ++ " Factory"
+    };
+
+    ~plonkMergedTrackState = { |trackIdx, savedState|
+        var merged = ~plonkMakeTrackState.(trackIdx.asInteger.clip(0, ~plonkTrackCount - 1));
+        if(savedState.notNil) {
+            merged.putAll(savedState.copy);
+        };
+        merged;
+    };
+
+    ~plonkLoadTrackDefaultsArchive = {
+        var obj = nil;
+        var names, states;
+
+        ~plonkTrackDefaultNames = Array.fill(~plonkTrackCount, { nil });
+        ~plonkTrackDefaultStates = Array.fill(~plonkTrackCount, { nil });
+
+        if(File.exists(~plonkTrackDefaultsPath)) {
+            obj = try {
+                Object.readArchive(~plonkTrackDefaultsPath)
+            } { |err|
+                ("Failed to read track defaults: " ++ err).warn;
+                nil
+            };
+        };
+
+        if(obj.notNil) {
+            names = obj[\names];
+            states = obj[\states];
+            ~plonkTrackCount.do { |i|
+                if(names.notNil and: { i < names.size } and: { names[i].notNil }) {
+                    ~plonkTrackDefaultNames[i] = names[i].asString;
+                };
+                if(states.notNil and: { i < states.size } and: { states[i].notNil }) {
+                    ~plonkTrackDefaultStates[i] = states[i].copy;
+                };
+            };
+        };
+    };
+
+    ~plonkSaveTrackDefaultsArchive = {
+        (
+            names: Array.fill(~plonkTrackCount, { |i| ~plonkTrackDefaultNames[i] }),
+            states: Array.fill(~plonkTrackCount, { |i|
+                if(~plonkTrackDefaultStates[i].notNil) {
+                    ~plonkTrackDefaultStates[i].copy
+                }{
+                    nil
+                }
+            })
+        ).writeArchive(~plonkTrackDefaultsPath);
+    };
+
+    ~plonkResolvedTrackDefaultName = { |trackIdx|
+        var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+        var name = ~plonkTrackDefaultNames[idx];
+        if(name.isNil or: { name.asString.size == 0 }) {
+            ~plonkFactoryTrackSoundName.(idx)
+        }{
+            name.asString
+        }
+    };
+
+    ~plonkResolvedTrackDefaultState = { |trackIdx|
+        var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+        var savedState = ~plonkTrackDefaultStates[idx];
+        if(savedState.notNil) {
+            ~plonkMergedTrackState.(idx, savedState)
+        }{
+            ~plonkMakeTrackState.(idx)
+        }
+    };
+
+    ~plonkLoadTrackDefaultsArchive.();
+    ~plonkTrackStates = Array.fill(~plonkTrackCount, { |i| ~plonkResolvedTrackDefaultState.(i) });
 
 	    ~plonkMixer = (
     tracks: Array.fill(~plonkTrackCount, {
@@ -1383,15 +1629,22 @@ AppClock.sched(0.1, {
     );
 
     ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+    ~plonkAudioDesiredState = ~plonkAudioState.copy;
     ~plonkAudioApplyInProgress = false;
+    ~plonkAudioApplyGeneration = 0;
     ~plonkAudioBootTimeout = 8.0;
 
 
 
 
     ~plonkAudioDevices = Array.new;
+    ~plonkAudioOutDevices = Array.new;
+    ~plonkAudioInDevices = Array.new;
     ~plonkAudioOutMenu = nil;
     ~plonkAudioInMenu = nil;
+    ~plonkAudioSrBox = nil;
+    ~plonkAudioOutChBox = nil;
+    ~plonkAudioInChBox = nil;
     ~plonkAudioStatus = nil;
 
     ~plonkNormalizeAudioState = { |state|
@@ -1402,6 +1655,7 @@ AppClock.sched(0.1, {
         sr = (state[\sampleRate] ? 48000).asInteger.clip(8000, 192000);
         outCh = (state[\numOutChannels] ? 2).asInteger.clip(2, 128);
         inCh = (state[\numInChannels] ? 0).asInteger.clip(0, 128);
+        if(inCh == 0) { inName = "" };
 
         (
             outDevice: outName,
@@ -1438,6 +1692,30 @@ AppClock.sched(0.1, {
         if(name == "") { "System Default" } { name };
     };
 
+    ~plonkAudioDeviceIndex = { |devices, name|
+        var target = (name ? "").asString;
+        if(target == "") {
+            nil
+        }{
+            devices.asArray.detectIndex { |deviceName|
+                deviceName.asString == target
+            }
+        }
+    };
+
+    ~plonkAudioDeviceExists = { |devices, name|
+        ~plonkAudioDeviceIndex.(devices, name).notNil
+    };
+
+    ~plonkAudioInputLabel = { |state|
+        var normalized = ~plonkNormalizeAudioState.(state);
+        if((normalized[\numInChannels] ? 0) == 0) {
+            "No audio input"
+        }{
+            ~plonkAudioDeviceLabel.(normalized[\inDevice])
+        }
+    };
+
     ~plonkSetServerAudioOptions = { |state|
         var normalized = ~plonkNormalizeAudioState.(state);
         var outName = normalized[\outDevice];
@@ -1449,7 +1727,7 @@ AppClock.sched(0.1, {
         s.options.numOutputBusChannels = normalized[\numOutChannels];
         s.options.numInputBusChannels = normalized[\numInChannels];
         s.options.outDevice = if(outName == "") { nil } { outName };
-        s.options.inDevice = if(inName == "") { nil } { inName };
+        s.options.inDevice = if((normalized[\numInChannels] == 0) or: { inName == "" }) { nil } { inName };
     };
 
     ~plonkValidateAudioState = { |state|
@@ -1460,11 +1738,11 @@ AppClock.sched(0.1, {
 
         ~plonkRefreshAudioDevices.();
 
-        if((outName != "") and: { ~plonkAudioDevices.includes(outName).not }) {
+        if((outName != "") and: { ~plonkAudioDeviceExists.(~plonkAudioOutDevices, outName).not }) {
             err = "Output device not found: " ++ outName;
         };
 
-        if(err.isNil and: { (inName != "") and: { ~plonkAudioDevices.includes(inName).not } }) {
+        if(err.isNil and: { (normalized[\numInChannels] > 0) and: { (inName != "") and: { ~plonkAudioDeviceExists.(~plonkAudioInDevices, inName).not } } }) {
             err = "Input device not found: " ++ inName;
         };
 
@@ -1477,12 +1755,18 @@ AppClock.sched(0.1, {
 
     ~plonkRefreshAudioDevices = {
         var devs = ServerOptions.devices;
+        var outDevs = ServerOptions.outDevices;
+        var inDevs = ServerOptions.inDevices;
         if(devs.isNil) { devs = [] };
+        if(outDevs.isNil) { outDevs = devs };
+        if(inDevs.isNil) { inDevs = devs };
         ~plonkAudioDevices = devs.asArray.collect(_.asString).sort;
+        ~plonkAudioOutDevices = outDevs.asArray.collect(_.asString).sort;
+        ~plonkAudioInDevices = inDevs.asArray.collect(_.asString).sort;
     };
 
     ~plonkRefreshAudioMenus = {
-        var outIdx, inIdx;
+        var outIdx, inIdx, displayState;
 
         if(~plonkAudioApplyInProgress) {
             if(~plonkAudioStatus.notNil) {
@@ -1492,28 +1776,35 @@ AppClock.sched(0.1, {
 	    ~plonkSyncAudioStateFromServer.();
         ~plonkAudioLastGoodState = ~plonkAudioState.copy;
 	    ~plonkRefreshAudioDevices.();
+        displayState = ~plonkNormalizeAudioState.(~plonkAudioDesiredState ? ~plonkAudioState);
 
             if(~plonkAudioOutMenu.notNil) {
-                ~plonkAudioOutMenu.items_(["System Default"] ++ ~plonkAudioDevices);
-                outIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\outDevice]);
+                ~plonkAudioOutMenu.items_(["System Default"] ++ ~plonkAudioOutDevices);
+                outIdx = ~plonkAudioDeviceIndex.(~plonkAudioOutDevices, displayState[\outDevice]);
                 if(outIdx.isNil) { outIdx = -1 };
                 ~plonkAudioOutMenu.value_(outIdx + 1);
             };
 
             if(~plonkAudioInMenu.notNil) {
-                ~plonkAudioInMenu.items_(["System Default"] ++ ~plonkAudioDevices);
-                inIdx = ~plonkAudioDevices.indexOf(~plonkAudioState[\inDevice]);
+                ~plonkAudioInMenu.items_(["System Default"] ++ ~plonkAudioInDevices);
+                inIdx = ~plonkAudioDeviceIndex.(~plonkAudioInDevices, displayState[\inDevice]);
                 if(inIdx.isNil) { inIdx = -1 };
                 ~plonkAudioInMenu.value_(inIdx + 1);
             };
 
+            if(~plonkAudioSrBox.notNil) { ~plonkAudioSrBox.value_(displayState[\sampleRate]) };
+            if(~plonkAudioOutChBox.notNil) { ~plonkAudioOutChBox.value_(displayState[\numOutChannels]) };
+            if(~plonkAudioInChBox.notNil) { ~plonkAudioInChBox.value_(displayState[\numInChannels]) };
+
             if(~plonkAudioStatus.notNil) {
                 ~plonkAudioStatus.string_(
-                    "Out: " ++ ~plonkAudioDeviceLabel.(~plonkAudioState[\outDevice])
-                    ++ " | In: " ++ ~plonkAudioDeviceLabel.(~plonkAudioState[\inDevice])
-                    ++ " | SR: " ++ ~plonkAudioState[\sampleRate].asString
-                    ++ " | OutCh: " ++ ~plonkAudioState[\numOutChannels].asString
-                    ++ " | InCh: " ++ ~plonkAudioState[\numInChannels].asString
+                    "Current Out: " ++ ~plonkAudioDeviceLabel.(~plonkAudioState[\outDevice])
+                    ++ " | Current In: " ++ ~plonkAudioInputLabel.(~plonkAudioState)
+                    ++ " | Pending Out: " ++ ~plonkAudioDeviceLabel.(displayState[\outDevice])
+                    ++ " | Pending In: " ++ ~plonkAudioInputLabel.(displayState)
+                    ++ " | SR: " ++ displayState[\sampleRate].asString
+                    ++ " | OutCh: " ++ displayState[\numOutChannels].asString
+                    ++ " | InCh: " ++ displayState[\numInChannels].asString
                 );
             };
         };
@@ -1526,6 +1817,7 @@ AppClock.sched(0.1, {
     ~plonkInstallMidi.();
     ~plonkSyncAudioStateFromServer.();
     ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+    ~plonkAudioDesiredState = ~plonkAudioState.copy;
     ~plonkRefreshAudioMenus.();
     ~plonkUpdateMidiSyncStatus.();
 
@@ -1534,20 +1826,25 @@ AppClock.sched(0.1, {
 	    };
 	};
 
-    ~plonkFinishAudioApplyFailure = { |reason|
-        ~plonkAudioApplyInProgress = false;
-        ~plonkAudioState = ~plonkAudioLastGoodState.copy;
-        ~plonkSetServerAudioOptions.(~plonkAudioLastGoodState);
-        ~plonkRefreshAudioMenus.();
+    ~plonkFinishAudioApplyFailure = { |reason, generation|
+        if(generation.isNil or: { generation == ~plonkAudioApplyGeneration }) {
+            ~plonkAudioApplyInProgress = false;
+            ~plonkAudioState = ~plonkAudioLastGoodState.copy;
+            ~plonkAudioDesiredState = ~plonkAudioLastGoodState.copy;
+            ~plonkSetServerAudioOptions.(~plonkAudioLastGoodState);
+            ~plonkRefreshAudioMenus.();
 
-        if(~plonkAudioStatus.notNil) {
-            ~plonkAudioStatus.string_(reason);
+            if(~plonkAudioStatus.notNil) {
+                ~plonkAudioStatus.string_(reason);
+            };
         };
     };
 
-    ~plonkFinishAudioApplySuccess = {
-        ~plonkAudioApplyInProgress = false;
-        ~plonkRebuildAfterAudioChange.();
+    ~plonkFinishAudioApplySuccess = { |generation|
+        if(generation.isNil or: { generation == ~plonkAudioApplyGeneration }) {
+            ~plonkAudioApplyInProgress = false;
+            ~plonkRebuildAfterAudioChange.();
+        };
     };
 
 	    ~plonkApplyAudioState = {
@@ -1558,7 +1855,7 @@ AppClock.sched(0.1, {
                     ~plonkAudioStatus.string_("Audio reboot already in progress.");
                 };
             }{
-                desired = ~plonkNormalizeAudioState.(~plonkAudioState);
+                desired = ~plonkNormalizeAudioState.(~plonkAudioDesiredState);
                 validation = ~plonkValidateAudioState.(desired);
 
                 if(validation.notNil) {
@@ -1571,6 +1868,7 @@ AppClock.sched(0.1, {
                     if(~plonkAudioStateEquals.(desired, current)) {
                         ~plonkAudioState = current.copy;
                         ~plonkAudioLastGoodState = current.copy;
+                        ~plonkAudioDesiredState = current.copy;
                         ~plonkRefreshAudioMenus.();
                         if(~plonkAudioStatus.notNil) {
                             ~plonkAudioStatus.string_("Audio settings unchanged.");
@@ -1578,6 +1876,7 @@ AppClock.sched(0.1, {
                     }{
                         ~plonkAudioLastGoodState = current.copy;
                         ~plonkAudioApplyInProgress = true;
+                        ~plonkAudioApplyGeneration = (~plonkAudioApplyGeneration ? 0) + 1;
 
                         ~plonkSeqStop.();
                         if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
@@ -1595,14 +1894,15 @@ AppClock.sched(0.1, {
                             var completed = false;
                             var startedAt = Main.elapsedTime;
                             var timeout = (~plonkAudioBootTimeout ? 8.0).asFloat;
+                            var applyGeneration = ~plonkAudioApplyGeneration;
 
                             s.reboot;
                             0.25.wait;
 
                             s.waitForBoot({
-                                if(completed.not) {
+                                if(completed.not and: { applyGeneration == ~plonkAudioApplyGeneration }) {
                                     completed = true;
-                                    { ~plonkFinishAudioApplySuccess.() }.defer;
+                                    { ~plonkFinishAudioApplySuccess.(applyGeneration) }.defer;
                                 };
                             });
 
@@ -1616,7 +1916,8 @@ AppClock.sched(0.1, {
                                 completed = true;
                                 {
                                     ~plonkFinishAudioApplyFailure.(
-                                        "Audio reboot failed. Restored last known settings."
+                                        "Audio reboot failed. Restored last known settings.",
+                                        applyGeneration
                                     );
                                 }.defer;
                             };
@@ -1630,6 +1931,7 @@ AppClock.sched(0.1, {
 
 	    ~plonkSyncAudioStateFromServer.();
         ~plonkAudioLastGoodState = ~plonkAudioState.copy;
+        ~plonkAudioDesiredState = ~plonkAudioState.copy;
 	    ~plonkRefreshAudioDevices.();
 
 
@@ -1639,13 +1941,19 @@ AppClock.sched(0.1, {
     // --------------------------------------------------------
     ~plonkMidiSync = (
     enabled: false,
+    inputMode: \none,
     sourceUID: nil,
     isPlaying: false,
     clockCount: 0,
     stepIndex: 0,
     clocksPerStep: 6,
+    clockPhase: 0,
+    resumePending: false,
+    songPos16ths: 0,
+    pendingSongPos16ths: nil,
     lastClockTime: nil,
-    secPerClock: (1 / 48)   // default fallback ~120 BPM
+    secPerClock: (1 / 48),   // default fallback ~120 BPM
+    clockDtHistory: List.new
 );
 
     ~plonkMidiSources = Array.new;
@@ -1660,19 +1968,28 @@ AppClock.sched(0.1, {
     var idx = 0;
 
     if(~plonkMidiSourceMenu.notNil) {
-        if(~plonkMidiSync[\sourceUID].notNil) {
+        if((~plonkMidiSync[\inputMode] ? \none) == \none) {
+            ~plonkMidiSourceMenu.value_(0);
+        }{
+            if((~plonkMidiSync[\inputMode] ? \none) == \any) {
+                ~plonkMidiSourceMenu.value_(1);
+            }{
             idx = ~plonkMidiSources.detectIndex { |ep| ep.uid == ~plonkMidiSync[\sourceUID] };
             if(idx.isNil) { idx = -1 };
-            ~plonkMidiSourceMenu.value_(idx + 1);
-        }{
-            ~plonkMidiSourceMenu.value_(0);
+                ~plonkMidiSourceMenu.value_(idx + 2);
+            };
         };
     };
 };
 
     ~plonkUpdateMidiSyncStatus = {
-        var srcLabel = "Any";
-        if(~plonkMidiSync[\sourceUID].notNil) {
+        var srcLabel = "No MIDI Input";
+        var stepLabel = ((~plonkMidiSync[\stepIndex] ? 0) + 1).asString;
+        var phaseLabel = (~plonkMidiSync[\clockPhase] ? 0).asString ++ "/" ++ (((~plonkMidiSync[\clocksPerStep] ? 6) - 1).max(0)).asString;
+        if((~plonkMidiSync[\inputMode] ? \none) == \any) {
+            srcLabel = "Any Source";
+        };
+        if((~plonkMidiSync[\inputMode] ? \none) == \source) {
             var match = ~plonkMidiSources.detect { |ep| ep.uid == ~plonkMidiSync[\sourceUID] };
             if(match.notNil) {
                 srcLabel = (match.device ? "Unknown") ++ " : " ++ (match.name ? "Unknown");
@@ -1688,6 +2005,9 @@ AppClock.sched(0.1, {
                 ++ " | Playing: "
                 ++ if(~plonkMidiSync[\isPlaying]) { "Yes" } { "No" }
                 ++ " | Source: " ++ srcLabel
+                ++ " | Step: " ++ stepLabel
+                ++ " | Cycle: " ++ (~plonkSeq[\cycleCount] ? 1).asString
+                ++ " | Phase: " ++ phaseLabel
             );
         };
     };
@@ -1697,6 +2017,32 @@ AppClock.sched(0.1, {
     // --------------------------------------------------------
     ~plonkVoices = List.new;
     ~plonkMaxVoices = 16;
+    ~plonkTrackChokeEnabled = [false, false, true, false];
+
+    ~plonkInvalidateScheduledTriggers = {
+        ~plonkTransportRunToken = (~plonkTransportRunToken ? 0) + 1;
+        ~plonkStepPrefire = Array.fill(~plonkTrackCount, {
+            (active: false, stepIndex: nil, didPlay: false)
+        });
+    };
+
+    ~plonkResetMidiClockTracking = {
+        ~plonkMidiSync[\clockCount] = 0;
+        ~plonkMidiSync[\clockPhase] = 0;
+        ~plonkMidiSync[\lastClockTime] = nil;
+        ~plonkMidiSync[\secPerClock] = (~plonkMidiSync[\secPerClock] ? (1 / 48));
+        ~plonkMidiSync[\clockDtHistory] = List.new;
+    };
+
+    ~plonkMidiStepSecs = {
+        (~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24
+    };
+
+    ~plonkTrackShouldChoke = { |trackIdx, voiceModelTag|
+        var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+        (~plonkTrackChokeEnabled.wrapAt(idx) ? false)
+        or: { [2, 3].includes(voiceModelTag) };
+    };
 
     ~plonkStealVoice = {
         if(~plonkVoices.size >= ~plonkMaxVoices) {
@@ -1705,16 +2051,30 @@ AppClock.sched(0.1, {
         };
     };
 
-    ~plonkChokeDrum = { |trackIdx|
-        ~plonkVoices.do { |entry|
-            if((entry[\model] == 3) and: { entry[\track] == trackIdx }) {
-                entry[\synth].set(\gate, 0);
-            };
-        };
-        ~plonkVoices = ~plonkVoices.select { |entry|
-            (entry[\model] != 3) or: { entry[\track] != trackIdx }
-        };
-    };
+	~plonkChokeDrum = { |trackIdx|
+        var chokeWholeTrack = (~plonkTrackChokeEnabled.wrapAt(trackIdx.asInteger.clip(0, ~plonkTrackCount - 1)) ? false);
+	    ~plonkVoices.do { |entry|
+	        if(
+                (entry[\track] == trackIdx) and:
+                {
+                    chokeWholeTrack or: { [2, 3].includes(entry[\model]) }
+                }
+            ) {
+	            entry[\synth].set(\gate, 0);
+	        };
+	    };
+	    ~plonkVoices = ~plonkVoices.select { |entry|
+	        if(entry[\track] != trackIdx) {
+                true
+            }{
+                if(chokeWholeTrack) {
+                    false
+                }{
+                    [2, 3].includes(entry[\model]).not
+                }
+            }
+	    };
+	};
 
 
 
@@ -1727,9 +2087,9 @@ AppClock.sched(0.1, {
     trackIdx = (args.removeAt(\trackIndex) ? -1).asInteger;
     voiceModelTag = (args.removeAt(\voiceModelTag) ? (args[\model] ? -999)).asInteger;
 
-    if((voiceModelTag == 3) and: { trackIdx >= 0 }) {
-        ~plonkChokeDrum.(trackIdx);
-    };
+	    if((trackIdx >= 0) and: { ~plonkTrackShouldChoke.(trackIdx, voiceModelTag) }) {
+	        ~plonkChokeDrum.(trackIdx);
+	    };
 
     if(~plonkMaster[\mixBus].isNil or: { ~plonkMaster[\synth].isNil }) {
     "Master bus missing, rebuilding.".warn;
@@ -1795,18 +2155,36 @@ args[\out] = outBus;
     // --------------------------------------------------------
     // sequencer / patterns / chain
     // --------------------------------------------------------
-~plonkLockKeys = [
-    \semi, \velocity, \decay, \brightness, \material, \inharm, \position,
-    \body, \damp, \drive, \tone, \noiseAmt, \clickAmt, \exciterType,
-    \model, \pitchEnvAmt, \pitchEnvDecay, \detune, \spread, \pan,
-    \filterMode, \filterCutoff, \filterRes, \filterEnvAmt, \filterEnvDecay,
-    \combAmt, \combTime, \combDecay,
-    \edgeDrive, \foldAmt, \presence,
-    \crushMix, \bitDepth, \downsample
-];
+	~plonkLockKeys = [
+	    \semi, \velocity, \decay, \brightness, \material, \inharm, \position,
+	    \body, \damp, \drive, \tone, \noiseAmt, \clickAmt, \exciterType,
+	    \model, \pitchEnvAmt, \pitchEnvDecay, \detune, \spread, \pan,
+	    \filterMode, \filterCutoff, \filterRes, \filterEnvAmt, \filterEnvDecay,
+	    \combAmt, \combTime, \combDecay,
+	    \edgeDrive, \foldAmt, \presence,
+	    \crushMix, \bitDepth, \downsample,
+	    \kickSubAmt, \kickSubDecay, \kickPunch, \kickDrive, \kickClick
+	];
 
-    ~makePlonkStep = { |on=0|
-        (
+	~plonkNeutralLockValue = { |key|
+	    switch(key,
+	        \drive, { 1.0 },
+	        \pitchEnvDecay, { 0.03 },
+	        \filterCutoff, { 1.0 },
+	        \filterRes, { 0.01 },
+	        \filterEnvDecay, { 0.08 },
+	        \combTime, { 0.008 },
+	        \combDecay, { 0.18 },
+	        \edgeDrive, { 1.0 },
+	        \bitDepth, { 16 },
+	        \downsample, { 1 },
+	        \kickSubDecay, { 0.8 },
+	        { 0 }
+	    )
+	};
+
+	    ~makePlonkStep = { |on=0|
+	        (
             on: on,
             prob: 1.0,
             ratchet: 1,
@@ -1815,13 +2193,14 @@ args[\out] = outBus;
             accent: 0.0,
             length: 1,
             tie: 0,
+            fixedPitch: 0,
             condType: 0,
             condA: 1,
             condB: 2,
             layerMode: 0,
             engine2Model: 0,
             engine2Exciter: 0,
-            layerLevel: 0.35,
+	            layerLevel: 0.0,
             engine2PitchMode: 0,
             engine2SemiOffset: 0,
             engine2DegreeOffset: 0,
@@ -1834,9 +2213,9 @@ args[\out] = outBus;
 			synth2PitchEnvAmt: 0.0,
             synth2PitchEnvDecay: 0.03,
             synth2PitchEnvCurve: -6.0,
-			synth2Drive: 1.40,
-			synth2Color: 0.50,
-			synth2Motion: 0.25,
+				synth2Drive: 0.60,
+				synth2Color: 0.00,
+				synth2Motion: 0.00,
 			synth2UnisonVoices: 1,
 			synth2UnisonDetune: 0.00,
 			synth2UnisonStereo: 0.00,
@@ -1849,19 +2228,75 @@ args[\out] = outBus;
                 degreeOct: 0,
                 velocity: nil, decay: nil, brightness: nil, material: nil, inharm: nil,
                 position: nil, body: nil, damp: nil, drive: nil, tone: nil, noiseAmt: nil,
-                clickAmt: nil, exciterType: nil, model: nil, pitchEnvAmt: nil,
-                pitchEnvDecay: nil, detune: nil, spread: nil, pan: nil
-            )
-        )
-    };
+	                clickAmt: nil, exciterType: nil, model: nil, pitchEnvAmt: nil,
+	                pitchEnvDecay: nil, detune: nil, spread: nil, pan: nil,
+	                filterMode: nil, filterCutoff: nil, filterRes: nil,
+	                filterEnvAmt: nil, filterEnvDecay: nil, combAmt: nil,
+	                combTime: nil, combDecay: nil, edgeDrive: nil,
+	                foldAmt: nil, presence: nil, crushMix: nil,
+	                bitDepth: nil, downsample: nil, kickSubAmt: nil,
+	                kickSubDecay: nil, kickPunch: nil, kickDrive: nil,
+	                kickClick: nil
+	            )
+		        )
+		    };
 
-~makePatternArray = {
-    Array.fill(32, { ~makePlonkStep.(0) })
-};
+	~makePlonkTrackStep = { |trackIdx=0, on=0|
+	    var st = ~makePlonkStep.(on).deepCopy;
 
-    ~plonkTrackPatterns = Array.fill(~plonkTrackCount, {
-        Array.fill(4, { ~makePatternArray.() })
-    });
+	    switch(trackIdx.asInteger.clip(0, ~plonkTrackCount - 1),
+	        1, {
+	            st[\gate] = 0.45;
+	            st[\locks][\useDegree] = 0;
+	            st[\locks][\semi] = 0;
+	            st[\layerMode] = 0;
+	            st[\layerLevel] = 0.0;
+	            st[\engine2Model] = 3;
+	            st[\engine2Exciter] = 5;
+	            st[\engine2PitchMode] = 0;
+	            st[\engine2DecayMul] = 0.42;
+	            st[\engine2NoiseOffset] = 0.85;
+	            st[\engine2ClickOffset] = 0.70;
+	            st[\synth2Drive] = 1.7;
+	            st[\synth2Color] = 0.85;
+	            st[\synth2Motion] = 0.18;
+	            st[\synth2UnisonVoices] = 1;
+	            st[\synth2UnisonDetune] = 0.0;
+	            st[\synth2UnisonStereo] = 0.0;
+	            st[\synth2UnisonDrift] = 0.0;
+	        },
+	        2, {
+	            st[\gate] = 0.12;
+	            st[\locks][\useDegree] = 0;
+	            st[\locks][\semi] = 0;
+	            st[\layerMode] = 0;
+	            st[\layerLevel] = 0.0;
+	            st[\engine2Model] = 2;
+	            st[\engine2Exciter] = 5;
+	            st[\engine2PitchMode] = 0;
+	            st[\engine2DecayMul] = 0.16;
+	            st[\engine2NoiseOffset] = 0.90;
+	            st[\engine2ClickOffset] = 0.35;
+	            st[\synth2Drive] = 1.8;
+	            st[\synth2Color] = 0.95;
+	            st[\synth2Motion] = 0.08;
+	            st[\synth2UnisonVoices] = 2;
+	            st[\synth2UnisonDetune] = 0.035;
+	            st[\synth2UnisonStereo] = 0.0;
+	            st[\synth2UnisonDrift] = 0.0;
+	        }
+	    );
+
+	    st;
+	};
+
+	~makePatternArray = { |trackIdx=0|
+	    Array.fill(32, { ~makePlonkTrackStep.(trackIdx, 0) })
+	};
+
+	    ~plonkTrackPatterns = Array.fill(~plonkTrackCount, { |trackIdx|
+	        Array.fill(4, { ~makePatternArray.(trackIdx) })
+	    });
 
     ~plonkSteps = ~plonkTrackPatterns[0][0];
 
@@ -1891,6 +2326,11 @@ args[\out] = outBus;
         chainBarCount: 1
     );
 
+    ~plonkTransportRunToken = 0;
+    ~plonkStepPrefire = Array.fill(~plonkTrackCount, {
+        (active: false, stepIndex: nil, didPlay: false)
+    });
+
     ~plonkClock = TempoClock.new((~plonkSeq[\tempo] ? 120) / 60);
     ~plonkClock.permanent_(true);
 
@@ -1898,11 +2338,50 @@ args[\out] = outBus;
         enabled: false,
         everyCycles: 4,
         amount: 0.20,
-        targetVariation: \active
+        targetVariation: \active,
+        preset: \medium,
+        lockPitch: false,
+        lockTiming: false,
+        lockConditions: false,
+        lockLayer: false
     );
 
     ~plonkVariationNames = ["A", "B", "C", "D"];
     ~plonkAltState = Array.fill(~plonkTrackCount, { Array.fill(32, { 0 }) });
+
+    ~plonkEditor = (
+        selectedSteps: Array.fill(32, { false }),
+        selectionAnchor: 0,
+        lastSelectedStep: 0,
+        clipboard: nil,
+        clipboardLabel: "Clipboard empty",
+        pasteMode: \overwrite,
+	        randomizeLabel: "Randomize: Full | Scope: Step 1",
+        randomizeMode: \full,
+        helpText: "Click selects. Double-click edits. Shift/range selects. Cmd toggles. Dot toggles on/off.",
+        currentPatternName: "pattern1",
+        currentSoundNames: Array.fill(~plonkTrackCount, { |i| ~plonkResolvedTrackDefaultName.(i) }),
+        recentSounds: Array.fill(~plonkTrackCount, { [] }),
+        defaultSoundNames: Array.fill(~plonkTrackCount, { |i| ~plonkResolvedTrackDefaultName.(i) }),
+        dirty: false,
+        recentPatterns: [],
+        undoStack: List.new,
+        redoStack: List.new,
+        maxUndo: 20,
+        stepSections: (basic: true, pitch: true, conditions: true, layer: true, locks: true),
+        compareSnapshot: nil,
+        compareReturnSnapshot: nil,
+        compareAuditioning: false,
+        compareLabel: "Snapshot: none"
+    );
+
+    ~plonkMacros = (
+        density: 0.50,
+        complexity: 0.35,
+        stability: 0.65,
+        humanize: 0.25,
+        contrast: 0.35
+    );
 
 ~plonkSetSelectedTrack = { |idx|
     idx = idx.clip(0, ~plonkTrackCount - 1);
@@ -1912,6 +2391,7 @@ args[\out] = outBus;
     if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
     if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
     if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+    if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
 };
 
 	~plonkEditStepsForSelectedTrack = {
@@ -1923,6 +2403,549 @@ args[\out] = outBus;
     ~plonkSeq[\editVariation] = idx;
     ~plonkSteps = ~plonkEditStepsForSelectedTrack.();
 };
+
+~plonkSnapshotState = {
+    (
+        seq: ~plonkSeq.copy.put(\task, nil),
+        trackPatterns: ~plonkTrackPatterns.collect { |trackArr|
+            trackArr.collect { |arr| arr.collect(_.deepCopy) }
+        },
+        trackStates: ~plonkTrackStates.collect(_.copy),
+        mutate: ~plonkMutate.copy,
+        pitch: ~plonkPitch.copy,
+        selectedTrack: ~plonkSelectedTrack,
+        currentSoundNames: (~plonkEditor[\currentSoundNames] ? Array.fill(~plonkTrackCount, { |i| ~plonkResolvedTrackDefaultName.(i) })).copy
+    )
+};
+
+~plonkRestoreSnapshot = { |snap|
+    if(snap.notNil) {
+        ~plonkSeq.putAll(snap[\seq].copy);
+        ~plonkSeq[\task] = nil;
+        ~plonkTrackPatterns = snap[\trackPatterns].collect { |trackArr|
+            trackArr.collect { |arr| arr.collect(_.deepCopy) }
+        };
+        ~plonkTrackStates = snap[\trackStates].collect(_.copy);
+        if(snap[\mutate].notNil) { ~plonkMutate = snap[\mutate].copy };
+        if(snap[\pitch].notNil) { ~plonkPitch = snap[\pitch].copy };
+        ~plonkSelectedTrack = (snap[\selectedTrack] ? 0).clip(0, ~plonkTrackCount - 1);
+        if(snap[\currentSoundNames].notNil) {
+            ~plonkEditor[\currentSoundNames] = Array.fill(~plonkTrackCount, { |i|
+                var names = snap[\currentSoundNames];
+                if((names.notNil) and: { i < names.size } and: { names[i].notNil }) {
+                    names[i].asString
+                }{
+                    ~plonkResolvedTrackDefaultName.(i)
+                }
+            });
+        };
+        ~plonkSetEditVariation.((~plonkSeq[\editVariation] ? 0).clip(0, 3));
+        ~plonkClock.tempo = (~plonkSeq[\tempo] ? 120) / 60;
+
+        if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
+        if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+        if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+        if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+        if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
+        if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+    };
+};
+
+~plonkMarkDirty = { |flag=true|
+    ~plonkEditor[\dirty] = flag;
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkShiftSelectedTrackFreq = { |semitones|
+    var st, freq, ratio;
+
+    st = ~plonkTrackStates[~plonkSelectedTrack];
+    freq = (st[\freq] ? 220).asFloat.max(1.0);
+    ratio = 2.0 ** (semitones.asFloat / 12.0);
+    st[\freq] = (freq * ratio).clip(20.0, 20000.0);
+
+    ~plonkMarkDirty.(true);
+    if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
+};
+
+~plonkPushUndo = { |label="Edit"|
+    var stack = ~plonkEditor[\undoStack];
+    var maxUndo = (~plonkEditor[\maxUndo] ? 20).asInteger.max(1);
+
+    stack.add(~plonkSnapshotState.());
+    while({ stack.size > maxUndo }, { stack.removeAt(0) });
+    ~plonkEditor[\redoStack] = List.new;
+    ~plonkEditor[\helpText] = label;
+};
+
+~plonkUndo = {
+    var undo = ~plonkEditor[\undoStack];
+    var redo = ~plonkEditor[\redoStack];
+    var snap;
+
+    if(undo.size > 0) {
+        redo.add(~plonkSnapshotState.());
+        snap = undo.removeAt(undo.size - 1);
+        ~plonkRestoreSnapshot.(snap);
+        ~plonkMarkDirty.(true);
+        ~plonkEditor[\helpText] = "Undo";
+    };
+};
+
+~plonkRedo = {
+    var undo = ~plonkEditor[\undoStack];
+    var redo = ~plonkEditor[\redoStack];
+    var snap;
+
+    if(redo.size > 0) {
+        undo.add(~plonkSnapshotState.());
+        snap = redo.removeAt(redo.size - 1);
+        ~plonkRestoreSnapshot.(snap);
+        ~plonkMarkDirty.(true);
+        ~plonkEditor[\helpText] = "Redo";
+    };
+};
+
+~plonkArchiveNameFromPath = { |pathName|
+    var name = pathName.fileName.asString;
+    if(name.endsWith(".archive")) {
+        name.copyRange(0, name.size - 9)
+    }{
+        name
+    }
+};
+
+~plonkRefreshRecentPatterns = {
+    ~plonkEditor[\recentPatterns] = ~plonkArchiveFilesIn.(~plonkPatternDir)
+    .collect { |pn| ~plonkArchiveNameFromPath.(pn) }
+    .sort;
+};
+
+~plonkSetPatternName = { |name, dirty=false|
+    ~plonkEditor[\currentPatternName] = if(name.isNil or: { name.asString.size == 0 }) { "pattern1" } { name.asString };
+    ~plonkEditor[\dirty] = dirty;
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkCurrentTrackSoundName = { |trackIdx|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var names = ~plonkEditor[\currentSoundNames];
+    var name = if(names.notNil and: { idx < names.size }) { names[idx] } { nil };
+    if(name.isNil or: { name.asString.size == 0 }) {
+        ~plonkResolvedTrackDefaultName.(idx)
+    }{
+        name.asString
+    }
+};
+
+~plonkSetCurrentTrackSoundName = { |trackIdx, name|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var resolved = if(name.isNil or: { name.asString.size == 0 }) {
+        ~plonkResolvedTrackDefaultName.(idx)
+    }{
+        name.asString
+    };
+    ~plonkEditor[\currentSoundNames][idx] = resolved;
+    resolved;
+};
+
+~plonkRefreshRecentSounds = { |trackIdx=nil|
+    var refreshOne = { |idx|
+        ~plonkEditor[\recentSounds][idx] = ~plonkArchiveFilesIn.(~plonkTrackSoundDirs[idx])
+        .collect { |pn| ~plonkArchiveNameFromPath.(pn) }
+        .sort;
+    };
+
+    if(trackIdx.isNil) {
+        ~plonkTrackCount.do { |i| refreshOne.(i) };
+    }{
+        refreshOne.(trackIdx.asInteger.clip(0, ~plonkTrackCount - 1));
+    };
+};
+
+~plonkTrackSoundPath = { |trackIdx, name|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    ~plonkTrackSoundDirs[idx] +/+ (name.asString ++ ".archive")
+};
+
+~plonkSaveTrackSound = { |trackIdx, name|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var resolvedName = if(name.isNil or: { name.asString.size == 0 }) {
+        ~plonkCurrentTrackSoundName.(idx)
+    }{
+        name.asString
+    };
+    var path = ~plonkTrackSoundPath.(idx, resolvedName);
+
+    (
+        name: resolvedName,
+        trackIndex: idx,
+        trackName: ~plonkTrackNames[idx],
+        state: ~plonkTrackStates[idx].copy
+    ).writeArchive(path);
+
+    ~plonkSetCurrentTrackSoundName.(idx, resolvedName);
+    ~plonkRefreshRecentSounds.(idx);
+    ~plonkEditor[\helpText] = "Saved " ++ ~plonkTrackNames[idx] ++ " sound: " ++ resolvedName;
+    if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+    if(~plonkDebug) {
+        ("Saved track sound: " ++ path).postln;
+    };
+};
+
+~plonkApplyTrackSoundState = { |trackIdx, state, soundName=nil, dirty=true|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+
+    ~plonkTrackStates[idx] = ~plonkMergedTrackState.(idx, state);
+    ~plonkSetCurrentTrackSoundName.(idx, soundName);
+
+    if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
+    if(~plonkRefreshMixerUI.notNil) { ~plonkRefreshMixerUI.() };
+    if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
+
+    if(dirty.isNil) {
+        if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+    }{
+        ~plonkMarkDirty.(dirty);
+    };
+};
+
+~plonkLoadTrackSound = { |trackIdx, name|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var requestedName = if(name.isNil or: { name.asString.size == 0 }) {
+        ~plonkCurrentTrackSoundName.(idx)
+    }{
+        name.asString
+    };
+    var path = ~plonkTrackSoundPath.(idx, requestedName);
+    var obj, savedTrackIdx, ok = true, resolvedName;
+
+    if(File.exists(path)) {
+        obj = Object.readArchive(path);
+        savedTrackIdx = obj[\trackIndex];
+        if(savedTrackIdx.notNil and: { savedTrackIdx.asInteger != idx }) {
+            ok = false;
+            ("Track sound does not match selected track: " ++ path).warn;
+        };
+
+        if(ok) {
+            ~plonkPushUndo.("Load " ++ ~plonkTrackNames[idx] ++ " Sound");
+            resolvedName = obj[\name] ? requestedName;
+            ~plonkApplyTrackSoundState.(idx, obj[\state], resolvedName, true);
+            ~plonkEditor[\helpText] = "Loaded " ++ ~plonkTrackNames[idx] ++ " sound: " ++ resolvedName.asString;
+            if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+            if(~plonkDebug) {
+                ("Loaded track sound: " ++ path).postln;
+            };
+        };
+    }{
+        ("Track sound not found: " ++ path).warn;
+    };
+};
+
+~plonkSetTrackDefaultFromCurrent = { |trackIdx, name|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var resolvedName = if(name.isNil or: { name.asString.size == 0 }) {
+        ~plonkCurrentTrackSoundName.(idx)
+    }{
+        name.asString
+    };
+
+    ~plonkTrackDefaultNames[idx] = resolvedName;
+    ~plonkTrackDefaultStates[idx] = ~plonkTrackStates[idx].copy;
+    ~plonkSetCurrentTrackSoundName.(idx, resolvedName);
+    ~plonkEditor[\defaultSoundNames][idx] = resolvedName;
+    ~plonkSaveTrackDefaultsArchive.();
+    ~plonkEditor[\helpText] = "Default " ++ ~plonkTrackNames[idx] ++ " sound: " ++ resolvedName;
+    if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkResetTrackSoundToDefault = { |trackIdx|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var resolvedName = ~plonkResolvedTrackDefaultName.(idx);
+    ~plonkPushUndo.("Reset " ++ ~plonkTrackNames[idx] ++ " Sound");
+    ~plonkApplyTrackSoundState.(idx, ~plonkResolvedTrackDefaultState.(idx), resolvedName, true);
+    ~plonkEditor[\helpText] = "Reset " ++ ~plonkTrackNames[idx] ++ " to default";
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkFactoryResetTrackSound = { |trackIdx|
+    var idx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
+    var resolvedName = ~plonkFactoryTrackSoundName.(idx);
+    ~plonkPushUndo.("Factory Reset " ++ ~plonkTrackNames[idx] ++ " Sound");
+    ~plonkApplyTrackSoundState.(idx, ~plonkMakeTrackState.(idx), resolvedName, true);
+    ~plonkEditor[\helpText] = "Factory reset " ++ ~plonkTrackNames[idx];
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkRefreshRecentSounds.();
+
+~plonkSelectedStepIndices = {
+    var out = List.new;
+    var selected = ~plonkEditor[\selectedSteps];
+    32.do { |i|
+        if(selected[i]) { out.add(i) };
+    };
+    out.asArray;
+};
+
+~plonkSelectionScopeLabel = {
+    var indices = ~plonkSelectedStepIndices.();
+    var contiguous = true;
+    if(indices.size == 0) {
+        "Step " ++ ((~plonkEditor[\lastSelectedStep] ? 0) + 1).asString
+    }{
+        if(indices.size == 1) {
+            "Step " ++ (indices[0] + 1).asString
+        }{
+            indices.do { |idx, pos|
+                if(idx != (indices[0] + pos)) { contiguous = false };
+            };
+            if(contiguous) {
+                "Steps " ++ (indices[0] + 1).asString ++ "-" ++ (indices[indices.size - 1] + 1).asString
+            }{
+                indices.size.asString ++ " selected"
+            }
+        }
+    }
+};
+
+~plonkRandomizeModeLabel = { |mode|
+    switch(mode ? \full,
+        \selection, { "Selection" },
+        \timing, { "Timing" },
+        \pitch, { "Pitch" },
+        \accent, { "Accent" },
+        \condition, { "Condition" },
+        \layer, { "Layer" },
+        { "Full" }
+    )
+};
+
+~plonkUpdateRandomizeScopeLabel = { |mode=nil|
+    if(mode.notNil) {
+        ~plonkEditor[\randomizeMode] = mode;
+    };
+    ~plonkEditor[\randomizeLabel] =
+        "Randomize: " ++ ~plonkRandomizeModeLabel.(~plonkEditor[\randomizeMode] ? \full)
+        ++ " | Scope: " ++ ~plonkSelectionScopeLabel.();
+};
+
+	~plonkClearStepSelection = {
+	    32.do { |i| ~plonkEditor[\selectedSteps][i] = false };
+	};
+
+~plonkSetSingleStepSelection = { |idx|
+    idx = idx.asInteger.clip(0, 31);
+	    ~plonkClearStepSelection.();
+	    ~plonkEditor[\selectedSteps][idx] = true;
+	    ~plonkEditor[\selectionAnchor] = idx;
+	    ~plonkEditor[\lastSelectedStep] = idx;
+	    ~plonkEditor[\helpText] = "Selected Step " ++ (idx + 1).asString;
+	    ~plonkUpdateRandomizeScopeLabel.();
+	    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+	};
+
+~plonkToggleStepSelection = { |idx|
+    idx = idx.asInteger.clip(0, 31);
+    ~plonkEditor[\selectedSteps][idx] = ~plonkEditor[\selectedSteps][idx].not;
+    if(~plonkSelectedStepIndices.().isEmpty) {
+        ~plonkEditor[\selectedSteps][idx] = true;
+	    };
+	    ~plonkEditor[\lastSelectedStep] = idx;
+	    ~plonkEditor[\selectionAnchor] = idx;
+	    ~plonkEditor[\helpText] = ~plonkSelectionScopeLabel.();
+	    ~plonkUpdateRandomizeScopeLabel.();
+	    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+	};
+
+~plonkSetStepRangeSelection = { |startIdx, endIdx|
+    var a = startIdx.asInteger.clip(0, 31);
+    var b = endIdx.asInteger.clip(0, 31);
+	    var lo = a.min(b);
+	    var hi = a.max(b);
+	    ~plonkClearStepSelection.();
+	    32.do { |i|
+	        if((i >= lo) and: { i <= hi }) {
+	            ~plonkEditor[\selectedSteps][i] = true;
+	        };
+	    };
+	    ~plonkEditor[\selectionAnchor] = lo;
+	    ~plonkEditor[\lastSelectedStep] = hi;
+    ~plonkEditor[\helpText] = if(lo == hi) {
+        "Selected Step " ++ (lo + 1).asString
+    }{
+        "Selected Steps " ++ (lo + 1).asString ++ "-" ++ (hi + 1).asString
+    };
+    ~plonkUpdateRandomizeScopeLabel.();
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkSelectStepRange = { |idx|
+    var anchor = (~plonkEditor[\selectionAnchor] ? 0).asInteger.clip(0, 31);
+    ~plonkSetStepRangeSelection.(anchor, idx);
+};
+
+~plonkStepTargets = {
+    var indices = ~plonkSelectedStepIndices.();
+    if(indices.isEmpty) {
+        [~plonkEditor[\lastSelectedStep].asInteger.clip(0, 31)]
+    }{
+        indices
+    }
+};
+
+~plonkCopyFields = { |dst, src, mode|
+    var out = dst.deepCopy;
+    var timingKeys = [\on, \prob, \ratchet, \micro, \gate, \length, \tie];
+    var layerKeys = [
+        \layerMode, \engine2Model, \engine2Exciter, \layerLevel, \engine2PitchMode,
+        \engine2SemiOffset, \engine2DegreeOffset, \engine2DegreeOctOffset, \engine2DecayMul,
+        \engine2NoiseOffset, \engine2ClickOffset, \engine2PanOffset, \synth2Drive,
+        \synth2Color, \synth2Motion, \synth2UnisonVoices, \synth2UnisonDetune,
+        \synth2UnisonStereo, \synth2UnisonDrift, \synth2PitchEnvAmt,
+        \synth2PitchEnvDecay, \synth2PitchEnvCurve
+    ];
+
+    switch(mode,
+        \overwrite, {
+            out = src.deepCopy;
+        },
+        \merge, {
+            src.keysValuesDo { |k, v|
+                if(k != \on) { out[k] = v.deepCopy };
+            };
+        },
+        \timing, {
+            timingKeys.do { |k| out[k] = src[k].deepCopy };
+        },
+        \pitch, {
+            out[\fixedPitch] = src[\fixedPitch].deepCopy;
+            [\semi, \useDegree, \degree, \degreeOct].do { |k|
+                out[\locks][k] = src[\locks][k].deepCopy;
+            };
+        },
+        \conditions, {
+            [\condType, \condA, \condB].do { |k| out[k] = src[k].deepCopy };
+        },
+        \layer, {
+            layerKeys.do { |k| out[k] = src[k].deepCopy };
+        },
+        {
+            out = src.deepCopy;
+        }
+    );
+
+    out;
+};
+
+~plonkCopySelectedSteps = {
+    var indices = ~plonkStepTargets.();
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    ~plonkEditor[\clipboard] = (
+        type: \steps,
+        sourceIndices: indices.copy,
+        steps: indices.collect { |i| steps[i].deepCopy }
+    );
+    ~plonkEditor[\clipboardLabel] = if(indices.size == 1) {
+        "Copied Step " ++ (indices[0] + 1).asString
+    }{
+        "Copied " ++ indices.size.asString ++ " selected"
+    };
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkPasteToSelectedSteps = { |mode=\overwrite|
+    var clip = ~plonkEditor[\clipboard];
+    var targets = ~plonkStepTargets.();
+    var steps = ~plonkEditStepsForSelectedTrack.();
+
+    if(clip.notNil and: { clip[\type] == \steps }) {
+        ~plonkPushUndo.("Paste " ++ mode.asString);
+        targets.do { |idx, pos|
+            var src = clip[\steps][pos % clip[\steps].size];
+            steps[idx] = ~plonkCopyFields.(steps[idx], src, mode);
+        };
+        ~plonkMarkDirty.(true);
+        ~plonkEditor[\clipboardLabel] = "Pasted " ++ targets.size.asString ++ " step(s)";
+    };
+};
+
+	~plonkClearSelectedSteps = {
+	    var steps = ~plonkEditStepsForSelectedTrack.();
+	    ~plonkPushUndo.("Clear selected");
+	    ~plonkStepTargets.().do { |idx|
+	        steps[idx] = ~makePlonkTrackStep.(~plonkSelectedTrack, 0).deepCopy;
+	    };
+	    ~plonkMarkDirty.(true);
+	};
+
+~plonkToggleSelectedSteps = {
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    var targets = ~plonkStepTargets.();
+    var turnOn = targets.any { |idx| steps[idx][\on] == 0 };
+    ~plonkPushUndo.("Toggle selected");
+    targets.do { |idx| steps[idx][\on] = turnOn.asInteger };
+    ~plonkMarkDirty.(true);
+};
+
+~plonkNudgeSelectedSteps = { |dir=1|
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    var targets = ~plonkStepTargets.();
+    var moved = List.new;
+	    var copies = targets.collect { |idx| steps[idx].deepCopy };
+
+	    ~plonkPushUndo.("Nudge selected");
+	    targets.do { |idx| steps[idx] = ~makePlonkTrackStep.(~plonkSelectedTrack, 0).deepCopy };
+    targets.do { |idx, pos|
+        var dst = (idx + dir.asInteger) % 32;
+        if(dst < 0) { dst = dst + 32 };
+        steps[dst] = copies[pos].deepCopy;
+        moved.add(dst);
+    };
+
+    ~plonkClearStepSelection.();
+    moved.do { |idx| ~plonkEditor[\selectedSteps][idx] = true };
+    ~plonkEditor[\lastSelectedStep] = moved[moved.size - 1] ? 0;
+    ~plonkEditor[\selectionAnchor] = moved[0] ? 0;
+    ~plonkMarkDirty.(true);
+};
+
+~plonkTransposeSelectedSteps = { |semiDelta=1|
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    ~plonkPushUndo.("Transpose selected");
+    ~plonkStepTargets.().do { |idx|
+        var locks = steps[idx][\locks];
+        if((locks[\useDegree] ? 0).asInteger == 1) {
+            locks[\degree] = ((locks[\degree] ? 0) + semiDelta.asInteger).clip(-14, 14);
+        }{
+            locks[\semi] = ((locks[\semi] ? 0) + semiDelta.asInteger).clip(-36, 36);
+        };
+    };
+    ~plonkMarkDirty.(true);
+};
+
+~plonkSetSelectedCondition = { |condType=0|
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    ~plonkPushUndo.("Set condition");
+    ~plonkStepTargets.().do { |idx| steps[idx][\condType] = condType.asInteger.clip(0, ~plonkCondNames.size - 1) };
+    ~plonkMarkDirty.(true);
+};
+
+	~plonkSetSelectedLayerMode = { |mode=0|
+	    var steps = ~plonkEditStepsForSelectedTrack.();
+	    var nextMode = mode.asInteger.clip(0, ~plonkLayerModeNames.size - 1);
+	    ~plonkPushUndo.("Set assist mode");
+	    ~plonkStepTargets.().do { |idx|
+	        steps[idx][\layerMode] = nextMode;
+	        if(nextMode > 0 and: { (steps[idx][\layerLevel] ? 0.0) <= 0.0 }) {
+	            steps[idx][\layerLevel] = 0.35;
+	        };
+	    };
+	    ~plonkMarkDirty.(true);
+	};
 
     ~plonkGetChainVar = {
         var slot = ~plonkSeq[\chainSlots][~plonkSeq[\chainIndex]];
@@ -1979,13 +3002,13 @@ args[\out] = outBus;
         };
     };
 
-    ~plonkClearCurrentVariation = {
-        var trackIdx = ~plonkSelectedTrack;
-        var varIdx = ~plonkSeq[\editVariation];
+	    ~plonkClearCurrentVariation = {
+	        var trackIdx = ~plonkSelectedTrack;
+	        var varIdx = ~plonkSeq[\editVariation];
 
-        ~plonkTrackPatterns[trackIdx][varIdx] = Array.fill(32, { ~makePlonkStep.(0) });
-        ~plonkSetEditVariation.(varIdx);
-    };
+	        ~plonkTrackPatterns[trackIdx][varIdx] = ~makePatternArray.(trackIdx);
+	        ~plonkSetEditVariation.(varIdx);
+	    };
 
     ~plonkRotateCurrentVariation = { |dir=1|
         var trackIdx = ~plonkSelectedTrack;
@@ -2080,37 +3103,43 @@ args[\out] = outBus;
         found;
     };
 
-~plonkStepMidiForIndex = { |idx|
-    var steps = ~plonkTrackPatterns[~plonkSelectedTrack][~plonkSeq[\editVariation]];
-    var locks = steps[idx][\locks];
+~plonkStepMidi = { |trackIdx, step|
+    var locks = step[\locks] ? ();
     var useDegree = (locks[\useDegree] ? 0).asInteger;
+    var fixedPitch = (step[\fixedPitch] ? 0).asInteger;
     var midi;
     var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
+
+    trackIdx = trackIdx.asInteger.clip(0, ~plonkTrackCount - 1);
 
     if(useDegree == 1) {
         midi = ~plonkDegreeToMidi.(locks[\degree] ? 0, locks[\degreeOct] ? 0);
     }{
-        midi = ~plonkQuantizeMidi.((tonicBase + (locks[\semi] ? 0)).clip(0, 127));
+        if(fixedPitch == 1) {
+            midi = ((~plonkTrackStates[trackIdx][\freq] ? 220).asFloat.max(1.0).cpsmidi
+                + (locks[\semi] ? 0));
+        }{
+            midi = ~plonkQuantizeMidi.((tonicBase + (locks[\semi] ? 0)).clip(0, 127));
+        };
     };
 
     midi.clip(0, 127);
+};
+
+~plonkStepMidiForIndex = { |idx|
+    var steps = ~plonkTrackPatterns[~plonkSelectedTrack][~plonkSeq[\editVariation]];
+    ~plonkStepMidi.(~plonkSelectedTrack, steps[idx]);
 };
 
 
  ~plonkBuildStepArgs = { |trackIdx, step|
     var args = ~plonkTrackStates[trackIdx].copy;
     var locks = step[\locks];
-    var useDegree = (locks[\useDegree] ? 0).asInteger;
     var noteMidi;
     var accentAmt = step[\accent].clip(0, 1);
-    var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
 
 
-    if(useDegree == 1) {
-        noteMidi = ~plonkDegreeToMidi.(locks[\degree] ? 0, locks[\degreeOct] ? 0);
-    }{
-        noteMidi = ~plonkQuantizeMidi.(tonicBase + (locks[\semi] ? 0));
-    };
+    noteMidi = ~plonkStepMidi.(trackIdx, step);
 
     args[\freq] = noteMidi.clip(0, 127).midicps;
     if(locks[\velocity].notNil) { args[\velocity] = locks[\velocity] };
@@ -2124,7 +3153,7 @@ args[\out] = outBus;
     args[\velocity] = (args[\velocity] + (accentAmt * 0.20)).clip(0, 1);
     args[\brightness] = (args[\brightness] + (accentAmt * 0.10)).clip(0, 1);
     args[\clickAmt] = (args[\clickAmt] + (accentAmt * 0.18)).clip(0, 2.0);
-    args[\drive] = (args[\drive] + (accentAmt * 0.08)).clip(0.7, 2.0);
+	    args[\drive] = (args[\drive] + (accentAmt * 0.08)).clip(1.0, 2.0);
 
 	args[\amp] = args[\amp].clip(0.0, 1.0);
     args[\pan] = (args[\pan] ? 0.0).clip(-1.0, 1.0);
@@ -2138,18 +3167,13 @@ args[\out] = outBus;
     var mainLocks = step[\locks];
     var useDegree = (mainLocks[\useDegree] ? 0).asInteger;
     var pitchMode = (step[\engine2PitchMode] ? 0).asInteger.clip(0, 2);
-    var tonicBase = ~plonkRootAlignedBaseMidi.(~plonkSeq[\baseMidi]);
     var baseArgs = ~plonkBuildStepArgs.(trackIdx, step).copy;
     var mainMidi, layerMidi, excIdx, synthType;
     var inferredColor, inferredMotion, inferredDrive;
     var inferredGlue, inferredBodyGlue, inferredToneFollow;
     var args = ();
 
-    if(useDegree == 1) {
-        mainMidi = ~plonkDegreeToMidi.(mainLocks[\degree] ? 0, mainLocks[\degreeOct] ? 0);
-    }{
-        mainMidi = ~plonkQuantizeMidi.(tonicBase + (mainLocks[\semi] ? 0));
-    };
+    mainMidi = ~plonkStepMidi.(trackIdx, step);
 
     layerMidi = mainMidi;
 
@@ -2253,6 +3277,111 @@ args[\out] = outBus;
     args;
 };
 
+~plonkStepDurSecs = { |stepDurBeats|
+    if(~plonkMidiSync[\enabled]) {
+        stepDurBeats * ~plonkMidiStepSecs.()
+    }{
+        stepDurBeats / (~plonkClock.tempo.max(0.0001))
+    };
+};
+
+~plonkBuildVoiceTriggerPlan = { |trackIdx, step, stepIndex|
+    var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
+    var args = ~plonkBuildStepArgs.(trackIdx, step);
+    var layerArgs;
+    var useAssist = false;
+    var defName = \plonkV520Main;
+
+    useAssist = switch(mode,
+        0, { false },
+        1, { true },
+        2, {
+            if(~plonkAltState[trackIdx][stepIndex] == 0) {
+                ~plonkAltState[trackIdx][stepIndex] = 1;
+                false
+            }{
+                ~plonkAltState[trackIdx][stepIndex] = 0;
+                true
+            }
+        },
+        3, {
+            1.0.rand < 0.58
+        },
+        { false }
+    );
+
+    if(useAssist) {
+        layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
+        args.putAll(layerArgs);
+        args[\layerMode] = 1;
+        if(mode == 3) {
+            args[\layerLevel] = ((args[\layerLevel] ? 0.35) * rrand(0.65, 1.0)).clip(0.12, 0.55);
+        };
+        defName = ~plonkAssistDefForStep.(step);
+    }{
+        args[\layerMode] = 0;
+    };
+
+    (
+        defName: defName,
+        args: args,
+        runToken: (~plonkTransportRunToken ? 0)
+    );
+};
+
+~plonkFireVoiceTriggerPlan = { |plan, gateDurSecs, ratchetIndex=0, ratchetCount=1|
+    var token = (~plonkTransportRunToken ? 0);
+    var args, ampScale, velScale, synth;
+
+    if((plan.notNil) and: { token == (plan[\runToken] ? -1) }) {
+        args = (plan[\args] ? ()).copy;
+
+        if(ratchetCount > 1) {
+            ampScale = ((1 / ratchetCount.sqrt).clip(0.58, 1.0) * (1 - (ratchetIndex * 0.05))).clip(0.42, 1.0);
+            velScale = (1 - (ratchetIndex * 0.03)).clip(0.82, 1.0);
+            args[\amp] = ((args[\amp] ? 0.12) * ampScale).clip(0.0, 1.0);
+            args[\velocity] = ((args[\velocity] ? 0.8) * velScale).clip(0.0, 1.0);
+        };
+
+        synth = ~plonkTriggerWithDef.(plan[\defName] ? \plonkV520Main, args);
+
+        SystemClock.sched(gateDurSecs, {
+            if(synth.notNil) { synth.set(\gate, 0) };
+            nil
+        });
+
+        synth
+    }{
+        nil
+    };
+};
+
+~plonkSchedulePreparedStepTriggers = { |plan, step, gateDurSecs, stepDurBeats, baseDelaySecs=0.0|
+    var ratchet = (step[\ratchet] ? 1).asInteger.clip(1, 8);
+    var micro = (step[\micro] ? 0.0).clip(-0.49, 0.49);
+    var stepDurSecs = ~plonkStepDurSecs.(stepDurBeats);
+    var startDelaySecs = baseDelaySecs.max(0.0);
+    var subDurSecs = (stepDurSecs / ratchet).max(0.001);
+
+    if(baseDelaySecs <= 0.0) {
+        startDelaySecs = (startDelaySecs + (micro.max(0.0) * stepDurSecs)).max(0.0);
+    };
+
+    ratchet.do { |r|
+        var trigDelay = startDelaySecs + (r * subDurSecs);
+        var thisGate = if(ratchet > 1) {
+            gateDurSecs.min(subDurSecs * 0.82).max(0.004)
+        }{
+            gateDurSecs
+        };
+
+        SystemClock.sched(trigDelay, {
+            ~plonkFireVoiceTriggerPlan.(plan, thisGate, r, ratchet);
+            nil
+        });
+    };
+};
+
     ~plonkCheckCondition = { |step, prevPlayed=false|
         var t = step[\condType] ? 0;
         var a = (step[\condA] ? 1).asInteger.max(1);
@@ -2277,106 +3406,37 @@ args[\out] = outBus;
     };
 
   ~plonkTriggerStepVoices = { |trackIdx, step, gateDurSecs, stepIndex|
-    var mode = (step[\layerMode] ? 0).asInteger.clip(0, 3);
-    var args = ~plonkBuildStepArgs.(trackIdx, step).copy;
-    var layerArgs;
-    var useAssist = false;
-    var defName = \plonkV520Main;
-    var synth;
-
-    useAssist = switch(mode,
-        0, { false },   // main only
-        1, { true },    // modal voice with assist shaping
-        2, {            // alternating: main only / assisted
-            if(~plonkAltState[trackIdx][stepIndex] == 0) {
-                ~plonkAltState[trackIdx][stepIndex] = 1;
-                false
-            }{
-                ~plonkAltState[trackIdx][stepIndex] = 0;
-                true
-            }
-        },
-        3, {            // random: main only / assisted
-            1.0.rand < 0.58
-        },
-        { false }
-    );
-
-    if(useAssist) {
-        layerArgs = ~plonkBuildLayer2Args.(trackIdx, step);
-        args.putAll(layerArgs);
-        args[\layerMode] = 1;
-        if(mode == 3) {
-            args[\layerLevel] = ((args[\layerLevel] ? 0.35) * rrand(0.65, 1.0)).clip(0.12, 0.55);
-        };
-        defName = ~plonkAssistDefForStep.(step);
-    }{
-        args[\layerMode] = 0;
-    };
-
-    synth = ~plonkTriggerWithDef.(defName, args);
-
-    SystemClock.sched(gateDurSecs, {
-        if(synth.notNil) { synth.set(\gate, 0) };
-        nil
-    });
-
-    synth;
+    var plan = ~plonkBuildVoiceTriggerPlan.(trackIdx, step, stepIndex);
+    ~plonkFireVoiceTriggerPlan.(plan, gateDurSecs, 0, 1);
 };
 
 
 	~plonkScheduleStepTriggers = { |trackIdx, step, gateDurSecs, stepIndex, stepDurBeats|
-    var ratchet = (step[\ratchet] ? 1).asInteger.clip(1, 8);
-    var micro = (step[\micro] ? 0.0).clip(-0.49, 0.49);
-    var stepDurSecs;
-    var microOffsetSecs;
-    var subDurSecs;
-    var startDelaySecs;
-
-    stepDurSecs = if(~plonkMidiSync[\enabled]) {
-        stepDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24)
-    }{
-        stepDurBeats / (~plonkClock.tempo.max(0.0001))
-    };
-
-    microOffsetSecs = micro * stepDurSecs;
-    startDelaySecs = microOffsetSecs.max(0.0);
-    subDurSecs = (stepDurSecs / ratchet).max(0.001);
-
-    ratchet.do { |r|
-        var trigDelay = startDelaySecs + (r * subDurSecs);
-        var thisGate;
-
-        thisGate = if(ratchet > 1) {
-            gateDurSecs.min(subDurSecs * 0.92).max(0.005)
-        }{
-            gateDurSecs
-        };
-
-        SystemClock.sched(trigDelay, {
-            ~plonkTriggerStepVoices.(trackIdx, step, thisGate, stepIndex);
-            nil
-        });
-    };
+    var plan = ~plonkBuildVoiceTriggerPlan.(trackIdx, step, stepIndex);
+    ~plonkSchedulePreparedStepTriggers.(plan, step, gateDurSecs, stepDurBeats, 0.0);
 };
 
 
     ~plonkMutateVariation = { |trackIdx, varIdx|
         var steps = ~plonkTrackPatterns[trackIdx][varIdx];
         var amt = ~plonkMutate[\amount].clip(0, 1);
+        var lockPitch = (~plonkMutate[\lockPitch] ? false);
+        var lockTiming = (~plonkMutate[\lockTiming] ? false);
+        var lockConditions = (~plonkMutate[\lockConditions] ? false);
+        var lockLayer = (~plonkMutate[\lockLayer] ? false);
 
         32.do { |i|
             var st = steps[i];
 
-            if(amt.coin) {
+            if(lockTiming.not and: { amt.coin }) {
                 st[\prob] = (st[\prob] + rrand(-0.12, 0.12) * amt.linlin(0, 1, 0.2, 1.0)).clip(0.15, 1.0);
             };
 
-            if((amt * 0.65).coin) {
+            if(lockTiming.not and: { (amt * 0.65).coin }) {
                 st[\micro] = (st[\micro] + rrand(-0.04, 0.04) * amt.linlin(0, 1, 0.4, 1.2)).clip(-0.49, 0.49);
             };
 
-            if((amt * 0.45).coin) {
+            if(lockTiming.not and: { (amt * 0.45).coin }) {
                 st[\gate] = (st[\gate] + rrand(-0.10, 0.10) * amt.linlin(0, 1, 0.3, 1.0)).clip(0.05, 1.25);
             };
 
@@ -2384,11 +3444,11 @@ args[\out] = outBus;
                 st[\accent] = (st[\accent] + rrand(-0.25, 0.25) * amt.linlin(0, 1, 0.3, 1.0)).clip(0, 1);
             };
 
-            if((amt * 0.28).coin) {
+            if(lockPitch.not and: { (amt * 0.28).coin }) {
                 st[\locks][\useDegree] = [0, 0, 1].choose;
             };
 
-            if((amt * 0.25).coin) {
+            if(lockPitch.not and: { (amt * 0.25).coin }) {
                 if((~plonkPitch[\scaleType] ? 0).asInteger == 0) {
                     if((st[\locks][\useDegree] ? 0) == 1) {
                         st[\locks][\degree] = ((st[\locks][\degree] ? 0) + [-2, -1, 1, 2].choose).clip(-14, 14);
@@ -2402,15 +3462,15 @@ args[\out] = outBus;
                 };
             };
 
-            if((amt * 0.22).coin) {
+            if(lockTiming.not and: { (amt * 0.22).coin }) {
                 st[\ratchet] = [1, 1, 1, 2, 2, 3, 4].choose;
             };
 
-            if((amt * 0.20).coin) {
+            if(lockTiming.not and: { (amt * 0.20).coin }) {
                 st[\on] = [st[\on], 1 - st[\on]].wchoose([0.8, 0.2]);
             };
 
-            if((amt * 0.18).coin) {
+            if(lockLayer.not and: { (amt * 0.18).coin }) {
                 st[\layerMode] = [0, 0, 0, 1, 1, 1, 2, 3].choose;
                 st[\engine2Model] = rrand(0, 3);
                 st[\engine2Exciter] = rrand(0, 5);
@@ -2439,7 +3499,7 @@ args[\out] = outBus;
 
             };
 
-            if((amt * 0.16).coin) {
+            if(lockConditions.not and: { (amt * 0.16).coin }) {
                 st[\condType] = [0, 0, 0, 1, 2, 3, 4, 9, 10, 11].choose;
                 if(st[\condType] == 11) {
                     st[\condA] = rrand(1, 4);
@@ -2447,7 +3507,7 @@ args[\out] = outBus;
                 };
             };
 
-            if((amt * 0.14).coin) {
+            if(lockTiming.not and: { (amt * 0.14).coin }) {
                 st[\length] = [1, 1, 1, 2, 2, 3, 4].choose;
                 st[\tie] = [0, 0, 0, 1].choose;
             };
@@ -2466,12 +3526,23 @@ args[\out] = outBus;
                 targetIdx = if(~plonkMutate[\targetVariation] == \edit) {
                     ~plonkSeq[\editVariation]
                 }{
-                    ~plonkCurrentPlaybackVariation.()
+                    if(~plonkMutate[\targetVariation] == \temp) {
+                        ~plonkSeq[\editVariation]
+                    }{
+                        ~plonkCurrentPlaybackVariation.()
+                    }
+                };
+
+                ~plonkPushUndo.("Mutation");
+                if(~plonkMutate[\targetVariation] == \temp) {
+                    ~plonkEditor[\compareSnapshot] = ~plonkEditor[\undoStack][~plonkEditor[\undoStack].size - 1];
+                    ~plonkEditor[\compareLabel] = "Snapshot: before temp mutation";
                 };
 
                 ~plonkTrackCount.do { |trackIdx|
                     ~plonkMutateVariation.(trackIdx, targetIdx);
                 };
+                ~plonkMarkDirty.(true);
 
                 AppClock.sched(0, {
                     if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
@@ -2486,8 +3557,6 @@ args[\out] = outBus;
    ~plonkRefreshPlayhead = {
     if(~plonkStepIndicators.notNil) {
         AppClock.sched(0, {
-            var playSteps = ~plonkPlaybackStepsForSelectedTrack.();
-
             32.do { |i|
                 var isActive = (i == ~plonkSeq[\currentStep]);
 
@@ -2496,19 +3565,7 @@ args[\out] = outBus;
                 };
 
                 if(~plonkStepButtons.notNil and: { ~plonkStepButtons[i].notNil }) {
-                    if(isActive) {
-                        ~plonkStepButtons[i].states_([
-                            ["-", Color.black, Color(1.0, 0.82, 0.0)],
-                            ["●", Color.black, Color(1.0, 0.82, 0.0)]
-                        ]);
-                    }{
-                        ~plonkStepButtons[i].states_([
-                            ["-", Color.black, Color.grey(0.85)],
-                            ["●", Color.white, Color.black]
-                        ]);
-                    };
-
-                    ~plonkStepButtons[i].value_(playSteps[i][\on]);
+                    ~plonkStepButtons[i].refresh;
                 };
             };
             nil
@@ -2516,17 +3573,136 @@ args[\out] = outBus;
     };
 };
 
+        ~plonkResolveChainStateForCycleCount = { |cycleCount|
+        var slotIdx = 0;
+        var barCount = 1;
+        var completedCycles = (cycleCount.asInteger.max(1) - 1);
+        var totalBars = 0;
+        var remainingBars, slot, bars;
+
+        if(~plonkSeq[\chainEnabled].not or: { ~plonkSeq[\chainSlots].isNil } or: { ~plonkSeq[\chainSlots].isEmpty }) {
+            [0, 1]
+        }{
+            ~plonkSeq[\chainSlots].do { |chSlot|
+                totalBars = totalBars + ((chSlot[\bars] ? 1).asInteger.max(1));
+            };
+
+            if(totalBars <= 0) { totalBars = 1 };
+            remainingBars = completedCycles % totalBars;
+
+            remainingBars.do {
+                slot = ~plonkSeq[\chainSlots][slotIdx];
+                bars = (slot[\bars] ? 1).asInteger.max(1);
+
+                if(barCount >= bars) {
+                    slotIdx = (slotIdx + 1) % ~plonkSeq[\chainSlots].size;
+                    barCount = 1;
+                }{
+                    barCount = barCount + 1;
+                };
+            };
+
+            [slotIdx, barCount]
+        };
+    };
+
+        ~plonkApplyExternalSongPosition = { |songPos16ths=0|
+        var stepsCount = ~plonkSeq[\steps].clip(1, 32);
+        var pos = songPos16ths.asInteger.max(0);
+        var cycleCount = ((pos / stepsCount).floor.asInteger) + 1;
+        var chainState;
+
+        ~plonkMidiSync[\songPos16ths] = pos;
+        ~plonkMidiSync[\stepIndex] = pos % stepsCount;
+        ~plonkSeq[\cycleCount] = cycleCount;
+
+        if(~plonkSeq[\chainEnabled]) {
+            chainState = ~plonkResolveChainStateForCycleCount.(cycleCount);
+            ~plonkSeq[\chainIndex] = chainState[0];
+            ~plonkSeq[\chainBarCount] = chainState[1];
+        }{
+            ~plonkResetChain.();
+        };
+    };
+
+        ~plonkRecordExternalClockDt = { |dt|
+        var hist;
+
+        if(dt > 0) {
+            hist = ~plonkMidiSync[\clockDtHistory] ? List.new;
+            hist.add(dt);
+            while({ hist.size > 6 }, {
+                hist.removeAt(0);
+            });
+            ~plonkMidiSync[\clockDtHistory] = hist;
+            ~plonkMidiSync[\secPerClock] = hist.sum / hist.size.max(1);
+        };
+    };
+
+        ~plonkPrefireNextNegativeMicro = { |stepIndex, stepDurBeats|
+        var stepsCount = ~plonkSeq[\steps].clip(1, 32);
+        var nextIdx = (stepIndex + 1) % stepsCount;
+        var currentStepSecs = ~plonkStepDurSecs.(stepDurBeats);
+        var nextStepDurBeats = ~plonkStepBeatDur.(nextIdx);
+        var nextStepSecs = ~plonkStepDurSecs.(nextStepDurBeats);
+
+        if(nextIdx != 0) {
+            ~plonkTrackCount.do { |trackIdx|
+                var steps = ~plonkPlaybackStepsForTrack.(trackIdx);
+                var st = steps[nextIdx];
+                var audible = ~plonkMixerTrackAudible.(trackIdx);
+                var prevPlayed = ~plonkSeq[\lastStepPlayedByTrack][trackIdx] ? false;
+                var micro = (st[\micro] ? 0.0).clip(-0.49, 0.49);
+                var isTieContinuation = ~plonkIsTiedContinuation.(steps, nextIdx);
+                var condPass, didPlay = false;
+                var gateDurBeats, gateDurSecs, noteHoldBeats;
+                var delaySecs, plan;
+
+                ~plonkStepPrefire[trackIdx] = (active: false, stepIndex: nil, didPlay: false);
+
+                if(micro < 0 and: { isTieContinuation.not }) {
+                    condPass = ~plonkCheckCondition.(st, prevPlayed);
+
+                    if(
+                        audible and:
+                        { st[\on] == 1 } and:
+                        { condPass } and:
+                        { 1.0.rand <= st[\prob] }
+                    ) {
+                        if((st[\tie] ? 0).asInteger == 1) {
+                            noteHoldBeats = ~plonkTiedHoldBeats.(nextIdx, st[\length] ? 1);
+                            gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(nextStepDurBeats * 0.9);
+                        }{
+                            gateDurBeats = (nextStepDurBeats * st[\gate].clip(0.05, 1.25)).max(0.01);
+                        };
+
+                        gateDurSecs = ~plonkStepDurSecs.(gateDurBeats);
+                        delaySecs = (currentStepSecs - (micro.neg * nextStepSecs)).max(0.0);
+                        plan = ~plonkBuildVoiceTriggerPlan.(trackIdx, st, nextIdx);
+                        ~plonkSchedulePreparedStepTriggers.(plan, st, gateDurSecs, nextStepDurBeats, delaySecs);
+                        didPlay = true;
+                    };
+
+                    ~plonkStepPrefire[trackIdx] = (active: true, stepIndex: nextIdx, didPlay: didPlay);
+                };
+            };
+        };
+    };
+
         ~plonkSeqStop = {
         if(~plonkSeq[\task].notNil) {
             ~plonkSeq[\task].stop;
             ~plonkSeq[\task] = nil;
         };
 
+        ~plonkInvalidateScheduledTriggers.();
         ~plonkSeq[\isRunning] = false;
         ~plonkSeq[\currentStep] = -1;
 
         ~plonkMidiSync[\isPlaying] = false;
-        ~plonkMidiSync[\clockCount] = 0;
+        ~plonkMidiSync[\resumePending] = false;
+        ~plonkMidiSync[\pendingSongPos16ths] = nil;
+        ~plonkResetMidiClockTracking.();
         ~plonkMidiSync[\stepIndex] = 0;
 
         ~plonkRefreshPlayhead.();
@@ -2545,75 +3721,55 @@ args[\out] = outBus;
         var audible = ~plonkMixerTrackAudible.(trackIdx);
         var condPass, didPlay = false;
         var isTieContinuation, noteHoldBeats, gateDurBeats, gateDurSecs;
-        var useTie, prevPlayed;
-        var micro, maxNegMicroFrac, negMicroFrac, earlyShiftBeats;
+        var prevPlayed, micro, plan, prefireState;
 
+        prefireState = ~plonkStepPrefire[trackIdx] ? (active: false);
         isTieContinuation = ~plonkIsTiedContinuation.(steps, stepIndex);
 
-        if(isTieContinuation) {
-            ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = true;
+        if(prefireState[\active] and: { prefireState[\stepIndex] == stepIndex }) {
+            didPlay = prefireState[\didPlay] ? false;
+            ~plonkStepPrefire[trackIdx] = (active: false, stepIndex: nil, didPlay: false);
+            ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
         }{
-            prevPlayed = ~plonkSeq[\lastStepPlayedByTrack][trackIdx] ? false;
-            condPass = ~plonkCheckCondition.(st, prevPlayed);
+            if(isTieContinuation) {
+                ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = true;
+            }{
+                prevPlayed = ~plonkSeq[\lastStepPlayedByTrack][trackIdx] ? false;
+                condPass = ~plonkCheckCondition.(st, prevPlayed);
 
-            if(
-                audible and:
-                { st[\on] == 1 } and:
-                { condPass } and:
-                { 1.0.rand <= st[\prob] }
-            ) {
-                useTie = (st[\tie] ? 0).asInteger;
-                micro = (st[\micro] ? 0.0).clip(-0.49, 0.49);
+                if(
+                    audible and:
+                    { st[\on] == 1 } and:
+                    { condPass } and:
+                    { 1.0.rand <= st[\prob] }
+                ) {
+                    micro = (st[\micro] ? 0.0).clip(-0.49, 0.49);
 
-                // Negative microtiming should fire slightly early, so shorten the wait
-                // for the CURRENT step and let the helper handle only non-negative delay.
-                maxNegMicroFrac = 0.49;
-                negMicroFrac = micro.neg.max(0.0).min(maxNegMicroFrac);
-                earlyShiftBeats = stepDur * negMicroFrac;
-
-                if(useTie == 1) {
-                    noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
-                    gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
-                    gateDurSecs = if(~plonkMidiSync[\enabled]) {
-                        gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24);
+                    if((st[\tie] ? 0).asInteger == 1) {
+                        noteHoldBeats = ~plonkTiedHoldBeats.(stepIndex, st[\length] ? 1);
+                        gateDurBeats = (noteHoldBeats * st[\gate].clip(0.85, 1.25)).max(stepDur * 0.9);
                     }{
-                        gateDurBeats / (~plonkClock.tempo.max(0.0001));
+                        gateDurBeats = (stepDur * st[\gate].clip(0.05, 1.25)).max(0.01);
                     };
+
+                    gateDurSecs = ~plonkStepDurSecs.(gateDurBeats);
+                    plan = ~plonkBuildVoiceTriggerPlan.(trackIdx, st, stepIndex);
 
                     if(micro < 0) {
-                        SystemClock.sched(0.0, {
-                            ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
-                            nil
-                        });
+                        ~plonkSchedulePreparedStepTriggers.(plan, st, gateDurSecs, stepDur, 0.0);
                     }{
-                        ~plonkScheduleStepTriggers.(trackIdx, st, gateDurSecs, stepIndex, stepDur);
-                    };
-
-                    didPlay = true;
-                }{
-                    gateDurBeats = (stepDur * st[\gate].clip(0.05, 1.25)).max(0.01);
-                    gateDurSecs = if(~plonkMidiSync[\enabled]) {
-                        gateDurBeats * ((~plonkMidiSync[\secPerClock] ? (1 / 48)) * 24);
-                    }{
-                        gateDurBeats / (~plonkClock.tempo.max(0.0001));
-                    };
-
-                    if(micro < 0) {
-                        SystemClock.sched(0.0, {
-                            ~plonkTriggerStepVoices.(trackIdx, st, gateDurSecs, stepIndex);
-                            nil
-                        });
-                    }{
-                        ~plonkScheduleStepTriggers.(trackIdx, st, gateDurSecs, stepIndex, stepDur);
+                        ~plonkSchedulePreparedStepTriggers.(plan, st, gateDurSecs, stepDur, 0.0);
                     };
 
                     didPlay = true;
                 };
-            };
 
-            ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
+                ~plonkSeq[\lastStepPlayedByTrack][trackIdx] = didPlay;
+            };
         };
     };
+
+    ~plonkPrefireNextNegativeMicro.(stepIndex, stepDur);
 };
 
     ~plonkPlayLiveStep = { |stepIndex|
@@ -2624,15 +3780,14 @@ args[\out] = outBus;
 
     ~plonkAdvanceExternalStep = {
         var idx = (~plonkMidiSync[\stepIndex] ? 0).clip(0, 31);
+        var nextSongPos;
 
         ~plonkProcessStep.(idx);
 
-        idx = (idx + 1) % ~plonkSeq[\steps].clip(1, 32);
-        ~plonkMidiSync[\stepIndex] = idx;
+        nextSongPos = (~plonkMidiSync[\songPos16ths] ? 0) + 1;
+        ~plonkApplyExternalSongPosition.(nextSongPos);
 
-        if(idx == 0) {
-            ~plonkSeq[\cycleCount] = (~plonkSeq[\cycleCount] ? 1) + 1;
-            ~plonkAdvanceChain.();
+        if((~plonkMidiSync[\stepIndex] ? 0) == 0) {
             ~plonkRunMutationIfNeeded.();
 
             AppClock.sched(0, {
@@ -2642,21 +3797,24 @@ args[\out] = outBus;
         };
     };
 
-        ~plonkSeqStart = {
+        ~plonkSeqStart = { |startIdx=0, resetChain=true|
         ~plonkSeqStop.();
+        ~plonkInvalidateScheduledTriggers.();
         ~plonkSeq[\isRunning] = true;
         ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
-        ~plonkResetChain.();
+        if(resetChain) { ~plonkResetChain.() };
         ~plonkClock.tempo = ~plonkSeq[\tempo] / 60;
 
         if(~plonkMidiSync[\enabled]) {
             ~plonkMidiSync[\isPlaying] = false;
-            ~plonkMidiSync[\clockCount] = 0;
-            ~plonkMidiSync[\stepIndex] = 0;
+            ~plonkMidiSync[\resumePending] = false;
+            ~plonkMidiSync[\pendingSongPos16ths] = nil;
+            ~plonkResetMidiClockTracking.();
+            ~plonkApplyExternalSongPosition.(startIdx.asInteger.clip(0, ~plonkSeq[\steps].clip(1, 32) - 1));
             ~plonkUpdateMidiSyncStatus.();
         }{
             ~plonkSeq[\task] = Task({
-                var idx = 0;
+                var idx = startIdx.asInteger.clip(0, ~plonkSeq[\steps].clip(1, 32) - 1);
                 loop {
                     ~plonkPlayLiveStep.(idx);
                     idx = (idx + 1) % ~plonkSeq[\steps].clip(1, 32);
@@ -2676,8 +3834,49 @@ args[\out] = outBus;
         };
     };
 
+    ~plonkSeqRestart = {
+        ~plonkSeq[\cycleCount] = 1;
+        ~plonkSeqStart.(0, true);
+    };
 
-    ~plonkRandomizeOnePattern = { |steps|
+    ~plonkSeqContinue = {
+        var nextIdx = ((~plonkSeq[\currentStep] ? -1) + 1) % ~plonkSeq[\steps].clip(1, 32);
+        if(~plonkMidiSync[\enabled]) {
+            ~plonkSeq[\isRunning] = true;
+            ~plonkMidiSync[\isPlaying] = true;
+            ~plonkMidiSync[\resumePending] = false;
+            ~plonkMidiSync[\lastClockTime] = nil;
+            ~plonkMidiSync[\clockDtHistory] = List.new;
+            ~plonkUpdateMidiSyncStatus.();
+        }{
+            ~plonkSeqStart.(nextIdx, false);
+        };
+    };
+
+    ~plonkResetCycleCount = {
+        ~plonkSeq[\cycleCount] = 1;
+        if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+    };
+
+
+	    ~plonkRandomizeKick808Locks = { |st, amount=1.0|
+	        amount = amount.clip(0.0, 1.0);
+	        if((amount * 0.70).coin) { st[\locks][\model] = [2, 3].choose };
+	        if((amount * 0.60).coin) { st[\locks][\exciterType] = [0, 4, 5].choose };
+	        if((amount * 0.45).coin) { st[\locks][\drive] = rrand(1.0, 2.0) };
+	        if((amount * 0.85).coin) { st[\locks][\kickSubAmt] = rrand(0.45, 1.0) };
+	        if((amount * 0.75).coin) { st[\locks][\kickSubDecay] = rrand(0.45, 2.6) };
+	        if((amount * 0.80).coin) { st[\locks][\kickPunch] = rrand(0.65, 3.6) };
+	        if((amount * 0.55).coin) { st[\locks][\kickDrive] = rrand(0.0, 0.95) };
+	        if((amount * 0.65).coin) { st[\locks][\kickClick] = rrand(0.05, 0.75) };
+	        if((amount * 0.55).coin) { st[\locks][\pitchEnvAmt] = rrand(0.45, 1.8) };
+	        if((amount * 0.50).coin) { st[\locks][\pitchEnvDecay] = rrand(0.018, 0.14) };
+	        if((amount * 0.40).coin) { st[\locks][\foldAmt] = rrand(0.0, 0.65) };
+	        if((amount * 0.38).coin) { st[\locks][\crushMix] = rrand(0.0, 0.45) };
+	        if((amount * 0.42).coin) { st[\locks][\edgeDrive] = rrand(1.0, 6.0) };
+	    };
+
+	    ~plonkRandomizeOnePattern = { |steps|
         32.do { |i|
             var st = steps[i];
 
@@ -2734,7 +3933,7 @@ args[\out] = outBus;
             if(0.35.coin) { st[\locks][\inharm] = rrand(0.0, 0.8) } { st[\locks][\inharm] = nil };
             if(0.30.coin) { st[\locks][\decay] = rrand(0.08, 2.5) } { st[\locks][\decay] = nil };
             if(0.25.coin) { st[\locks][\exciterType] = rrand(0, 5) } { st[\locks][\exciterType] = nil };
-            if(0.20.coin) { st[\locks][\model] = rrand(0, 3) } { st[\locks][\model] = nil };
+            if(0.20.coin) { st[\locks][\model] = rrand(0, 5) } { st[\locks][\model] = nil };
 
 			if(0.35.coin) { st[\locks][\filterCutoff] = rrand(0.08, 0.95) } { st[\locks][\filterCutoff] = nil };
 			if(0.30.coin) { st[\locks][\filterRes] = rrand(0.05, 0.90) } { st[\locks][\filterRes] = nil };
@@ -2745,7 +3944,7 @@ args[\out] = outBus;
 			if(0.18.coin) { st[\locks][\combTime] = exprand(0.0009, 0.018) } { st[\locks][\combTime] = nil };
 			if(0.16.coin) { st[\locks][\combDecay] = rrand(0.04, 0.75) } { st[\locks][\combDecay] = nil };
 
-			if(0.28.coin) { st[\locks][\edgeDrive] = rrand(0.8, 4.5) } { st[\locks][\edgeDrive] = nil };
+				if(0.28.coin) { st[\locks][\edgeDrive] = rrand(1.0, 4.5) } { st[\locks][\edgeDrive] = nil };
 			if(0.22.coin) { st[\locks][\foldAmt] = rrand(0.0, 0.45) } { st[\locks][\foldAmt] = nil };
 			if(0.20.coin) { st[\locks][\presence] = rrand(-0.2, 0.8) } { st[\locks][\presence] = nil };
 
@@ -2753,9 +3952,10 @@ args[\out] = outBus;
 			if(0.14.coin) { st[\locks][\bitDepth] = rrand(6, 14) } { st[\locks][\bitDepth] = nil };
 			if(0.14.coin) { st[\locks][\downsample] = [1, 2, 3, 4, 6, 8, 12].choose } { st[\locks][\downsample] = nil };
 
-			if(0.12.coin) { st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose } { st[\locks][\filterMode] = nil };
-        };
-    };
+				if(0.12.coin) { st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose } { st[\locks][\filterMode] = nil };
+	            if(~plonkSelectedTrack == 0) { ~plonkRandomizeKick808Locks.(st, 0.65) };
+	        };
+	    };
 
 
 	~plonkRandomizeSelectionRange = { |trackIdx, varIdx, startStep=0, endStep=7, mode=\full, amount=1.0|
@@ -2829,6 +4029,26 @@ args[\out] = outBus;
                 };
                 if((amount * 0.65).coin) {
                     st[\locks][\velocity] = rrand(0.35, 1.0);
+                };
+            },
+
+            \condition, {
+                if((amount * 0.90).coin) {
+                    st[\prob] = rrand(0.45, 1.0);
+                };
+                if((amount * 0.85).coin) {
+                    st[\condType] = [0, 0, 0, 1, 2, 3, 4, 9, 10, 11].choose;
+                };
+                if(st[\condType] == 11) {
+                    if((amount * 0.85).coin) {
+                        st[\condA] = rrand(1, 4);
+                    };
+                    if((amount * 0.85).coin) {
+                        st[\condB] = [2, 3, 4, 5, 6, 8].choose;
+                    };
+                }{
+                    if((amount * 0.55).coin) { st[\condA] = 1 };
+                    if((amount * 0.55).coin) { st[\condB] = 2 };
                 };
             },
 
@@ -2963,7 +4183,7 @@ if((amount * 0.18).coin) {
 };
 
 if((amount * 0.35).coin) {
-    st[\locks][\edgeDrive] = rrand(0.8, 4.5);
+	    st[\locks][\edgeDrive] = rrand(1.0, 4.5);
 };
 if((amount * 0.24).coin) {
     st[\locks][\foldAmt] = rrand(0.0, 0.45);
@@ -2982,11 +4202,14 @@ if((amount * 0.15).coin) {
     st[\locks][\downsample] = [1, 2, 3, 4, 6, 8, 12].choose;
 };
 
-if((amount * 0.12).coin) {
-    st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose;
-};
-            }
-        );
+	if((amount * 0.12).coin) {
+	    st[\locks][\filterMode] = [0, 0, 0, 1, 2, 3].choose;
+	};
+	if(trackIdx == 0) {
+	    ~plonkRandomizeKick808Locks.(st, amount * 0.85);
+	};
+	            }
+	        );
     };
 };
 
@@ -3002,7 +4225,24 @@ if((amount * 0.12).coin) {
 };
 
 ~plonkRandomizeCurrentSelectionAndRefresh = { |startStep=0, endStep=7, mode=\full, amount=1.0|
+    ~plonkPushUndo.("Randomize " ++ mode.asString);
     ~plonkRandomizeCurrentSelection.(startStep, endStep, mode, amount);
+    ~plonkEditor[\randomizeLabel] = "Randomize: " ++ mode.asString ++ " | Scope: Steps " ++ (startStep + 1).asString ++ "-" ++ (endStep + 1).asString;
+    ~plonkMarkDirty.(true);
+
+    if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+    if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+};
+
+~plonkRandomizeSelectedStepsAndRefresh = { |mode=\full, amount=1.0|
+    var targets = ~plonkStepTargets.();
+    ~plonkPushUndo.("Randomize selected");
+    ~plonkUpdateRandomizeScopeLabel.(mode);
+    targets.do { |idx|
+        ~plonkRandomizeSelectionRange.(~plonkSelectedTrack, ~plonkSeq[\editVariation], idx, idx, mode, amount);
+    };
+    ~plonkUpdateRandomizeScopeLabel.(mode);
+    ~plonkMarkDirty.(true);
 
     if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
     if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
@@ -3013,10 +4253,104 @@ if((amount * 0.12).coin) {
     };
 
    ~plonkRandomizePatternAndRefresh = {
+    ~plonkPushUndo.("Randomize pattern");
     ~plonkRandomizePattern.();
+    ~plonkEditor[\randomizeLabel] = "Randomize: Full | Scope: Pattern";
+    ~plonkMarkDirty.(true);
 
     if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
     if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+};
+
+~plonkApplyMutationPreset = { |preset|
+    ~plonkMutate[\preset] = preset;
+    switch(preset,
+        \subtle, {
+            ~plonkMutate[\amount] = 0.12;
+            ~plonkMutate[\everyCycles] = 8;
+        },
+        \wild, {
+            ~plonkMutate[\amount] = 0.55;
+            ~plonkMutate[\everyCycles] = 2;
+        },
+        {
+            ~plonkMutate[\amount] = 0.25;
+            ~plonkMutate[\everyCycles] = 4;
+        }
+    );
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkApplyMacrosToCurrentVariation = {
+    var steps = ~plonkEditStepsForSelectedTrack.();
+    var density = (~plonkMacros[\density] ? 0.5).clip(0, 1);
+    var complexity = (~plonkMacros[\complexity] ? 0.35).clip(0, 1);
+    var stability = (~plonkMacros[\stability] ? 0.65).clip(0, 1);
+    var humanize = (~plonkMacros[\humanize] ? 0.25).clip(0, 1);
+    var contrast = (~plonkMacros[\contrast] ? 0.35).clip(0, 1);
+
+    ~plonkPushUndo.("Apply macros");
+
+    32.do { |i|
+        var st = steps[i];
+        var densityChance = density.linlin(0, 1, 0.15, 0.92);
+        var accentChance = contrast.linlin(0, 1, 0.08, 0.60);
+
+        st[\on] = if(1.0.rand < densityChance) { 1 } { 0 };
+        st[\prob] = stability.linlin(0, 1, 0.55, 1.0).clip(0.2, 1.0);
+        st[\micro] = rrand(humanize.neg, humanize) * 0.18;
+        st[\gate] = rrand(0.45, 0.95 + (humanize * 0.25)).clip(0.05, 1.25);
+        st[\accent] = if(1.0.rand < accentChance) { [0.45, 0.65, 0.85, 1.0].choose } { [0.0, 0.0, 0.20].choose };
+
+        if((complexity * 0.60).coin) {
+            st[\ratchet] = [1, 1, 2, 2, 3, 4].wchoose([0.42, 0.22, 0.16, 0.10, 0.06, 0.04]);
+        };
+
+        if((complexity * 0.42).coin) {
+            st[\condType] = [0, 0, 1, 2, 3, 7, 9, 10, 11].choose;
+            if(st[\condType] == 11) {
+                st[\condA] = rrand(1, 4);
+                st[\condB] = [2, 3, 4, 6, 8].choose;
+            };
+        };
+
+        if((complexity * 0.30).coin) {
+            st[\layerMode] = [0, 0, 1, 1, 2, 3].choose;
+            st[\layerLevel] = rrand(0.15, 0.50);
+        };
+
+        if((humanize * 0.50).coin) {
+            st[\locks][\velocity] = rrand(0.42, 1.0);
+        };
+    };
+
+    ~plonkMutate[\amount] = (~plonkMutate[\amount] * (1.0 - (stability * 0.45))).clip(0.02, 0.75);
+    ~plonkMarkDirty.(true);
+    if(~plonkRefreshPatternUI.notNil) { ~plonkRefreshPatternUI.() };
+    if(~plonkRefreshLockEditor.notNil) { ~plonkRefreshLockEditor.() };
+};
+
+~plonkCaptureCompareSnapshot = {
+    ~plonkEditor[\compareSnapshot] = ~plonkSnapshotState.();
+    ~plonkEditor[\compareAuditioning] = false;
+    ~plonkEditor[\compareLabel] = "Snapshot: captured";
+    if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+};
+
+~plonkToggleCompareSnapshot = {
+    if(~plonkEditor[\compareSnapshot].notNil) {
+        if(~plonkEditor[\compareAuditioning]) {
+            ~plonkRestoreSnapshot.(~plonkEditor[\compareReturnSnapshot]);
+            ~plonkEditor[\compareAuditioning] = false;
+            ~plonkEditor[\compareLabel] = "Snapshot: current";
+        }{
+            ~plonkEditor[\compareReturnSnapshot] = ~plonkSnapshotState.();
+            ~plonkRestoreSnapshot.(~plonkEditor[\compareSnapshot]);
+            ~plonkEditor[\compareAuditioning] = true;
+            ~plonkEditor[\compareLabel] = "Snapshot: auditioning";
+        };
+        if(~plonkRefreshEditorStatusUI.notNil) { ~plonkRefreshEditorStatusUI.() };
+    };
 };
 
     // --------------------------------------------------------
@@ -3034,7 +4368,11 @@ if((amount * 0.12).coin) {
             pitch: ~plonkPitch.copy,
             selectedTrack: ~plonkSelectedTrack
         ).writeArchive(path);
-        ("Saved pattern: " ++ path).postln;
+        ~plonkSetPatternName.(name, false);
+        ~plonkRefreshRecentPatterns.();
+        if(~plonkDebug) {
+            ("Saved pattern: " ++ path).postln;
+        };
     };
 
     ~plonkLoadPattern = { |name="pattern1"|
@@ -3047,13 +4385,23 @@ if((amount * 0.12).coin) {
             ~plonkTrackPatterns = obj[\trackPatterns].collect { |trackArr|
                 trackArr.collect { |arr| arr.collect(_.deepCopy) }
             };
-            ~plonkTrackStates = obj[\trackStates].collect(_.copy);
-            ~plonkMutate = obj[\mutate].copy;
+            ~plonkTrackStates = obj[\trackStates].collect { |savedState, idx|
+                ~plonkMergedTrackState.(idx, savedState)
+            };
+            ~plonkEditor[\currentSoundNames] = Array.fill(~plonkTrackCount, { |i|
+                ~plonkTrackNames[i] ++ " Pattern"
+            });
+            if(obj[\mutate].notNil) { ~plonkMutate.putAll(obj[\mutate].copy) };
             if(obj[\pitch].notNil) { ~plonkPitch = obj[\pitch].copy };
             ~plonkSelectedTrack = (obj[\selectedTrack] ? 0).clip(0, ~plonkTrackCount - 1);
             ~plonkSetEditVariation.(~plonkSeq[\editVariation] ? 0);
             ~plonkClock.tempo = ~plonkSeq[\tempo] / 60;
-            ("Loaded pattern: " ++ path).postln;
+            ~plonkSetPatternName.(name, false);
+            ~plonkRefreshRecentPatterns.();
+            if(~plonkRefreshTrackSoundUI.notNil) { ~plonkRefreshTrackSoundUI.() };
+            if(~plonkDebug) {
+                ("Loaded pattern: " ++ path).postln;
+            };
         }{
             ("Pattern not found: " ++ path).warn;
         };
@@ -3069,28 +4417,41 @@ if((amount * 0.12).coin) {
     MIDIdef.start(\plonkStartIn).free;
     MIDIdef.continue(\plonkContinueIn).free;
     MIDIdef.stop(\plonkStopIn).free;
+    MIDIdef.songPosition(\plonkSongPosIn).free;
 };
 
 
 	~plonkInitMidiSystem = {
     MIDIClient.disposeClient;
     MIDIClient.init(nil, nil, true);
-    MIDIIn.connectAll;
+    if((~plonkMidiSync[\inputMode] ? \none) == \none) {
+        MIDIIn.disconnectAll;
+    }{
+        MIDIIn.connectAll(false);
+    };
     ~plonkMidiSources = (MIDIClient.sources ? []).asArray;
 };
 
  ~plonkInstallMidi = {
-    var wantedUID;
+    var wantedUID, inputMode;
 
     ~plonkFreeMidiDefs.();
     ~plonkInitMidiSystem.();
 
+    inputMode = (~plonkMidiSync[\inputMode] ? \none);
     wantedUID = ~plonkMidiSync[\sourceUID];
+
+    if(inputMode == \none) {
+        MIDIIn.disconnectAll;
+        {
+            ~plonkUpdateMidiSyncStatus.();
+        }.defer;
+    }{
 
     MIDIdef.noteOn(\plonkV520On, { |vel, note, chan, src|
         var trackIdx, args, accept;
 
-        accept = wantedUID.isNil or: { src == wantedUID };
+        accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
 
         if(~plonkDebug) {
             ["NOTEON RAW", "src:", src, "wanted:", wantedUID, "chan:", chan, "note:", note, "vel:", vel].postln;
@@ -3107,7 +4468,7 @@ if((amount * 0.12).coin) {
     });
 
     MIDIdef.start(\plonkStartIn, { |src|
-        var accept = wantedUID.isNil or: { src == wantedUID };
+        var accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
 
         if(~plonkDebug) {
             ["START RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
@@ -3119,16 +4480,15 @@ if((amount * 0.12).coin) {
                 ~plonkSeq[\task] = nil;
             };
 
+            ~plonkInvalidateScheduledTriggers.();
             ~plonkSeq[\isRunning] = true;
             ~plonkSeq[\currentStep] = -1;
             ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
-            ~plonkSeq[\cycleCount] = 1;
-            ~plonkResetChain.();
-
+            ~plonkApplyExternalSongPosition.(0);
             ~plonkMidiSync[\isPlaying] = true;
-            ~plonkMidiSync[\clockCount] = 0;
-            ~plonkMidiSync[\stepIndex] = 0;
-            ~plonkMidiSync[\lastClockTime] = nil;
+            ~plonkMidiSync[\pendingSongPos16ths] = nil;
+            ~plonkMidiSync[\resumePending] = true;
+            ~plonkResetMidiClockTracking.();
 
             if(~plonkDebug) {
                 ["START ACCEPTED", "src:", src].postln;
@@ -3141,8 +4501,34 @@ if((amount * 0.12).coin) {
         };
     });
 
+    MIDIdef.songPosition(\plonkSongPosIn, { |position, src|
+        var accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
+        var songPos = position.asInteger.max(0);
+
+        if(~plonkDebug) {
+            ["SONGPOS RAW", "src:", src, "pos:", songPos, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
+        };
+
+        if(accept and: { ~plonkMidiSync[\enabled] }) {
+            ~plonkMidiSync[\pendingSongPos16ths] = songPos;
+
+            if(~plonkMidiSync[\isPlaying].not) {
+                ~plonkInvalidateScheduledTriggers.();
+                ~plonkSeq[\currentStep] = -1;
+                ~plonkApplyExternalSongPosition.(songPos);
+                ~plonkMidiSync[\resumePending] = true;
+                ~plonkResetMidiClockTracking.();
+
+                {
+                    ~plonkRefreshPlayhead.();
+                    ~plonkUpdateMidiSyncStatus.();
+                }.defer;
+            };
+        };
+    });
+
     MIDIdef.continue(\plonkContinueIn, { |src|
-        var accept = wantedUID.isNil or: { src == wantedUID };
+        var accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
 
         if(~plonkDebug) {
             ["CONTINUE RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
@@ -3154,33 +4540,50 @@ if((amount * 0.12).coin) {
                 ~plonkSeq[\task] = nil;
             };
 
+            ~plonkInvalidateScheduledTriggers.();
             ~plonkSeq[\isRunning] = true;
             ~plonkMidiSync[\isPlaying] = true;
             ~plonkMidiSync[\lastClockTime] = nil;
+            ~plonkMidiSync[\clockDtHistory] = List.new;
+
+            if(~plonkMidiSync[\pendingSongPos16ths].notNil) {
+                ~plonkSeq[\currentStep] = -1;
+                ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
+                ~plonkApplyExternalSongPosition.(~plonkMidiSync[\pendingSongPos16ths]);
+                ~plonkMidiSync[\pendingSongPos16ths] = nil;
+                ~plonkMidiSync[\resumePending] = true;
+                ~plonkResetMidiClockTracking.();
+            }{
+                ~plonkMidiSync[\resumePending] = false;
+            };
 
             if(~plonkDebug) {
                 ["CONTINUE ACCEPTED", "src:", src].postln;
             };
 
             {
+                ~plonkRefreshPlayhead.();
                 ~plonkUpdateMidiSyncStatus.();
             }.defer;
         };
     });
 
     MIDIdef.stop(\plonkStopIn, { |src|
-        var accept = wantedUID.isNil or: { src == wantedUID };
+        var accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
 
         if(~plonkDebug) {
             ["STOP RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled]].postln;
         };
 
         if(accept and: { ~plonkMidiSync[\enabled] }) {
+            ~plonkInvalidateScheduledTriggers.();
             ~plonkMidiSync[\isPlaying] = false;
             ~plonkSeq[\isRunning] = false;
             ~plonkSeq[\currentStep] = -1;
             ~plonkMidiSync[\lastClockTime] = nil;
             ~plonkMidiSync[\clockCount] = 0;
+            ~plonkMidiSync[\resumePending] = false;
+            ~plonkMidiSync[\clockDtHistory] = List.new;
 
             if(~plonkDebug) {
                 ["STOP ACCEPTED", "src:", src].postln;
@@ -3194,34 +4597,47 @@ if((amount * 0.12).coin) {
     });
 
     MIDIdef.midiClock(\plonkClockIn, { |src|
-        var now, dt, accept;
+        var now, dt, accept, phase, clocksPerStep;
 
-        accept = wantedUID.isNil or: { src == wantedUID };
+        accept = (inputMode == \any) or: { (inputMode == \source) and: { src == wantedUID } };
 
         if(accept and: { ~plonkDebug }) {
             ["CLOCK RAW", "src:", src, "wanted:", wantedUID, "enabled:", ~plonkMidiSync[\enabled], "playing:", ~plonkMidiSync[\isPlaying]].postln;
         };
 
         if(accept and: { ~plonkMidiSync[\enabled] } and: { ~plonkMidiSync[\isPlaying] }) {
+            if(~plonkMidiSync[\pendingSongPos16ths].notNil) {
+                ~plonkInvalidateScheduledTriggers.();
+                ~plonkSeq[\currentStep] = -1;
+                ~plonkSeq[\lastStepPlayedByTrack] = Array.fill(~plonkTrackCount, { false });
+                ~plonkApplyExternalSongPosition.(~plonkMidiSync[\pendingSongPos16ths]);
+                ~plonkMidiSync[\pendingSongPos16ths] = nil;
+                ~plonkMidiSync[\resumePending] = true;
+                ~plonkResetMidiClockTracking.();
+            };
+
             now = Main.elapsedTime;
 
             if(~plonkMidiSync[\lastClockTime].notNil) {
                 dt = now - ~plonkMidiSync[\lastClockTime];
-                if(dt > 0) {
-                    ~plonkMidiSync[\secPerClock] = dt;
-                };
+                ~plonkRecordExternalClockDt.(dt);
             };
 
             ~plonkMidiSync[\lastClockTime] = now;
             ~plonkMidiSync[\clockCount] = (~plonkMidiSync[\clockCount] ? 0) + 1;
+            clocksPerStep = (~plonkMidiSync[\clocksPerStep] ? 6).asInteger.max(1);
+            phase = (~plonkMidiSync[\clockPhase] ? 0).asInteger % clocksPerStep;
 
             if(((~plonkMidiSync[\clockCount] % 24) == 0) and: { ~plonkDebug }) {
                 ["CLOCK ACCEPTED", "src:", src, "count:", ~plonkMidiSync[\clockCount]].postln;
             };
 
-            if((~plonkMidiSync[\clockCount] % (~plonkMidiSync[\clocksPerStep] ? 6)) == 0) {
+            if(~plonkMidiSync[\resumePending] or: { phase == 0 }) {
+                ~plonkMidiSync[\resumePending] = false;
                 ~plonkAdvanceExternalStep.();
             };
+
+            ~plonkMidiSync[\clockPhase] = (phase + 1) % clocksPerStep;
         };
     });
 
@@ -3236,6 +4652,7 @@ if((amount * 0.12).coin) {
     {
         ~plonkUpdateMidiSyncStatus.();
     }.defer;
+    };
 };
 
     ~plonkInstallMidi.();
@@ -3267,14 +4684,17 @@ if((amount * 0.12).coin) {
         var stepLabels = Array.newClear(32);
         var stepNoteMiniLabels = Array.newClear(32);
         var condMiniLabels = Array.newClear(32);
-        var patternField, baseMidiLabel, stepNoteLabel, condSummaryLabel, chainSummaryLabel;
+        var patternField, soundField, baseMidiLabel, stepNoteLabel, condSummaryLabel, chainSummaryLabel;
+        var patternStatusLabel, soundStatusLabel, clipboardStatusLabel, randomizeStatusLabel, helpStatusLabel, recentPatternMenu, recentSoundMenu, freqNoteLabel;
+        var pasteModeMenu, selectedCondMenu, selectedLayerMenu, compareStatusLabel;
         var copiedVariation = nil;
         var lockStep = 0;
         var lockBoxes = IdentityDictionary.new;
         var lockEnableButtons = IdentityDictionary.new;
-        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI;
+        var sectionButtons = IdentityDictionary.new;
+        var showPage, refreshControls, refreshPatternUI, refreshLockEditor, refreshVarButtons, refreshChainUI, refreshEditorStatusUI, refreshTrackSoundUI, applyStepSectionVisibility, handleShortcut;
 	var makeButton, makePage, makeSlider, makeMenu, makeBoundedBox, makePageTitle, makeSectionLabel, polishControls;
-        var modelNames = ["Bar", "Plate", "Bell", "Drum"];
+        var modelNames = ["Beam", "Marimba", "Drumhead", "Membrane", "Plate", "String"];
         var exciterNames = ["Mallet", "HardPick", "Brush", "Scrape", "Burst", "ImpulseCluster"];
 
         var varButtons = Array.newClear(4);
@@ -3355,9 +4775,15 @@ makePage = { |key|
             nb.font_(controlFont);
             nb.action_({ |box|
                 var val = box.value.clip(lo, hi);
+                if(~plonkCurrentPage == \step) {
+                    ~plonkPushUndo.("Step Edit");
+                };
                 if(decimals == 0) { val = val.asInteger };
                 box.value_(val);
                 action.value(box, val);
+                if([\main, \exciter, \res, \perf, \pattern, \step, \live].includes(~plonkCurrentPage)) {
+                    ~plonkMarkDirty.(true);
+                };
             });
             nb;
         };
@@ -3370,10 +4796,12 @@ showPage = { |key|
     if(pages[key].notNil) {
         pages[key].visible_(true);
     };
+    ~plonkCurrentPage = key;
 
     if(refreshControls.notNil) { refreshControls.() };
     if(refreshPatternUI.notNil) { refreshPatternUI.() };
     if(refreshLockEditor.notNil) { refreshLockEditor.() };
+    if(applyStepSectionVisibility.notNil) { applyStepSectionVisibility.() };
     if(key == \mixer) {
         if(~plonkStartMixerMeters.notNil) { ~plonkStartMixerMeters.() };
     }{
@@ -3381,6 +4809,8 @@ showPage = { |key|
     };
 	if(~plonkRefreshMixerUI.notNil and: { key == \mixer }) { ~plonkRefreshMixerUI.() };
     if(~plonkRefreshAudioMenus.notNil and: { key == \audio }) { ~plonkRefreshAudioMenus.() };
+    if(refreshTrackSoundUI.notNil) { refreshTrackSoundUI.() };
+    if(refreshEditorStatusUI.notNil) { refreshEditorStatusUI.() };
 
     content.refresh;
 };
@@ -3410,6 +4840,7 @@ showPage = { |key|
         v = v.clip(min, max);
         state[key] = v;
         nb.value_(v);
+        ~plonkMarkDirty.(true);
 
         if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
     });
@@ -3427,6 +4858,7 @@ showPage = { |key|
 
         state[key] = v;
         sl.value_(norm.clip(0, 1));
+        ~plonkMarkDirty.(true);
 
         if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
     });
@@ -3452,6 +4884,7 @@ makeMenu = { |parent, x, y, label, key, items|
     pm.items_(items);
     pm.action_({
         ~plonkTrackStates[~plonkSelectedTrack][key] = pm.value;
+        ~plonkMarkDirty.(true);
 
         if(~plonkRefreshControls.notNil) { ~plonkRefreshControls.() };
     });
@@ -3478,11 +4911,15 @@ makeMenu = { |parent, x, y, label, key, items|
 	refreshControls = {
     var state = ~plonkTrackStates[~plonkSelectedTrack];
 
-    controls.keysValuesDo { |k, controlList|
-        var v = state[k];
-        var norm;
+	    controls.keysValuesDo { |k, controlList|
+	        var v = state[k];
+	        var norm;
+	        if(v.isNil) {
+	            v = ~plonkMakeTrackState.(~plonkSelectedTrack)[k] ? 0;
+	            state[k] = v;
+	        };
 
-        controlList.do { |c|
+	        controlList.do { |c|
             if(c[\type] == \slider) {
                 if(c[\spec] == \exp) {
                     norm = v.explin(c[\min].max(0.0001), c[\max], 0, 1);
@@ -3495,10 +4932,14 @@ makeMenu = { |parent, x, y, label, key, items|
             }{
                 if(c[\type] == \menu) {
                     c[\menu].value_(v.asInteger);
-                };
-            };
-        };
-    };
+	            };
+	        };
+	    };
+
+	    if(freqNoteLabel.notNil) {
+	        freqNoteLabel.string_(~plonkFreqNoteString.(state[\freq] ? 220));
+	    };
+	};
 };
 
         refreshVarButtons = {
@@ -3578,6 +5019,101 @@ makeMenu = { |parent, x, y, label, key, items|
             };
         };
 
+        refreshEditorStatusUI = {
+            var patternName = ~plonkEditor[\currentPatternName] ? "pattern1";
+            var dirtyMark = if(~plonkEditor[\dirty]) { " *" } { "" };
+            var recent = ~plonkEditor[\recentPatterns] ? [];
+
+            if(patternStatusLabel.notNil) {
+                patternStatusLabel.string_("Pattern: " ++ patternName ++ dirtyMark);
+            };
+            if(clipboardStatusLabel.notNil) {
+                clipboardStatusLabel.string_(~plonkEditor[\clipboardLabel] ? "Clipboard empty");
+            };
+            if(randomizeStatusLabel.notNil) {
+                randomizeStatusLabel.string_(~plonkEditor[\randomizeLabel] ? "");
+            };
+            if(helpStatusLabel.notNil) {
+                helpStatusLabel.string_(~plonkEditor[\helpText] ? "");
+            };
+            if(compareStatusLabel.notNil) {
+                compareStatusLabel.string_(~plonkEditor[\compareLabel] ? "Snapshot: none");
+            };
+            if(recentPatternMenu.notNil) {
+                recentPatternMenu.items_(["Recent Patterns"] ++ recent);
+                recentPatternMenu.value_(0);
+            };
+            if(pasteModeMenu.notNil) {
+                pasteModeMenu.value_(~plonkPasteModeNames.indexOf(
+                    switch(~plonkEditor[\pasteMode] ? \overwrite,
+                        \merge, { "Merge" },
+                        \timing, { "Timing" },
+                        \pitch, { "Pitch" },
+                        \conditions, { "Conditions" },
+                        \layer, { "Layer" },
+                        { "Overwrite" }
+                    )
+                ) ? 0);
+            };
+        };
+
+        refreshTrackSoundUI = {
+            var trackIdx = ~plonkSelectedTrack.clip(0, ~plonkTrackCount - 1);
+            var currentName = ~plonkCurrentTrackSoundName.(trackIdx);
+            var defaultNames = ~plonkEditor[\defaultSoundNames] ? Array.fill(~plonkTrackCount, { |i| ~plonkResolvedTrackDefaultName.(i) });
+            var recentLists = ~plonkEditor[\recentSounds] ? Array.fill(~plonkTrackCount, { [] });
+            var defaultName = if((defaultNames.notNil) and: { trackIdx < defaultNames.size } and: { defaultNames[trackIdx].notNil }) {
+                defaultNames[trackIdx].asString
+            }{
+                ~plonkResolvedTrackDefaultName.(trackIdx)
+            };
+            var recent = if((recentLists.notNil) and: { trackIdx < recentLists.size } and: { recentLists[trackIdx].notNil }) {
+                recentLists[trackIdx]
+            }{
+                []
+            };
+
+            if(soundField.notNil) {
+                soundField.string_(currentName);
+            };
+            if(soundStatusLabel.notNil) {
+                soundStatusLabel.string_(
+                    "Track: " ++ ~plonkTrackNames[trackIdx]
+                    ++ " | Current: " ++ currentName
+                    ++ " | Default: " ++ defaultName.asString
+                );
+            };
+            if(recentSoundMenu.notNil) {
+                recentSoundMenu.items_(["Recent " ++ ~plonkTrackNames[trackIdx] ++ " Sounds"] ++ recent);
+                recentSoundMenu.value_(0);
+            };
+        };
+
+        applyStepSectionVisibility = {
+            if(pages[\step].notNil) {
+                pages[\step].children.do { |child|
+                    var y = child.bounds.top;
+                    var keep = true;
+                    if((y >= 42) and: { y < 104 }) { keep = ~plonkEditor[\stepSections][\basic] };
+            if((y >= 104) and: { y < 150 }) { keep = (~plonkEditor[\stepSections][\pitch] or: { ~plonkEditor[\stepSections][\conditions] }) };
+                    if((y >= 158) and: { y < 320 }) { keep = ~plonkEditor[\stepSections][\layer] };
+	                    if((y >= 332) and: { y < 642 }) { keep = ~plonkEditor[\stepSections][\locks] };
+	                    if(y >= 642) { keep = true };
+                    child.visible_(keep);
+                };
+
+	                sectionButtons.keysValuesDo { |key, bt|
+	                    var isOn = ~plonkEditor[\stepSections][key] ? true;
+	                    if(key == \pitch) {
+	                        isOn = ((~plonkEditor[\stepSections][\pitch] ? true) or: { (~plonkEditor[\stepSections][\conditions] ? true) });
+	                        ~plonkEditor[\stepSections][\pitch] = isOn;
+	                        ~plonkEditor[\stepSections][\conditions] = isOn;
+	                    };
+	                    bt.value_(isOn.asInteger);
+	                };
+            };
+        };
+
        refreshPatternUI = {
     var editSteps = ~plonkEditStepsForSelectedTrack.();
     var playSteps = ~plonkPlaybackStepsForSelectedTrack.();
@@ -3602,21 +5138,7 @@ var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
 
         if(stepButtons[i].notNil) {
             stepButtons[i].enabled_(isActive);
-
-            if(i == ~plonkSeq[\currentStep]) {
-                stepButtons[i].states_([
-                    ["-", Color.black, Color(1.0, 0.82, 0.0)],
-                    ["●", Color.black, Color(1.0, 0.82, 0.0)]
-                ]);
-            }{
-                stepButtons[i].states_([
-                    ["-", Color.black, Color.grey(0.85)],
-                    ["●", Color.white, Color.black]
-                ]);
-            };
-
-            // show what is CURRENTLY PLAYING, not just what is being edited
-            stepButtons[i].value_(stPlay[\on]);
+            stepButtons[i].refresh;
         };
 
         if(stepEditButtons[i].notNil) {
@@ -3678,6 +5200,7 @@ var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
 
     refreshVarButtons.();
     refreshChainUI.();
+    if(~plonkRefreshLiveUI.notNil) { ~plonkRefreshLiveUI.() };
 };
 
 
@@ -3701,6 +5224,7 @@ var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
     if(lockBoxes[\condB].notNil) { lockBoxes[\condB].value_(st[\condB] ? 2) };
     if(lockEnableButtons[\on].notNil) { lockEnableButtons[\on].value_(st[\on]) };
     if(lockEnableButtons[\useDegree].notNil) { lockEnableButtons[\useDegree].value_(locks[\useDegree] ? 0) };
+    if(lockEnableButtons[\fixedPitch].notNil) { lockEnableButtons[\fixedPitch].value_(st[\fixedPitch] ? 0) };
     if(lockBoxes[\degree].notNil) { lockBoxes[\degree].value_(locks[\degree] ? 0) };
     if(lockBoxes[\degreeOct].notNil) { lockBoxes[\degreeOct].value_(locks[\degreeOct] ? 0) };
     if(lockBoxes[\semi].notNil) { lockBoxes[\semi].value_(locks[\semi] ? 0) };
@@ -3708,7 +5232,7 @@ var layerTag = switch((stEdit[\layerMode] ? 0).asInteger,
    if(layerModeMenu.notNil) { layerModeMenu.value_((st[\layerMode] ? 0).asInteger.clip(0, ~plonkLayerModeNames.size - 1)) };
 if(eng2ModelMenu.notNil) { eng2ModelMenu.value_((st[\engine2Model] ? 0).asInteger.clip(0, ~plonkSynth2TypeNames.size - 1)) };
 if(eng2ExcMenu.notNil) { eng2ExcMenu.value_((st[\engine2Exciter] ? 0).asInteger.clip(0, ~plonkSynth2VariantNames.size - 1)) };
-if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.35) };
+	if(lockBoxes[\layerLevel].notNil) { lockBoxes[\layerLevel].value_(st[\layerLevel] ? 0.0) };
 if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((st[\engine2PitchMode] ? 0).asInteger.clip(0, ~plonkSynth2PitchModeNames.size - 1)) };
     if(lockBoxes[\engine2SemiOffset].notNil) { lockBoxes[\engine2SemiOffset].value_((st[\engine2SemiOffset] ? 0).clip(-2, 2)) };
     if(lockBoxes[\engine2DegreeOffset].notNil) { lockBoxes[\engine2DegreeOffset].value_((st[\engine2DegreeOffset] ? 0).clip(-1, 1)) };
@@ -3718,9 +5242,9 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
     if(lockBoxes[\engine2ClickOffset].notNil) { lockBoxes[\engine2ClickOffset].value_(st[\engine2ClickOffset] ? 0.00) };
     if(lockBoxes[\engine2PanOffset].notNil) { lockBoxes[\engine2PanOffset].value_((st[\engine2PanOffset] ? 0.00).clip(-0.25, 0.25)) };
 
-    if(lockBoxes[\synth2Drive].notNil) { lockBoxes[\synth2Drive].value_(st[\synth2Drive] ? 1.40) };
-    if(lockBoxes[\synth2Color].notNil) { lockBoxes[\synth2Color].value_(st[\synth2Color] ? 0.50) };
-    if(lockBoxes[\synth2Motion].notNil) { lockBoxes[\synth2Motion].value_(st[\synth2Motion] ? 0.25) };
+	    if(lockBoxes[\synth2Drive].notNil) { lockBoxes[\synth2Drive].value_(st[\synth2Drive] ? 0.60) };
+	    if(lockBoxes[\synth2Color].notNil) { lockBoxes[\synth2Color].value_(st[\synth2Color] ? 0.00) };
+	    if(lockBoxes[\synth2Motion].notNil) { lockBoxes[\synth2Motion].value_(st[\synth2Motion] ? 0.00) };
     if(lockBoxes[\synth2UnisonVoices].notNil) { lockBoxes[\synth2UnisonVoices].value_(st[\synth2UnisonVoices] ? 1) };
     if(lockBoxes[\synth2UnisonDetune].notNil) { lockBoxes[\synth2UnisonDetune].value_(st[\synth2UnisonDetune] ? 0.00) };
     if(lockBoxes[\synth2UnisonStereo].notNil) { lockBoxes[\synth2UnisonStereo].value_(st[\synth2UnisonStereo] ? 0.00) };
@@ -3762,9 +5286,9 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
         if(v.notNil) {
             lockBoxes[k].value_(v);
         }{
-            if((k != \semi) and: { k != \degree } and: { k != \degreeOct } and: { k != \useDegree }) {
-                lockBoxes[k].value_(0);
-            };
+	            if((k != \semi) and: { k != \degree } and: { k != \degreeOct } and: { k != \useDegree }) {
+	                lockBoxes[k].value_(~plonkNeutralLockValue.(k));
+	            };
         };
     };
 };
@@ -3781,6 +5305,8 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 ~plonkRefreshPatternUI = refreshPatternUI;
 ~plonkRefreshLockEditor = refreshLockEditor;
 ~plonkRefreshVarButtons = refreshVarButtons;
+~plonkRefreshEditorStatusUI = refreshEditorStatusUI;
+~plonkRefreshTrackSoundUI = refreshTrackSoundUI;
 
 	      // header
 	StaticText(header, Rect(18, 10, 92, 24))
@@ -3791,29 +5317,41 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 	.string_("v5.20")
 	.font_(smallFont);
 
-	makeButton.(header, Rect(118, 16, 70, 28), "Main", { showPage.(\main) });
-	makeButton.(header, Rect(198, 16, 70, 28), "Exciter", { showPage.(\exciter) });
-	makeButton.(header, Rect(278, 16, 90, 28), "Resonator", { showPage.(\res) });
-	makeButton.(header, Rect(378, 16, 100, 28), "Performance", { showPage.(\perf) });
-	makeButton.(header, Rect(488, 16, 100, 28), "Pattern", { showPage.(\pattern) });
-	makeButton.(header, Rect(598, 16, 80, 28), "Step", { showPage.(\step) });
-	makeButton.(header, Rect(688, 16, 90, 28), "Mixer", { showPage.(\mixer) });
-	makeButton.(header, Rect(798, 16, 110, 28), "Audio/Midi", { showPage.(\audio) });
+	makeButton.(header, Rect(118, 16, 62, 28), "Main", { showPage.(\main) });
+	makeButton.(header, Rect(188, 16, 72, 28), "Exciter", { showPage.(\exciter) });
+	makeButton.(header, Rect(268, 16, 82, 28), "Resonator", { showPage.(\res) });
+	makeButton.(header, Rect(358, 16, 92, 28), "Perf", { showPage.(\perf) });
+	makeButton.(header, Rect(460, 16, 86, 28), "Pattern", { showPage.(\pattern) });
+	makeButton.(header, Rect(554, 16, 70, 28), "Step", { showPage.(\step) });
+	makeButton.(header, Rect(632, 16, 78, 28), "Mixer", { showPage.(\mixer) });
+	makeButton.(header, Rect(718, 16, 70, 28), "Live", { showPage.(\live) });
+	makeButton.(header, Rect(798, 16, 106, 28), "Audio/MIDI", { showPage.(\audio) });
 
-	Button(header, Rect(928, 16, 90, 28))
+	Button(header, Rect(914, 16, 86, 28))
 	.states_([["Trigger", Color.white, Color(0.9, 0.7, 0.0)]])
 	.font_(labelFont)
 	.action_({
-	    var args = ~plonkTrackStates[~plonkSelectedTrack].copy;
-	    args[\trackIndex] = ~plonkSelectedTrack;
-	    ~plonkTrigger.(args);
+	    var trackIdx, st, gateDur, args;
+	    trackIdx = ~plonkSelectedTrack;
+	    if([1, 2].includes(trackIdx)) {
+	        st = ~makePlonkTrackStep.(trackIdx, 1);
+	        gateDur = if(trackIdx == 1) { 0.25 } { 0.08 };
+	        ~plonkTriggerStepVoices.(trackIdx, st, gateDur, 0);
+	    }{
+	        args = ~plonkTrackStates[trackIdx].copy;
+	        args[\trackIndex] = trackIdx;
+	        ~plonkTrigger.(args);
+	    };
 	});
 
-	makeButton.(header, Rect(1038, 16, 90, 28), "RandPat", {
+	makeButton.(header, Rect(1010, 16, 82, 28), "RandPat", {
 	    ~plonkRandomizePatternAndRefresh.();
 	    refreshPatternUI.();
 	    refreshLockEditor.();
 });
+
+	makeButton.(header, Rect(1102, 16, 70, 28), "Undo", { ~plonkUndo.() });
+	makeButton.(header, Rect(1182, 16, 70, 28), "Redo", { ~plonkRedo.() });
 
 	        // main page
 	        {
@@ -3822,7 +5360,14 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 
 	            makeMenu.(v, 20, y, "Model", \model, modelNames); y = y + 28;
 	            makeMenu.(v, 20, y, "Exciter", \exciterType, exciterNames); y = y + 28;
-            makeSlider.(v, 20, y, "Freq", \freq, 40, 4000, \exp); y = y + 28;
+	            makeSlider.(v, 20, y, "Freq", \freq, 40, 4000, \exp);
+	            freqNoteLabel = StaticText(v, Rect(438, y, 92, 20));
+	            freqNoteLabel.font_(controlFont);
+	            makeButton.(v, Rect(536, y - 1, 40, 22), "-12", { ~plonkShiftSelectedTrackFreq.(-12) });
+	            makeButton.(v, Rect(582, y - 1, 34, 22), "-1", { ~plonkShiftSelectedTrackFreq.(-1) });
+	            makeButton.(v, Rect(622, y - 1, 34, 22), "+1", { ~plonkShiftSelectedTrackFreq.(1) });
+	            makeButton.(v, Rect(662, y - 1, 40, 22), "+12", { ~plonkShiftSelectedTrackFreq.(12) });
+	            y = y + 28;
             makeSlider.(v, 20, y, "Amp", \amp, 0.01, 0.6, \lin); y = y + 28;
             makeSlider.(v, 20, y, "Pan", \pan, -1.0, 1.0, \lin); y = y + 28;
 	            makeSlider.(v, 20, y, "Velocity", \velocity, 0.0, 1.0, \lin); y = y + 28;
@@ -3830,15 +5375,83 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 	            y = y + 20;
 	            makeSectionLabel.(v, Rect(20, y, 120, 20), "Pattern Preset");
 	            patternField = TextField(v, Rect(140, y, 140, 20)).string_("pattern1");
-	            makeButton.(v, Rect(290, y - 1, 60, 22), "Save", {
-	                ~plonkSavePattern.(patternField.string);
+	            makeButton.(v, Rect(290, y - 1, 74, 22), "Quick Save", {
+	                ~plonkSavePattern.(~plonkEditor[\currentPatternName] ? patternField.string);
+	                refreshEditorStatusUI.();
             });
-            makeButton.(v, Rect(356, y - 1, 60, 22), "Load", {
+	            makeButton.(v, Rect(370, y - 1, 66, 22), "Save As", {
+	                ~plonkSavePattern.(patternField.string);
+	                refreshEditorStatusUI.();
+            });
+            makeButton.(v, Rect(442, y - 1, 60, 22), "Load", {
                 ~plonkLoadPattern.(patternField.string);
                 refreshControls.();
                 refreshPatternUI.();
                 refreshLockEditor.();
+                refreshEditorStatusUI.();
             });
+            patternStatusLabel = StaticText(v, Rect(520, y, 260, 20));
+            patternStatusLabel.font_(controlFont);
+            recentPatternMenu = PopUpMenu(v, Rect(790, y, 220, 20));
+            recentPatternMenu.items_(["Recent Patterns"]);
+            recentPatternMenu.action_({
+                var idx = recentPatternMenu.value;
+                var recent = ~plonkEditor[\recentPatterns] ? [];
+                if(idx > 0) {
+                    patternField.string_(recent[idx - 1]);
+                    ~plonkLoadPattern.(recent[idx - 1]);
+                    refreshControls.();
+                    refreshPatternUI.();
+                    refreshLockEditor.();
+                    refreshEditorStatusUI.();
+                };
+            });
+            y = y + 32;
+            makeSectionLabel.(v, Rect(20, y, 120, 20), "Track Sound");
+            soundField = TextField(v, Rect(140, y, 140, 20)).string_(~plonkCurrentTrackSoundName.(~plonkSelectedTrack));
+            makeButton.(v, Rect(290, y - 1, 74, 22), "Quick Save", {
+                ~plonkSaveTrackSound.(~plonkSelectedTrack, ~plonkCurrentTrackSoundName.(~plonkSelectedTrack));
+                refreshTrackSoundUI.();
+            });
+            makeButton.(v, Rect(370, y - 1, 66, 22), "Save As", {
+                ~plonkSaveTrackSound.(~plonkSelectedTrack, soundField.string);
+                refreshTrackSoundUI.();
+            });
+            makeButton.(v, Rect(442, y - 1, 60, 22), "Load", {
+                ~plonkLoadTrackSound.(~plonkSelectedTrack, soundField.string);
+            });
+            makeButton.(v, Rect(508, y - 1, 88, 22), "Set Default", {
+                ~plonkSetTrackDefaultFromCurrent.(~plonkSelectedTrack, soundField.string);
+                refreshTrackSoundUI.();
+            });
+            makeButton.(v, Rect(602, y - 1, 90, 22), "Reset Track", {
+                ~plonkResetTrackSoundToDefault.(~plonkSelectedTrack);
+            });
+            makeButton.(v, Rect(698, y - 1, 96, 22), "Factory Reset", {
+                ~plonkFactoryResetTrackSound.(~plonkSelectedTrack);
+            });
+            recentSoundMenu = PopUpMenu(v, Rect(804, y, 220, 20));
+            recentSoundMenu.items_(["Recent " ++ ~plonkTrackNames[~plonkSelectedTrack] ++ " Sounds"]);
+            recentSoundMenu.action_({
+                var idx = recentSoundMenu.value;
+                var recentLists = ~plonkEditor[\recentSounds] ? Array.fill(~plonkTrackCount, { [] });
+                var recent = if((recentLists.notNil) and: { ~plonkSelectedTrack < recentLists.size } and: { recentLists[~plonkSelectedTrack].notNil }) {
+                    recentLists[~plonkSelectedTrack]
+                }{
+                    []
+                };
+                if(idx > 0) {
+                    soundField.string_(recent[idx - 1]);
+                    ~plonkLoadTrackSound.(~plonkSelectedTrack, recent[idx - 1]);
+                };
+            });
+            y = y + 24;
+            soundStatusLabel = StaticText(v, Rect(140, y, 1080, 20));
+            soundStatusLabel.font_(controlFont);
+            ~plonkRefreshRecentPatterns.();
+            ~plonkRefreshRecentSounds.();
+            refreshTrackSoundUI.();
+            refreshEditorStatusUI.();
         }.value;
 
         // exciter page, resonator page, performance page
@@ -3871,13 +5484,18 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 	        {
 	            var v = makePage.(\perf), y = 64;
 	            makePageTitle.(v, "Performance", "Drive, envelopes, filtering, comb, edge, and bit treatment for the selected track.");
-	            makeSlider.(v, 20, y, "Drive", \drive, 0.7, 2.0, \lin); y = y + 28;
-	            makeSlider.(v, 20, y, "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, \lin); y = y + 28;
-	            makeSlider.(v, 20, y, "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, \exp); y = y + 28;
-            makeSlider.(v, 20, y, "Vel->Bright", \velToBright, 0, 0.6, \lin); y = y + 28;
-            makeSlider.(v, 20, y, "Vel->Decay", \velToDecay, 0, 0.5, \lin); y = y + 28;
-	            makeSlider.(v, 20, y, "Vel->Noise", \velToNoise, 0, 0.5, \lin); y = y + 28;
-	            makeSlider.(v, 20, y, "Vel->Click", \velToClick, 0, 0.5, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Drive", \drive, 1.0, 2.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "PitchEnvAmt", \pitchEnvAmt, 0, 2.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "PitchEnvDec", \pitchEnvDecay, 0.005, 0.32, \exp); y = y + 28;
+	            makeSlider.(v, 20, y, "Vel->Bright", \velToBright, 0, 0.6, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "Vel->Decay", \velToDecay, 0, 0.5, \lin); y = y + 28;
+		            makeSlider.(v, 20, y, "Vel->Noise", \velToNoise, 0, 0.5, \lin); y = y + 28;
+		            makeSlider.(v, 20, y, "Vel->Click", \velToClick, 0, 0.5, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "KickSub", \kickSubAmt, 0, 1.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "SubDecay", \kickSubDecay, 0.05, 4.0, \exp); y = y + 28;
+	            makeSlider.(v, 20, y, "SubPunch", \kickPunch, 0, 4.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "SubDrive", \kickDrive, 0, 1.0, \lin); y = y + 28;
+	            makeSlider.(v, 20, y, "SubClick", \kickClick, 0, 1.0, \lin); y = y + 28;
 
 				makeMenu.(v, 460, 64, "FilterMode", \filterMode, ["LP", "HP", "BP", "Notch"]);
 				makeSlider.(v, 460, 92, "FiltCut", \filterCutoff, 0, 1, \lin);
@@ -3889,7 +5507,7 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
 				makeSlider.(v, 460, 260, "CombTime", \combTime, 0.0007, 0.03, \exp);
 				makeSlider.(v, 460, 288, "CombDecay", \combDecay, 0.02, 2.0, \exp);
 
-				makeSlider.(v, 460, 344, "EdgeDrive", \edgeDrive, 0.5, 8.0, \exp);
+					makeSlider.(v, 460, 344, "EdgeDrive", \edgeDrive, 1.0, 8.0, \exp);
 				makeSlider.(v, 460, 372, "FoldAmt", \foldAmt, 0, 1, \lin);
 				makeSlider.(v, 460, 400, "Presence", \presence, -1, 1, \lin);
 
@@ -4446,8 +6064,8 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
         // pattern page
         {
             var v = makePage.(\pattern);
-            var leftPad = 20;
-            var cellW = 58;
+	            var leftPad = 20;
+		            var cellW = 78;
             var trigW = 44;
             var editW = 44;
             var noteW = 44;
@@ -4460,13 +6078,14 @@ if(lockBoxes[\engine2PitchMode].notNil) { lockBoxes[\engine2PitchMode].value_((s
             var mutateEveryBox, mutateAmtBox;
 var chainSlotStartX = 226;
 var chainSlotSpacing = 220;
+var makeStepCell;
 
 	var y1 = 64;
 	var y2 = 108;
 	var y3 = 152;
 	var y4 = 196;
-	var topY1 = 272;
-	var topY2 = 472;
+			var topY1 = 320;
+			var topY2 = 400;
 
 	makePageTitle.(v, "Pattern");
 	condSummaryLabel = StaticText(v, Rect(460, 14, 430, 20));
@@ -4565,14 +6184,18 @@ var chainSlotSpacing = 220;
             .states_([["Copy"]])
             .action_({
                 copiedVariation = ~plonkTrackPatterns[~plonkSelectedTrack][~plonkSeq[\editVariation]].collect(_.deepCopy);
+                ~plonkEditor[\clipboardLabel] = "Copied Var " ++ ~plonkVariationNames[~plonkSeq[\editVariation]];
+                refreshEditorStatusUI.();
             });
 
             pasteVarButton = Button(v, Rect(620, y2 - 1, 44, 22))
             .states_([["Paste"]])
             .action_({
                 if(copiedVariation.notNil) {
+                    ~plonkPushUndo.("Paste variation");
                     ~plonkTrackPatterns[~plonkSelectedTrack][~plonkSeq[\editVariation]] = copiedVariation.collect(_.deepCopy);
                     ~plonkSetEditVariation.(~plonkSeq[\editVariation]);
+                    ~plonkMarkDirty.(true);
                     refreshPatternUI.();
                     refreshLockEditor.();
                 };
@@ -4584,8 +6207,10 @@ var chainSlotSpacing = 220;
                 var src, dst;
                 src = ~plonkSeq[\editVariation];
                 dst = (src + 1) % 4;
+                ~plonkPushUndo.("Duplicate variation");
                 ~plonkTrackPatterns[~plonkSelectedTrack][dst] =
                     ~plonkTrackPatterns[~plonkSelectedTrack][src].collect(_.deepCopy);
+                ~plonkMarkDirty.(true);
                 refreshPatternUI.();
                 refreshLockEditor.();
             });
@@ -4616,10 +6241,10 @@ makeBoundedBox.(v, Rect(980, y2, 52, 20), ~plonkMutate[\amount], 0, 1, 0.01, 2, 
 
 			StaticText(v, Rect(1042, y2, 40, 20)).string_("Tgt");
 PopUpMenu(v, Rect(1084, y2, 72, 20))
-.items_(["Active", "Edit"])
-.value_(if(~plonkMutate[\targetVariation] == \edit) { 1 } { 0 })
+.items_(~plonkMutateTargetNames)
+.value_(switch(~plonkMutate[\targetVariation] ? \active, \edit, { 1 }, \temp, { 2 }, { 0 }))
 .action_({ |pm|
-    ~plonkMutate[\targetVariation] = if(pm.value == 1) { \edit } { \active };
+    ~plonkMutate[\targetVariation] = [\active, \edit, \temp][pm.value.clip(0, 2)];
 });
 
             StaticText(v, Rect(20, y3, 40, 20)).string_("Chain");
@@ -4667,7 +6292,9 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             Button(v, Rect(74, y4 - 1, 78, 22))
             .states_([["ClearPat"]])
             .action_({
+                ~plonkPushUndo.("Clear pattern");
                 ~plonkClearCurrentVariation.();
+                ~plonkMarkDirty.(true);
                 refreshPatternUI.();
                 refreshLockEditor.();
             });
@@ -4675,7 +6302,9 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             Button(v, Rect(158, y4 - 1, 42, 22))
             .states_([["RotL"]])
             .action_({
+                ~plonkPushUndo.("Rotate left");
                 ~plonkRotateCurrentVariation.(-1);
+                ~plonkMarkDirty.(true);
                 refreshPatternUI.();
                 refreshLockEditor.();
             });
@@ -4683,122 +6312,308 @@ PopUpMenu(v, Rect(1084, y2, 72, 20))
             Button(v, Rect(204, y4 - 1, 42, 22))
             .states_([["RotR"]])
             .action_({
+                ~plonkPushUndo.("Rotate right");
                 ~plonkRotateCurrentVariation.(1);
+                ~plonkMarkDirty.(true);
                 refreshPatternUI.();
                 refreshLockEditor.();
             });
 
-            StaticText(v, Rect(260, y4, 74, 20)).string_("CopyRange");
-            StaticText(v, Rect(344, y4, 20, 20)).string_("A");
-            rangeSrcABox = makeBoundedBox.(v, Rect(364, y4, 42, 20), 1, 1, 32, 1, 0, { |nb, val|
-                nb.value_(val.asInteger.clip(1, 32));
-            });
+	            StaticText(v, Rect(260, y4, 48, 20)).string_("Range");
+	            StaticText(v, Rect(312, y4, 34, 20)).string_("Start");
+	            rangeSrcABox = makeBoundedBox.(v, Rect(350, y4, 42, 20), 1, 1, 32, 1, 0, { |nb, val|
+	                nb.value_(val.asInteger.clip(1, 32));
+	            });
 
-            StaticText(v, Rect(430, y4, 20, 20)).string_("B");
-            rangeSrcBBox = makeBoundedBox.(v, Rect(450, y4, 42, 20), 4, 1, 32, 1, 0, { |nb, val|
-                nb.value_(val.asInteger.clip(1, 32));
-            });
+	            StaticText(v, Rect(416, y4, 30, 20)).string_("End");
+	            rangeSrcBBox = makeBoundedBox.(v, Rect(450, y4, 42, 20), 4, 1, 32, 1, 0, { |nb, val|
+	                nb.value_(val.asInteger.clip(1, 32));
+	            });
 
             StaticText(v, Rect(516, y4, 30, 20)).string_("Dst");
             rangeDstBox = makeBoundedBox.(v, Rect(546, y4, 42, 20), 9, 1, 32, 1, 0, { |nb, val|
                 nb.value_(val.asInteger.clip(1, 32));
             });
 
-Button(v, Rect(625, y4 - 1, 74, 22))
-.states_([["CopyRan"]])
+	Button(v, Rect(625, y4 - 1, 86, 22))
+	.states_([["Copy Range"]])
 .action_({
+    ~plonkPushUndo.("Copy range");
     ~plonkCopyStepRangeInCurrentVariation.(
         (rangeSrcABox.value.asInteger - 1).clip(0, 31),
         (rangeSrcBBox.value.asInteger - 1).clip(0, 31),
         (rangeDstBox.value.asInteger - 1).clip(0, 31)
     );
+    ~plonkMarkDirty.(true);
     refreshPatternUI.();
     refreshLockEditor.();
 });
 
-randSelButton = Button(v, Rect(710, y4 - 1, 68, 22))
+	randSelButton = Button(v, Rect(720, y4 - 1, 68, 22))
 .states_([["RandSel"]])
 .action_({
-    var modeSym = [\full, \selection, \timing, \pitch, \accent, \layer][randModeMenu.value.clip(0, 5)];
+    var modeSym = [\full, \selection, \timing, \pitch, \accent, \condition, \layer][randModeMenu.value.clip(0, 6)];
 
-    ~plonkRandomizeCurrentSelectionAndRefresh.(
-        (rangeSrcABox.value.asInteger - 1).clip(0, 31),
-        (rangeSrcBBox.value.asInteger - 1).clip(0, 31),
-        modeSym,
-        randAmtBox.value
-    );
+    ~plonkRandomizeSelectedStepsAndRefresh.(modeSym, randAmtBox.value);
 });
 
-randModeMenu = PopUpMenu(v, Rect(786, y4, 112, 20));
-randModeMenu.items_(~plonkRandSelModeNames);
-randModeMenu.value_(0);
+	randModeMenu = PopUpMenu(v, Rect(798, y4, 112, 20));
+	randModeMenu.items_(~plonkRandSelModeNames);
+	randModeMenu.value_(0);
+	randModeMenu.action_({
+	    var modeSym = [\full, \selection, \timing, \pitch, \accent, \condition, \layer][randModeMenu.value.clip(0, 6)];
+	    ~plonkUpdateRandomizeScopeLabel.(modeSym);
+	    refreshEditorStatusUI.();
+	});
 
-StaticText(v, Rect(908, y4, 30, 20)).string_("Amt");
+	StaticText(v, Rect(920, y4, 30, 20)).string_("Amt");
 
-randAmtBox = makeBoundedBox.(v, Rect(940, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, { |nb, val|
-    nb.value_(val);
+	randAmtBox = makeBoundedBox.(v, Rect(952, y4, 52, 20), 1.0, 0.0, 1.0, 0.01, 2, { |nb, val|
+	    nb.value_(val);
+	});
+
+	Button(v, Rect(1018, y4 - 1, 92, 22))
+	.states_([["Select Range"]])
+	.action_({
+	    var a = (rangeSrcABox.value.asInteger - 1).clip(0, 31);
+	    var b = (rangeSrcBBox.value.asInteger - 1).clip(0, 31);
+	    ~plonkSetStepRangeSelection.(a, b);
+	    lockStep = b;
+	    refreshPatternUI.();
+	    refreshLockEditor.();
+	    refreshEditorStatusUI.();
+	});
+
+	clipboardStatusLabel = StaticText(v, Rect(20, 244, 220, 18));
+	clipboardStatusLabel.font_(controlFont);
+	randomizeStatusLabel = StaticText(v, Rect(250, 244, 300, 18));
+	randomizeStatusLabel.font_(controlFont);
+		helpStatusLabel = StaticText(v, Rect(560, 244, 760, 18));
+	helpStatusLabel.font_(controlFont);
+
+	Button(v, Rect(20, 270, 58, 22))
+.states_([["Copy"]])
+.action_({
+    ~plonkCopySelectedSteps.();
+    refreshEditorStatusUI.();
 });
 
+	Button(v, Rect(84, 270, 58, 22))
+.states_([["Paste"]])
+.action_({
+    ~plonkPasteToSelectedSteps.(~plonkEditor[\pasteMode] ? \overwrite);
+    refreshPatternUI.();
+    refreshLockEditor.();
+    refreshEditorStatusUI.();
+});
+
+	pasteModeMenu = PopUpMenu(v, Rect(148, 270, 108, 20));
+pasteModeMenu.items_(~plonkPasteModeNames);
+pasteModeMenu.value_(0);
+pasteModeMenu.action_({
+    ~plonkEditor[\pasteMode] = [\overwrite, \merge, \timing, \pitch, \conditions, \layer][pasteModeMenu.value.clip(0, 5)];
+    refreshEditorStatusUI.();
+});
+
+	Button(v, Rect(266, 270, 66, 22))
+.states_([["ClearSel"]])
+.action_({
+    ~plonkClearSelectedSteps.();
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	Button(v, Rect(338, 270, 48, 22))
+.states_([["NudgeL"]])
+.action_({
+    ~plonkNudgeSelectedSteps.(-1);
+    lockStep = ~plonkEditor[\lastSelectedStep];
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	Button(v, Rect(392, 270, 48, 22))
+.states_([["NudgeR"]])
+.action_({
+    ~plonkNudgeSelectedSteps.(1);
+    lockStep = ~plonkEditor[\lastSelectedStep];
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	Button(v, Rect(450, 270, 42, 22))
+.states_([["Tr-"]])
+.action_({
+    ~plonkTransposeSelectedSteps.(-1);
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	Button(v, Rect(498, 270, 42, 22))
+.states_([["Tr+"]])
+.action_({
+    ~plonkTransposeSelectedSteps.(1);
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	StaticText(v, Rect(552, 272, 34, 18)).string_("Cond");
+	selectedCondMenu = PopUpMenu(v, Rect(590, 270, 110, 20));
+selectedCondMenu.items_(~plonkCondNames);
+selectedCondMenu.action_({
+    ~plonkSetSelectedCondition.(selectedCondMenu.value);
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	StaticText(v, Rect(712, 272, 36, 18)).string_("Layer");
+	selectedLayerMenu = PopUpMenu(v, Rect(752, 270, 112, 20));
+selectedLayerMenu.items_(~plonkLayerModeNames);
+selectedLayerMenu.action_({
+    ~plonkSetSelectedLayerMode.(selectedLayerMenu.value);
+    refreshPatternUI.();
+    refreshLockEditor.();
+});
+
+	Button(v, Rect(880, 270, 72, 22))
+.states_([["Snapshot"]])
+.action_({
+    ~plonkCaptureCompareSnapshot.();
+    refreshEditorStatusUI.();
+});
+
+	Button(v, Rect(958, 270, 72, 22))
+.states_([["Compare"]])
+.action_({
+    ~plonkToggleCompareSnapshot.();
+    refreshControls.();
+    refreshPatternUI.();
+    refreshLockEditor.();
+    refreshEditorStatusUI.();
+});
+
+	compareStatusLabel = StaticText(v, Rect(1040, 272, 220, 18));
+compareStatusLabel.font_(controlFont);
+
+
+		            makeStepCell = { |idx, x, y|
+		                var cell = UserView(v, Rect(x, y, cellW - 6, 58));
+                stepButtons[idx] = cell;
+                stepIndicators[idx] = nil;
+                stepLabels[idx] = nil;
+                stepEditButtons[idx] = nil;
+                stepNoteMiniLabels[idx] = nil;
+                condMiniLabels[idx] = nil;
+
+                cell.background_(Color.clear);
+                cell.drawFunc = {
+                    var editSteps = ~plonkEditStepsForSelectedTrack.();
+                    var playSteps = ~plonkPlaybackStepsForSelectedTrack.();
+                    var stEdit = editSteps[idx];
+                    var stPlay = playSteps[idx];
+                    var active = idx < ~plonkSeq[\steps];
+                    var selected = (~plonkEditor[\selectedSteps][idx] ? false);
+                    var playing = idx == ~plonkSeq[\currentStep];
+                    var w = cell.bounds.width;
+                    var h = cell.bounds.height;
+	                    var isOn = (stPlay[\on] ? 0) == 1;
+	                    var bg = if(active) { Color.grey(0.90) } { Color.grey(0.74) };
+	                    var dotColor = if(isOn) { Color.black } { Color.grey(0.66) };
+	                    var noteName = if(active) { ~plonkMidiToName.(~plonkStepMidiForIndex.(idx)) } { "-" };
+	                    var tags = List.new;
+
+		                    if(isOn.not) { bg = if(active) { Color.grey(0.86) } { Color.grey(0.72) } };
+		                    if(selected) { bg = Color(0.68, 0.84, 1.0) };
+	                    if(active.not) { dotColor = Color.grey(0.55) };
+
+                    if((stEdit[\tie] ? 0) == 1) { tags.add(["T", Color(0.02, 0.55, 0.55)]) };
+                    if((stEdit[\condType] ? 0).asInteger != 0) { tags.add(["C", Color(0.48, 0.30, 0.72)]) };
+                    if((stEdit[\locks][\useDegree] ? 0).asInteger == 1) { tags.add(["D", Color(0.20, 0.58, 0.28)]) };
+                    if((stEdit[\layerMode] ? 0).asInteger > 0) { tags.add(["L", Color(0.18, 0.42, 0.78)]) };
+
+	                    Pen.fillColor = bg;
+	                    Pen.fillRect(Rect(0, 0, w, h));
+
+	                    if((idx % 4) == 0) {
+	                        Pen.fillColor = if((idx % 16) == 0) { Color.grey(0.18) } { Color.grey(0.45) };
+	                        Pen.fillRect(Rect(0, 0, if((idx % 16) == 0) { 3 } { 2 }, h));
+	                    };
+
+		                    if(playing) {
+		                        Pen.fillColor = Color(1.0, 0.72, 0.08);
+		                        Pen.fillRect(Rect(0, 0, w, 4));
+		                    };
+
+		                    if(selected) {
+		                        Pen.fillColor = accentBlue;
+		                        Pen.fillRect(Rect(0, h - 5, w, 5));
+		                    };
+
+		                    Pen.strokeColor = if(selected) { Color(0.02, 0.24, 0.62) } { Color.grey(0.70) };
+	                    Pen.width = if(selected) { 2.0 } { 1.0 };
+	                    Pen.strokeRect(Rect(1, 1, w - 2, h - 2));
+
+		                    Pen.stringAtPoint((idx + 1).asString, Point(6, 7), Font.default.boldVariant.size_(9), Color.grey(0.12));
+
+		                    Pen.fillColor = dotColor;
+		                    Pen.fillOval(Rect(w - 19, 8, 12, 12));
+		                    Pen.strokeColor = if(isOn) { Color.white } { Color.grey(0.40) };
+		                    Pen.width = 1.0;
+		                    Pen.strokeOval(Rect(w - 19, 8, 12, 12));
+
+		                    Pen.stringAtPoint(noteName, Point(6, 29), Font.default.boldVariant.size_(9), Color.grey(0.10));
+
+		                    tags.do { |tag, tagIdx|
+		                        var tx = 6 + (tagIdx * 10);
+		                        Pen.fillColor = tag[1];
+		                        Pen.fillRect(Rect(tx, 44, 8, 8));
+		                    };
+		                };
+
+		                cell.mouseDownAction_({ |view, mx, my, modifiers, buttonNumber, clickCount|
+		                    var mods = modifiers ? 0;
+		                    var dotHit = (mx >= (view.bounds.width - 24)) and: { mx <= (view.bounds.width - 3) } and: { my >= 2 and: { my <= 27 } };
+
+                    if(clickCount >= 2) {
+                        ~plonkSetSingleStepSelection.(idx);
+                        lockStep = idx;
+                        refreshPatternUI.();
+                        refreshLockEditor.();
+                        showPage.(\step);
+                    }{
+                        if(dotHit) {
+                            ~plonkPushUndo.("Toggle Step " ++ (idx + 1).asString);
+                            ~plonkSteps[idx][\on] = 1 - (~plonkSteps[idx][\on] ? 0);
+                            ~plonkSetSingleStepSelection.(idx);
+                            lockStep = idx;
+                            ~plonkMarkDirty.(true);
+                        }{
+                            if(mods.isShift) {
+                                ~plonkSelectStepRange.(idx);
+                            }{
+                                if(mods.isCmd) {
+                                    ~plonkToggleStepSelection.(idx);
+                                }{
+                                    ~plonkSetSingleStepSelection.(idx);
+                                };
+                            };
+                            lockStep = idx;
+                        };
+                        refreshPatternUI.();
+                        refreshLockEditor.();
+                    };
+                });
+            };
 
             16.do { |i|
                 var x = gridStartX + (i * cellW);
-
-                stepIndicators[i] = StaticText(v, Rect(x + indicatorOffset, topY1, 20, 16));
-                stepIndicators[i].string_(" ");
-
-                stepLabels[i] = StaticText(v, Rect(x + labelOffset, topY1 + 18, 34, 16));
-                stepLabels[i].string_((i + 1).asString);
-
-                stepButtons[i] = Button(v, Rect(x + trigOffset, topY1 + 40, trigW, 24));
-                stepButtons[i].states_([
-                    ["-", Color.black, Color.grey(0.85)],
-                    ["●", Color.white, Color.black]
-                ]);
-                stepButtons[i].value_(~plonkSteps[i][\on]);
-                stepButtons[i].action_({ |bt| ~plonkSteps[i][\on] = bt.value });
-
-                stepEditButtons[i] = makeButton.(v, Rect(x + editOffset, topY1 + 70, editW, 20), "Edit", {
-                    lockStep = i;
-                    refreshLockEditor.();
-                    showPage.(\step);
-                });
-
-                stepNoteMiniLabels[i] = StaticText(v, Rect(x + noteOffset, topY1 + 95, noteW, 14));
-                stepNoteMiniLabels[i].string_(~plonkMidiToName.(~plonkStepMidiForIndex.(i)));
-
-                condMiniLabels[i] = StaticText(v, Rect(x + noteOffset, topY1 + 110, noteW, 14));
-                condMiniLabels[i].string_(~plonkCondShortName.(~plonkSteps[i]));
+                makeStepCell.(i, x, topY1);
             };
 
             16.do { |j|
                 var i = j + 16;
                 var x = gridStartX + (j * cellW);
-
-                stepIndicators[i] = StaticText(v, Rect(x + indicatorOffset, topY2, 20, 16));
-                stepIndicators[i].string_(" ");
-
-                stepLabels[i] = StaticText(v, Rect(x + labelOffset, topY2 + 18, 34, 16));
-                stepLabels[i].string_((i + 1).asString);
-
-                stepButtons[i] = Button(v, Rect(x + trigOffset, topY2 + 40, trigW, 24));
-                stepButtons[i].states_([
-                    ["-", Color.black, Color.grey(0.85)],
-                    ["●", Color.white, Color.black]
-                ]);
-                stepButtons[i].value_(~plonkSteps[i][\on]);
-                stepButtons[i].action_({ |bt| ~plonkSteps[i][\on] = bt.value });
-
-                stepEditButtons[i] = makeButton.(v, Rect(x + editOffset, topY2 + 70, editW, 20), "Edit", {
-                    lockStep = i;
-                    refreshLockEditor.();
-                    showPage.(\step);
-                });
-
-                stepNoteMiniLabels[i] = StaticText(v, Rect(x + noteOffset, topY2 + 95, noteW, 14));
-                stepNoteMiniLabels[i].string_(~plonkMidiToName.(~plonkStepMidiForIndex.(i)));
-
-                condMiniLabels[i] = StaticText(v, Rect(x + noteOffset, topY2 + 110, noteW, 14));
-                condMiniLabels[i].string_(~plonkCondShortName.(~plonkSteps[i]));
+                makeStepCell.(i, x, topY2);
             };
         }.value;
 
@@ -4837,6 +6652,29 @@ var valueGap = 6;
 
 	    makePageTitle.(v, "Per-step Editor");
 
+	    StaticText(v, Rect(24, yBottom + 38, 90, 18)).string_("Sections");
+	    [
+	        ["Basic", \basic],
+	        ["Pitch/Cond", \pitch],
+	        ["Layer", \layer],
+	        ["Locks", \locks]
+	    ].do { |pair, idx|
+	        var key = pair[1];
+	        sectionButtons[key] = Button(v, Rect(118 + (idx * 96), yBottom + 34, 88, 24))
+	        .states_([
+	            [pair[0], Color.black, Color.grey(0.84)],
+	            [pair[0], Color.white, accentBlue]
+	        ])
+	        .value_((~plonkEditor[\stepSections][key] ? true).asInteger)
+	        .action_({ |bt|
+	            ~plonkEditor[\stepSections][key] = (bt.value == 1);
+	            if(key == \pitch) {
+	                ~plonkEditor[\stepSections][\conditions] = (bt.value == 1);
+	            };
+	            applyStepSectionVisibility.();
+	        });
+	    };
+
 	    // --------------------------------------------------
 	    // TIMING + CONDITIONS
 	    // --------------------------------------------------
@@ -4851,7 +6689,9 @@ var valueGap = 6;
     lockEnableButtons[\on] = Button(v, Rect(174, yRow1 - 2, 64, 24))
     .states_([["Off"], ["On"]])
     .action_({ |bt|
+        ~plonkPushUndo.("Step On/Off");
         ~plonkSteps[lockStep][\on] = bt.value;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
 
@@ -4888,7 +6728,9 @@ var valueGap = 6;
     lockEnableButtons[\tie] = Button(v, Rect(998, yRow1 - 2, 70, 24))
     .states_([["Tie Off"], ["Tie On"]])
     .action_({ |bt|
+        ~plonkPushUndo.("Step Tie");
         ~plonkSteps[lockStep][\tie] = bt.value;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
 
@@ -4899,7 +6741,9 @@ var valueGap = 6;
     lockEnableButtons[\useDegree] = Button(v, Rect(88, yRow2 - 2, 58, 24))
     .states_([["Off"], ["On"]])
     .action_({ |bt|
+        ~plonkPushUndo.("Step Pitch Mode");
         ~plonkSteps[lockStep][\locks][\useDegree] = bt.value;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
         refreshLockEditor.();
     });
@@ -4922,7 +6766,9 @@ var valueGap = 6;
     condMenu = PopUpMenu(v, Rect(504, yRow2, 150, 20));
     condMenu.items_(~plonkCondNames);
     condMenu.action_({
+        ~plonkPushUndo.("Step Condition");
         ~plonkSteps[lockStep][\condType] = condMenu.value;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
     lockBoxes[\condType] = condMenu;
@@ -4939,6 +6785,17 @@ var valueGap = 6;
         refreshPatternUI.();
     });
 
+    StaticText(v, Rect(858, yRow2, 42, 20)).string_("Fixed");
+    lockEnableButtons[\fixedPitch] = Button(v, Rect(904, yRow2 - 2, 58, 24))
+    .states_([["Off"], ["On"]])
+    .action_({ |bt|
+        ~plonkPushUndo.("Step Fixed Pitch");
+        ~plonkSteps[lockStep][\fixedPitch] = bt.value;
+        ~plonkMarkDirty.(true);
+        refreshPatternUI.();
+        refreshLockEditor.();
+    });
+
     // --------------------------------------------------
     // SYNTH2 PARALLEL ENGINE
     // --------------------------------------------------
@@ -4946,17 +6803,24 @@ var valueGap = 6;
 
     StaticText(v, Rect(20, yRow3, 40, 20)).string_("Mode");
     layerModeMenu = PopUpMenu(v, Rect(64, yRow3, 110, 20));
-    layerModeMenu.items_(~plonkLayerModeNames);
-    layerModeMenu.action_({
-        ~plonkSteps[lockStep][\layerMode] = layerModeMenu.value.asInteger;
-        refreshPatternUI.();
-    });
+	    layerModeMenu.items_(~plonkLayerModeNames);
+	    layerModeMenu.action_({
+	        ~plonkPushUndo.("Step Assist Mode");
+	        ~plonkSteps[lockStep][\layerMode] = layerModeMenu.value.asInteger;
+	        if((layerModeMenu.value.asInteger > 0) and: { (~plonkSteps[lockStep][\layerLevel] ? 0.0) <= 0.0 }) {
+	            ~plonkSteps[lockStep][\layerLevel] = 0.35;
+	        };
+	        ~plonkMarkDirty.(true);
+	        refreshPatternUI.();
+	    });
 
     StaticText(v, Rect(192, yRow3, 50, 20)).string_("Assist");
     eng2ModelMenu = PopUpMenu(v, Rect(246, yRow3, 120, 20));
     eng2ModelMenu.items_(~plonkSynth2TypeNames);
     eng2ModelMenu.action_({
+        ~plonkPushUndo.("Step Assist Type");
         ~plonkSteps[lockStep][\engine2Model] = eng2ModelMenu.value.asInteger;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
 
@@ -4964,20 +6828,24 @@ var valueGap = 6;
     eng2ExcMenu = PopUpMenu(v, Rect(440, yRow3, 116, 20));
     eng2ExcMenu.items_(~plonkSynth2VariantNames);
     eng2ExcMenu.action_({
+        ~plonkPushUndo.("Step Assist Variant");
         ~plonkSteps[lockStep][\engine2Exciter] = eng2ExcMenu.value.asInteger;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
 
     StaticText(v, Rect(574, yRow3, 38, 20)).string_("Level");
-    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(616, yRow3, 60, 20), 0.35, 0.05, 1.0, 0.01, 2, { |nb, val|
-        ~plonkSteps[lockStep][\layerLevel] = val;
-    });
+	    lockBoxes[\layerLevel] = makeBoundedBox.(v, Rect(616, yRow3, 60, 20), 0.0, 0.0, 1.0, 0.01, 2, { |nb, val|
+	        ~plonkSteps[lockStep][\layerLevel] = val;
+	    });
 
     StaticText(v, Rect(694, yRow3, 36, 20)).string_("Pitch");
     lockBoxes[\engine2PitchMode] = PopUpMenu(v, Rect(734, yRow3, 92, 20));
     lockBoxes[\engine2PitchMode].items_(~plonkSynth2PitchModeNames);
     lockBoxes[\engine2PitchMode].action_({
+        ~plonkPushUndo.("Step Assist Pitch");
         ~plonkSteps[lockStep][\engine2PitchMode] = lockBoxes[\engine2PitchMode].value.asInteger;
+        ~plonkMarkDirty.(true);
         refreshPatternUI.();
     });
 
@@ -5099,6 +6967,7 @@ var valueGap = 6;
         .states_([["Off"], ["On"]])
         .action_({ |bt|
             var val;
+            ~plonkPushUndo.("Step Lock");
             if(bt.value == 0) {
                 if((key != \semi) and: { key != \useDegree } and: { key != \degree } and: { key != \degreeOct }) {
                     ~plonkSteps[lockStep][\locks][key] = nil;
@@ -5108,6 +6977,7 @@ var valueGap = 6;
                 if(isInt) { val = val.asInteger };
                 ~plonkSteps[lockStep][\locks][key] = val;
             };
+            ~plonkMarkDirty.(true);
             refreshPatternUI.();
             refreshLockEditor.();
         });
@@ -5150,14 +7020,14 @@ var valueGap = 6;
     addLockRow.(col1X, yLocks + (8 * rowGap), "Damp", \damp, 0, 1, 0.01, 2, false);
 
     // column 2
-    addLockRow.(col2X, yLocks + (0 * rowGap), "Drive", \drive, 0.7, 2.0, 0.01, 2, false);
+	    addLockRow.(col2X, yLocks + (0 * rowGap), "Drive", \drive, 1.0, 2.0, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (1 * rowGap), "Tone", \tone, 0, 1, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (2 * rowGap), "NoiseAmt", \noiseAmt, 0, 1.2, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (3 * rowGap), "ClickAmt", \clickAmt, 0, 2.0, 0.01, 2, false);
     addLockRow.(col2X, yLocks + (4 * rowGap), "ExciterType", \exciterType, 0, 5, 1, 0, true);
-    addLockRow.(col2X, yLocks + (5 * rowGap), "Model", \model, 0, 3, 1, 0, true);
-    addLockRow.(col2X, yLocks + (6 * rowGap), "PitchEnvAmt", \pitchEnvAmt, 0, 0.4, 0.01, 2, false);
-    addLockRow.(col2X, yLocks + (7 * rowGap), "PitchEnvDec", \pitchEnvDecay, 0.005, 0.12, 0.001, 3, false);
+	    addLockRow.(col2X, yLocks + (5 * rowGap), "Model", \model, 0, 5, 1, 0, true);
+	    addLockRow.(col2X, yLocks + (6 * rowGap), "PitchEnvAmt", \pitchEnvAmt, 0, 2.0, 0.01, 2, false);
+	    addLockRow.(col2X, yLocks + (7 * rowGap), "PitchEnvDec", \pitchEnvDecay, 0.005, 0.32, 0.001, 3, false);
     addLockRow.(col2X, yLocks + (8 * rowGap), "Detune", \detune, 0, 0.02, 0.001, 3, false);
 
     // column 3
@@ -5172,13 +7042,17 @@ var valueGap = 6;
 
     // column 4
     addLockRow.(col4X, yLocks + (0 * rowGap), "CombDecay", \combDecay, 0.02, 2.0, 0.01, 2, false);
-    addLockRow.(col4X, yLocks + (1 * rowGap), "EdgeDrive", \edgeDrive, 0.5, 8.0, 0.01, 2, false);
+	    addLockRow.(col4X, yLocks + (1 * rowGap), "EdgeDrive", \edgeDrive, 1.0, 8.0, 0.01, 2, false);
     addLockRow.(col4X, yLocks + (2 * rowGap), "FoldAmt", \foldAmt, 0, 1, 0.01, 2, false);
     addLockRow.(col4X, yLocks + (3 * rowGap), "Presence", \presence, -1, 1, 0.01, 2, false);
     addLockRow.(col4X, yLocks + (4 * rowGap), "CrushMix", \crushMix, 0, 1, 0.01, 2, false);
     addLockRow.(col4X, yLocks + (5 * rowGap), "BitDepth", \bitDepth, 2, 16, 1, 0, true);
-    addLockRow.(col4X, yLocks + (6 * rowGap), "Downsample", \downsample, 1, 24, 1, 0, true);
-    addLockRow.(col4X, yLocks + (7 * rowGap), "FilterMode", \filterMode, 0, 3, 1, 0, true);
+	    addLockRow.(col4X, yLocks + (6 * rowGap), "Downsample", \downsample, 1, 24, 1, 0, true);
+	    addLockRow.(col4X, yLocks + (7 * rowGap), "FilterMode", \filterMode, 0, 3, 1, 0, true);
+	    addLockRow.(col1X, yLocks + (9 * rowGap), "KickSub", \kickSubAmt, 0, 1.0, 0.01, 2, false);
+	    addLockRow.(col2X, yLocks + (9 * rowGap), "SubDecay", \kickSubDecay, 0.05, 4.0, 0.01, 2, false);
+	    addLockRow.(col3X, yLocks + (9 * rowGap), "SubPunch", \kickPunch, 0, 4.0, 0.01, 2, false);
+	    addLockRow.(col4X, yLocks + (9 * rowGap), "SubDrive", \kickDrive, 0, 1.0, 0.01, 2, false);
 
     // --------------------------------------------------
     // bottom actions
@@ -5190,18 +7064,13 @@ var valueGap = 6;
         refreshPatternUI.();
     });
 
-    makeButton.(v, Rect(136, yBottom, 96, 26), "Clear", {
-        var oldSemi = ~plonkSteps[lockStep][\locks][\semi] ? 0;
-        var oldUseDegree = ~plonkSteps[lockStep][\locks][\useDegree] ? 0;
-        var oldDegree = ~plonkSteps[lockStep][\locks][\degree] ? 0;
-        var oldDegreeOct = ~plonkSteps[lockStep][\locks][\degreeOct] ? 0;
-        ~plonkSteps[lockStep] = ~makePlonkStep.(~plonkSteps[lockStep][\on]).deepCopy;
-        ~plonkSteps[lockStep][\locks][\semi] = oldSemi;
-        ~plonkSteps[lockStep][\locks][\useDegree] = oldUseDegree;
-        ~plonkSteps[lockStep][\locks][\degree] = oldDegree;
-        ~plonkSteps[lockStep][\locks][\degreeOct] = oldDegreeOct;
-        refreshLockEditor.();
-        refreshPatternUI.();
+	    makeButton.(v, Rect(136, yBottom, 96, 26), "Clear", {
+	        var oldOn = ~plonkSteps[lockStep][\on] ? 0;
+	        ~plonkPushUndo.("Clear step");
+	        ~plonkSteps[lockStep] = ~makePlonkTrackStep.(~plonkSelectedTrack, oldOn).deepCopy;
+	        ~plonkMarkDirty.(true);
+	        refreshLockEditor.();
+	        refreshPatternUI.();
     });
 
     makeButton.(v, Rect(248, yBottom, 96, 26), "Copy", {
@@ -5210,12 +7079,171 @@ var valueGap = 6;
 
     makeButton.(v, Rect(360, yBottom, 96, 26), "Paste", {
         if(~copiedPlonkStep.notNil) {
+            ~plonkPushUndo.("Paste step");
             ~plonkSteps[lockStep] = ~copiedPlonkStep.deepCopy;
+            ~plonkMarkDirty.(true);
             refreshPatternUI.();
             refreshLockEditor.();
         };
     });
 }.value;
+
+        // live page
+        {
+            var v = makePage.(\live);
+            var liveStatus;
+            var macroY = 188;
+            var liveRootMenu, liveScaleMenu;
+            var updateLiveStatus;
+
+            makePageTitle.(v, "Live", "Compact controls for performance, macros, variations, randomization, and transport.");
+
+            updateLiveStatus = {
+                if(liveStatus.notNil) {
+                    liveStatus.string_(
+                        "Track: " ++ ~plonkTrackNames[~plonkSelectedTrack]
+                        ++ " | Edit: " ++ ~plonkVariationNames[~plonkSeq[\editVariation]]
+                        ++ " | Play: " ++ ~plonkVariationNames[~plonkCurrentPlaybackVariation.()]
+                        ++ " | Step: " ++ ((~plonkSeq[\currentStep] ? -1) + 1).max(0).asString
+                        ++ " | Cycle: " ++ (~plonkSeq[\cycleCount] ? 1).asString
+                    );
+                };
+            };
+            ~plonkRefreshLiveUI = updateLiveStatus;
+
+            liveStatus = StaticText(v, Rect(24, 58, 760, 22));
+            liveStatus.font_(Font.default.boldVariant.size_(12));
+
+            makeButton.(v, Rect(24, 92, 70, 28), "Run", {
+                ~plonkSeqStart.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(102, 92, 70, 28), "Stop", {
+                ~plonkSeqStop.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(180, 92, 92, 28), "Restart 1", {
+                ~plonkSeqRestart.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(280, 92, 96, 28), "Continue", {
+                ~plonkSeqContinue.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(384, 92, 108, 28), "Reset Cycle", {
+                ~plonkResetCycleCount.();
+                updateLiveStatus.();
+            });
+
+            StaticText(v, Rect(24, 142, 70, 20)).string_("Variation");
+            4.do { |i|
+                makeButton.(v, Rect(96 + (i * 44), 138, 36, 28), ~plonkVariationNames[i], {
+                    ~plonkSeq[\activeVariation] = i;
+                    ~plonkSetEditVariation.(i);
+                    refreshPatternUI.();
+                    refreshLockEditor.();
+                    updateLiveStatus.();
+                });
+            };
+
+            makeButton.(v, Rect(300, 138, 70, 28), "Fill", {
+                ~plonkSeq[\fillMode] = ~plonkSeq[\fillMode].not;
+                refreshVarButtons.();
+                refreshPatternUI.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(380, 138, 86, 28), "Mutate", {
+                ~plonkMutate[\enabled] = ~plonkMutate[\enabled].not;
+                refreshVarButtons.();
+                updateLiveStatus.();
+            });
+
+            StaticText(v, Rect(500, 142, 34, 20)).string_("Root");
+            liveRootMenu = PopUpMenu(v, Rect(538, 140, 56, 22));
+            liveRootMenu.items_(~plonkNoteNames);
+            liveRootMenu.value_(~plonkPitch[\root].asInteger);
+            liveRootMenu.action_({
+                ~plonkPitch[\root] = liveRootMenu.value.asInteger;
+                ~plonkMarkDirty.(true);
+                refreshPatternUI.();
+                refreshLockEditor.();
+            });
+
+            StaticText(v, Rect(608, 142, 36, 20)).string_("Scale");
+            liveScaleMenu = PopUpMenu(v, Rect(648, 140, 124, 22));
+            liveScaleMenu.items_(~plonkScaleNames);
+            liveScaleMenu.value_(~plonkPitch[\scaleType].asInteger);
+            liveScaleMenu.action_({
+                ~plonkPitch[\scaleType] = liveScaleMenu.value.asInteger;
+                ~plonkMarkDirty.(true);
+                refreshPatternUI.();
+                refreshLockEditor.();
+            });
+
+            makeSectionLabel.(v, Rect(24, macroY - 34, 180, 20), "Macros");
+            StaticText(v, Rect(24, macroY, 80, 20)).string_("Density");
+            makeBoundedBox.(v, Rect(108, macroY, 62, 20), ~plonkMacros[\density], 0, 1, 0.01, 2, { |nb, val| ~plonkMacros[\density] = val });
+            StaticText(v, Rect(190, macroY, 80, 20)).string_("Complex");
+            makeBoundedBox.(v, Rect(274, macroY, 62, 20), ~plonkMacros[\complexity], 0, 1, 0.01, 2, { |nb, val| ~plonkMacros[\complexity] = val });
+            StaticText(v, Rect(356, macroY, 80, 20)).string_("Stability");
+            makeBoundedBox.(v, Rect(440, macroY, 62, 20), ~plonkMacros[\stability], 0, 1, 0.01, 2, { |nb, val| ~plonkMacros[\stability] = val });
+            StaticText(v, Rect(522, macroY, 80, 20)).string_("Humanize");
+            makeBoundedBox.(v, Rect(606, macroY, 62, 20), ~plonkMacros[\humanize], 0, 1, 0.01, 2, { |nb, val| ~plonkMacros[\humanize] = val });
+            StaticText(v, Rect(688, macroY, 74, 20)).string_("Contrast");
+            makeBoundedBox.(v, Rect(766, macroY, 62, 20), ~plonkMacros[\contrast], 0, 1, 0.01, 2, { |nb, val| ~plonkMacros[\contrast] = val });
+
+            makeButton.(v, Rect(24, macroY + 42, 114, 28), "Apply Macros", {
+                ~plonkApplyMacrosToCurrentVariation.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(148, macroY + 42, 112, 28), "Rand Selected", {
+                ~plonkRandomizeSelectedStepsAndRefresh.(\full, 0.7);
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(270, macroY + 42, 96, 28), "Rand Pat", {
+                ~plonkRandomizePatternAndRefresh.();
+                updateLiveStatus.();
+            });
+            makeButton.(v, Rect(376, macroY + 42, 96, 28), "Snapshot", {
+                ~plonkCaptureCompareSnapshot.();
+                refreshEditorStatusUI.();
+            });
+            makeButton.(v, Rect(482, macroY + 42, 96, 28), "Compare", {
+                ~plonkToggleCompareSnapshot.();
+                refreshControls.();
+                refreshPatternUI.();
+                refreshLockEditor.();
+                refreshEditorStatusUI.();
+                updateLiveStatus.();
+            });
+
+            makeSectionLabel.(v, Rect(24, macroY + 102, 180, 20), "Mutation Safety");
+            StaticText(v, Rect(24, macroY + 132, 42, 20)).string_("Preset");
+            PopUpMenu(v, Rect(70, macroY + 130, 98, 22))
+            .items_(~plonkMutatePresetNames)
+            .value_(switch(~plonkMutate[\preset] ? \medium, \subtle, { 0 }, \wild, { 2 }, { 1 }))
+            .action_({ |pm|
+                ~plonkApplyMutationPreset.([\subtle, \medium, \wild][pm.value.clip(0, 2)]);
+                refreshPatternUI.();
+            });
+
+            [
+                ["No Pitch", \lockPitch],
+                ["No Timing", \lockTiming],
+                ["No Cond", \lockConditions],
+                ["No Layer", \lockLayer]
+            ].do { |pair, idx|
+                Button(v, Rect(190 + (idx * 98), macroY + 128, 88, 26))
+                .states_([
+                    [pair[0], Color.black, Color.grey(0.86)],
+                    [pair[0], Color.white, accentBlue]
+                ])
+                .value_((~plonkMutate[pair[1]] ? false).asInteger)
+                .action_({ |bt| ~plonkMutate[pair[1]] = (bt.value == 1) });
+            };
+
+            updateLiveStatus.();
+        }.value;
 
         // audio page
         {
@@ -5230,10 +7258,11 @@ var valueGap = 6;
             ~plonkAudioOutMenu.action_({
                 var idx = ~plonkAudioOutMenu.value;
                 if(idx <= 0) {
-                    ~plonkAudioState[\outDevice] = "";
+                    ~plonkAudioDesiredState[\outDevice] = "";
                 }{
-                    ~plonkAudioState[\outDevice] = ~plonkAudioDevices[idx - 1];
+                    ~plonkAudioDesiredState[\outDevice] = ~plonkAudioOutDevices[idx - 1];
                 };
+                ~plonkRefreshAudioMenus.();
             });
 
 	            StaticText(v, Rect(20, 108, 100, 20)).string_("Input Device");
@@ -5242,32 +7271,46 @@ var valueGap = 6;
             ~plonkAudioInMenu.action_({
                 var idx = ~plonkAudioInMenu.value;
                 if(idx <= 0) {
-                    ~plonkAudioState[\inDevice] = "";
+                    ~plonkAudioDesiredState[\inDevice] = "";
                 }{
-                    ~plonkAudioState[\inDevice] = ~plonkAudioDevices[idx - 1];
+                    ~plonkAudioDesiredState[\inDevice] = ~plonkAudioInDevices[idx - 1];
+                    if((~plonkAudioDesiredState[\numInChannels] ? 0) == 0) {
+                        ~plonkAudioDesiredState[\numInChannels] = 2;
+                        if(~plonkAudioInChBox.notNil) { ~plonkAudioInChBox.value_(2) };
+                    };
                 };
+                ~plonkRefreshAudioMenus.();
             });
 
 	            StaticText(v, Rect(20, 154, 100, 20)).string_("Sample Rate");
-	            srBox = makeBoundedBox.(v, Rect(130, 154, 100, 20), ~plonkAudioState[\sampleRate], 8000, 192000, 1, 0, { |nb, val|
-                ~plonkAudioState[\sampleRate] = val.asInteger;
+	            srBox = makeBoundedBox.(v, Rect(130, 154, 100, 20), ~plonkAudioDesiredState[\sampleRate], 8000, 192000, 1, 0, { |nb, val|
+                ~plonkAudioDesiredState[\sampleRate] = val.asInteger;
             });
+            ~plonkAudioSrBox = srBox;
 
 	            StaticText(v, Rect(20, 188, 100, 20)).string_("Out Channels");
-	            outChBox = makeBoundedBox.(v, Rect(130, 188, 100, 20), ~plonkAudioState[\numOutChannels], 2, 128, 1, 0, { |nb, val|
-                ~plonkAudioState[\numOutChannels] = val.asInteger;
+	            outChBox = makeBoundedBox.(v, Rect(130, 188, 100, 20), ~plonkAudioDesiredState[\numOutChannels], 2, 128, 1, 0, { |nb, val|
+                ~plonkAudioDesiredState[\numOutChannels] = val.asInteger;
             });
+            ~plonkAudioOutChBox = outChBox;
 
 	            StaticText(v, Rect(20, 222, 100, 20)).string_("In Channels");
-	            inChBox = makeBoundedBox.(v, Rect(130, 222, 100, 20), ~plonkAudioState[\numInChannels], 0, 128, 1, 0, { |nb, val|
-                ~plonkAudioState[\numInChannels] = val.asInteger;
+	            inChBox = makeBoundedBox.(v, Rect(130, 222, 100, 20), ~plonkAudioDesiredState[\numInChannels], 0, 128, 1, 0, { |nb, val|
+                ~plonkAudioDesiredState[\numInChannels] = val.asInteger;
+                if(val.asInteger == 0) {
+                    ~plonkAudioDesiredState[\inDevice] = "";
+                    if(~plonkAudioInMenu.notNil) { ~plonkAudioInMenu.value_(0) };
+                };
             });
+            ~plonkAudioInChBox = inChBox;
 
 	            makeButton.(v, Rect(20, 274, 120, 26), "Refresh Devices", { ~plonkRefreshAudioMenus.() });
 	            makeButton.(v, Rect(150, 274, 120, 26), "Apply / Reboot", { ~plonkApplyAudioState.() });
 	            makeButton.(v, Rect(280, 274, 120, 26), "Use No Input", {
-                ~plonkAudioState[\numInChannels] = 0;
+                ~plonkAudioDesiredState[\numInChannels] = 0;
+                ~plonkAudioDesiredState[\inDevice] = "";
                 inChBox.value_(0);
+                if(~plonkAudioInMenu.notNil) { ~plonkAudioInMenu.value_(0) };
                 if(~plonkAudioStatus.notNil) {
                     ~plonkAudioStatus.string_("Input channels set to 0. Apply / Reboot to use it.");
                 };
@@ -5297,8 +7340,11 @@ var valueGap = 6;
 
                 if(~plonkMidiSync[\enabled].not) {
                     ~plonkMidiSync[\isPlaying] = false;
-                    ~plonkMidiSync[\clockCount] = 0;
+                    ~plonkMidiSync[\resumePending] = false;
+                    ~plonkMidiSync[\pendingSongPos16ths] = nil;
+                    ~plonkMidiSync[\songPos16ths] = 0;
                     ~plonkMidiSync[\stepIndex] = 0;
+                    ~plonkResetMidiClockTracking.();
                 };
 
                 ~plonkInstallMidi.();
@@ -5309,7 +7355,7 @@ var valueGap = 6;
 	            ~plonkMidiSourceMenu = PopUpMenu(v, Rect(264, 504, 420, 22));
 
             ~plonkMidiSourceMenu.items_(
-                ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+                ["No MIDI Input", "Any Source"] ++ ~plonkMidiSources.collect { |ep|
                     (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
                 }
             );
@@ -5317,10 +7363,17 @@ var valueGap = 6;
             ~plonkMidiSourceMenu.action_({
                 var idx = ~plonkMidiSourceMenu.value;
 
-                if(idx <= 0) {
+                if(idx == 0) {
+                    ~plonkMidiSync[\inputMode] = \none;
                     ~plonkMidiSync[\sourceUID] = nil;
                 }{
-                    ~plonkMidiSync[\sourceUID] = ~plonkMidiSources[idx - 1].uid;
+                    if(idx == 1) {
+                        ~plonkMidiSync[\inputMode] = \any;
+                        ~plonkMidiSync[\sourceUID] = nil;
+                    }{
+                        ~plonkMidiSync[\inputMode] = \source;
+                        ~plonkMidiSync[\sourceUID] = ~plonkMidiSources[idx - 2].uid;
+                    };
                 };
 
                 ~plonkInstallMidi.();
@@ -5332,7 +7385,7 @@ var valueGap = 6;
 
     if(~plonkMidiSourceMenu.notNil) {
         ~plonkMidiSourceMenu.items_(
-            ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+            ["No MIDI Input", "Any Source"] ++ ~plonkMidiSources.collect { |ep|
                 (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
             }
         );
@@ -5354,7 +7407,7 @@ var valueGap = 6;
             ~plonkRefreshMidiSources.();
 if(~plonkMidiSourceMenu.notNil) {
     ~plonkMidiSourceMenu.items_(
-        ["Any source"] ++ ~plonkMidiSources.collect { |ep|
+        ["No MIDI Input", "Any Source"] ++ ~plonkMidiSources.collect { |ep|
             (ep.device ? "Unknown") ++ " : " ++ (ep.name ? "Unknown")
         }
     );
@@ -5365,11 +7418,105 @@ if(~plonkMidiSourceMenu.notNil) {
 	            ~plonkRefreshAudioMenus.();
 	        }.value;
 
+    handleShortcut = { |view, char, modifiers, unicode, keycode, key|
+        var mods = modifiers ? 0;
+        var handled = true;
+
+        if(mods.isCmd and: { char == $q }) {
+            if(~plonkRequestAppQuit.notNil) { ~plonkRequestAppQuit.() };
+        }{
+            if(mods.isCmd and: { char == $c }) {
+                ~plonkCopySelectedSteps.();
+            }{
+                if(mods.isCmd and: { char == $v }) {
+                    ~plonkPasteToSelectedSteps.(~plonkEditor[\pasteMode] ? \overwrite);
+                    refreshPatternUI.();
+                    refreshLockEditor.();
+                }{
+                    if(mods.isCmd and: { char == $z }) {
+                        if(mods.isShift) { ~plonkRedo.() } { ~plonkUndo.() };
+                    }{
+                        if(char == $ ) {
+                            if(~plonkCurrentPage == \pattern) {
+                                ~plonkToggleSelectedSteps.();
+                                refreshPatternUI.();
+                                refreshLockEditor.();
+                            }{
+                                if(~plonkSeq[\isRunning]) { ~plonkSeqStop.() } { ~plonkSeqStart.() };
+                            };
+                        }{
+                            if(char == $r) {
+                                ~plonkRandomizeSelectedStepsAndRefresh.(\full, if(randAmtBox.notNil) { randAmtBox.value } { 1.0 });
+                            }{
+                                if(char == $m) {
+                                    ~plonkMutate[\enabled] = ~plonkMutate[\enabled].not;
+                                    refreshVarButtons.();
+                                }{
+                                    if(char == $f) {
+                                        ~plonkSeq[\fillMode] = ~plonkSeq[\fillMode].not;
+                                        refreshVarButtons.();
+                                        refreshPatternUI.();
+                                    }{
+                                        if((char >= $1) and: { char <= $4 }) {
+                                            var idx = char.ascii - $1.ascii;
+                                            ~plonkSeq[\activeVariation] = idx;
+                                            ~plonkSetEditVariation.(idx);
+                                            refreshPatternUI.();
+                                            refreshLockEditor.();
+                                        }{
+                                            if(keycode == 123) {
+                                                ~plonkNudgeSelectedSteps.(-1);
+                                                lockStep = ~plonkEditor[\lastSelectedStep];
+                                                refreshPatternUI.();
+                                                refreshLockEditor.();
+                                            }{
+                                                if(keycode == 124) {
+                                                    ~plonkNudgeSelectedSteps.(1);
+                                                    lockStep = ~plonkEditor[\lastSelectedStep];
+                                                    refreshPatternUI.();
+                                                    refreshLockEditor.();
+                                                }{
+                                                    if(keycode == 126) {
+                                                        lockStep = (lockStep - 1).clip(0, 31);
+                                                        ~plonkSetSingleStepSelection.(lockStep);
+                                                        refreshPatternUI.();
+                                                        refreshLockEditor.();
+                                                    }{
+                                                        if(keycode == 125) {
+                                                            lockStep = (lockStep + 1).clip(0, 31);
+                                                            ~plonkSetSingleStepSelection.(lockStep);
+                                                            refreshPatternUI.();
+                                                            refreshLockEditor.();
+                                                        }{
+                                                            handled = false;
+                                                        };
+                                                    };
+                                                };
+                                            };
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+
+        if(handled) {
+            refreshEditorStatusUI.();
+        };
+    };
+
+    win.view.keyDownAction_(handleShortcut);
+    content.keyDownAction_(handleShortcut);
+
 	polishControls.(header);
 	pages.keysValuesDo { |k, v| polishControls.(v) };
 
 	~plonkSetSelectedTrack.(0);
 	~plonkSetEditVariation.(0);
+~plonkSetSingleStepSelection.(0);
 refreshControls.();
 refreshPatternUI.();
 refreshLockEditor.();
@@ -5379,16 +7526,51 @@ showPage.(\main);
 
 		win.front;
 
+        ~plonkCleanupForShutdown = {
+            ~plonkSeqStop.();
+            ~plonkFreeMidiDefs.();
+
+            if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
+            if(~plonkFreeMixer.notNil) { ~plonkFreeMixer.() };
+
+            ~plonkVoices.do { |entry|
+                if(entry[\synth].notNil) { entry[\synth].set(\gate, 0) };
+            };
+            ~plonkVoices.clear;
+        };
+
+        ~plonkRequestAppQuit = {
+            var serverPid;
+            if(~plonkIsShuttingDown.not) {
+                ~plonkIsShuttingDown = true;
+                serverPid = if(s.notNil) { s.pid } { nil };
+                if(~plonkDebug) {
+                    "Plonk-ish shutting down...".postln;
+                };
+                ~plonkCleanupForShutdown.();
+
+                if(s.notNil and: { s.serverRunning }) {
+                    s.quit(watchShutDown: false);
+                };
+
+                if(~plonkStandaloneMode) {
+                    ~plonkHardExitStandalone.(0.08, serverPid);
+                };
+            };
+        };
+
+        if(~plonkStandaloneMode) {
+            ~plonkQuitMenuAction = MenuAction("Quit Plonk-ish", {
+                if(~plonkRequestAppQuit.notNil) { ~plonkRequestAppQuit.() };
+            });
+            ~plonkQuitMenuAction.menuRole_(\quitRole);
+            ~plonkQuitMenuAction.shortcut_("Ctrl+Q");
+            MainMenu.register(~plonkQuitMenuAction, "File", \plonk);
+        };
+
         win.onClose_({
-    ~plonkSeqStop.();
-    ~plonkFreeMidiDefs.();
-
-    if(~plonkStopMixerMeters.notNil) { ~plonkStopMixerMeters.() };
-    if(~plonkFreeMixer.notNil) { ~plonkFreeMixer.() };
-
-    ~plonkVoices.do { |entry| entry[\synth].set(\gate, 0) };
-    ~plonkVoices.clear;
-});
+            ~plonkRequestAppQuit.();
+        });
     }.defer;
 
 });
